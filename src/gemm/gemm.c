@@ -120,6 +120,33 @@ static inline int linalg_has_avx512(void) { return 0; }
 #include "gemm_kernels_avx2_complete.h"
 #include "gemm_kernels_avx512.h"
 
+/**
+ * @brief Build AVX2 tail mask for n active lanes (clamped to NR)
+ */
+static inline __m256i avx2_tailmask_nr(size_t n, size_t NR)
+{
+    // For n > 8, this function handles ONLY the second 8-element chunk
+    // The caller handles the split (e.g., first 8 full, second 8 partial)
+    size_t lanes = (n <= 8) ? n : 8;
+    
+    // Lookup table for 0-8 lanes
+    static const int mask_table[9][8] __attribute__((aligned(32))) = {
+        {0, 0, 0, 0, 0, 0, 0, 0},         // 0 lanes
+        {-1, 0, 0, 0, 0, 0, 0, 0},        // 1 lane
+        {-1, -1, 0, 0, 0, 0, 0, 0},       // 2 lanes
+        {-1, -1, -1, 0, 0, 0, 0, 0},      // 3 lanes
+        {-1, -1, -1, -1, 0, 0, 0, 0},     // 4 lanes
+        {-1, -1, -1, -1, -1, 0, 0, 0},    // 5 lanes
+        {-1, -1, -1, -1, -1, -1, 0, 0},   // 6 lanes
+        {-1, -1, -1, -1, -1, -1, -1, 0},  // 7 lanes
+        {-1, -1, -1, -1, -1, -1, -1, -1}  // 8 lanes (all)
+    };
+    
+    // Load 8 bytes and extend to 8 × 32-bit integers
+    __m128i b8 = _mm_loadl_epi64((const __m128i *)mask_table[lanes]);
+    return _mm256_cvtepi8_epi32(b8);
+}
+
 //==============================================================================
 // PACKING ROUTINES (EXACT FROM ORIGINAL)
 //==============================================================================
@@ -418,17 +445,40 @@ static inline void pack_B_tile(
     const float *RESTRICT B,
     size_t K, size_t N,
     size_t kk, size_t Kblk,
-    size_t j0, size_t jb,
-    size_t NR)
+    size_t j0, size_t jb,  // jb = actual columns in this panel
+    size_t NR)             // NR = panel width (6, 8, 12, 16)
 {
+    // ✅ MOVE NR==16 OUTSIDE AVX512 (needed for AVX2 8×16 kernel!)
+    if (NR == 16) {
+        // Pack 16 columns: [8][8]
+        for (size_t k = 0; k < Kblk; ++k) {
+            const float *brow = B + (kk + k) * N + j0;  // ← FIX: j0 not j
+            float *dst = Bp + k * 16;
+            
+            // First 8 cols
+            if (jb >= 8) {  // ← FIX: jb not n_block
+                __m256 v = _mm256_loadu_ps(brow);
+                _mm256_storeu_ps(dst, v);
+            } else {
+                for (size_t t = 0; t < 8; ++t)
+                    dst[t] = (t < jb) ? brow[t] : 0.0f;
+            }
+            
+            // Next 8 cols
+            if (jb > 8) {  // ← FIX: jb not n_block
+                __m256 v = _mm256_loadu_ps(brow + 8);
+                _mm256_storeu_ps(dst + 8, v);
+            } else {
+                for (size_t t = 8; t < 16; ++t)
+                    dst[t] = 0.0f;
+            }
+        }
+    }
 #ifdef __AVX512F__
-    if (NR == 16)
-        pack_B_16col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
     else if (NR == 12)
         pack_B_12col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
-    else
 #endif
-    if (NR == 8)
+    else if (NR == 8)
         pack_B_8col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
     else
         pack_B_6col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
@@ -449,32 +499,26 @@ enum kernel_shape {
 #endif
 };
 
-static inline enum kernel_shape pick_kernel(size_t Mblk, size_t Nblk, size_t Kblk)
-{
-    (void)Kblk;
-    
+static enum kernel_shape pick_kernel(size_t Mc, size_t Nc, size_t Kc) {
+    // AVX-512 path
 #ifdef __AVX512F__
-    // AVX-512 path: prefer 32-row kernels when AVX-512 available
     if (linalg_has_avx512()) {
-        if (Nblk >= 16 && (Nblk % 16 >= 12 || Nblk >= 3 * (size_t)LINALG_SMALL_N_THRESH)) {
-            if (Mblk >= 32)
-                return K32x16;
-        }
-        if (Mblk >= 32)
-            return K32x12;
+        if (Mc >= 32 && Nc >= 16) return KERN_32x16_AVX512;
+        if (Mc >= 32 && Nc >= 12) return KERN_32x12_AVX512;
     }
 #endif
     
-    // AVX2 fallback
-    if (Nblk >= 8 && (Nblk % 8 >= 6 || Nblk >= 3 * (size_t)LINALG_SMALL_N_THRESH)) {
-        if (Mblk >= 16)
-            return K16x8;
-        if (Mblk >= 8)
-            return K8x8;
-    }
-    if (Mblk >= 16)
-        return K16x6;
-    return K8x6;
+    // AVX2 path
+    if (Mc >= 16 && Nc >= 8) return KERN_16x8_AVX2;
+    if (Mc >= 16 && Nc >= 6) return KERN_16x6_AVX2;
+    
+    // ✨ NEW: Add 8×16 selection
+    if (Mc >= 8 && Nc >= 16) return KERN_8x16_AVX2;  // ← ADD THIS!
+    
+    if (Mc >= 8 && Nc >= 8) return KERN_8x8_AVX2;
+    if (Mc >= 8 && Nc >= 6) return KERN_8x6_AVX2;
+    
+    return KERN_8x8_AVX2; // fallback
 }
 
 //==============================================================================
@@ -531,6 +575,7 @@ int mul(
         {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor, gemm_8x6_panel_avx2fma_add, gemm_8x6_panel_avx2fma_store, 8, 6, 8},
         {pack_A_block_16row_colmajor, pack_A_16row_tile, gemm_16x8_panel_avx2fma_add, gemm_16x8_panel_avx2fma_store, 16, 8, 16},
         {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor, gemm_8x8_panel_avx2fma_add, gemm_8x8_panel_avx2fma_store, 8, 8, 8},
+        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor, gemm_8x16_panel_avx2fma_add, gemm_8x16_panel_avx2fma_store, 8, 16, 8},  
 #ifdef __AVX512F__
         // AVX-512 kernels
         {pack_A_block_32row_colmajor, pack_A_32row_tile, gemm_32x12_panel_avx512_add, gemm_32x12_panel_avx512_store, 32, 12, 32},
@@ -540,10 +585,10 @@ int mul(
 
     // Allocate packing buffers (sized for maximum: AVX-512 if available)
 #ifdef __AVX512F__
-    const size_t max_nr = linalg_has_avx512() ? 16 : 8;
+    const size_t max_nr = linalg_has_avx512() ? 16 : 16;  // ← 16 for both!
     const size_t max_mr = linalg_has_avx512() ? 32 : 16;
 #else
-    const size_t max_nr = 8;
+    const size_t max_nr = 16;  // ← Changed from 8 to 16
     const size_t max_mr = 16;
 #endif
     const size_t max_n_panels = (Nc + max_nr - 1) / max_nr;
