@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        ".fantomasignore": "ignore",
+        "linalg_simd.h": "c"
+    }
+}
