@@ -4,12 +4,47 @@
 #include <math.h>
 #include <immintrin.h>
 
-// Include your kernel headers (adjust path as needed)
-// Note: You may need to stub out dependencies if these headers require full context
 #include "../gemm/gemm_kernels_avx2.h"
 
 #define TOLERANCE 1e-4f
 #define ALIGN_BYTES 32
+
+// Prefetch macros
+#ifndef PREFETCH_T0
+#define PREFETCH_T0(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T0)
+#endif
+
+#ifndef PREFETCH_T1
+#define PREFETCH_T1(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T1)
+#endif
+
+// RESTRICT keyword
+#ifndef RESTRICT
+#if defined(__GNUC__) || defined(__clang__)
+#define RESTRICT __restrict__
+#else
+#define RESTRICT
+#endif
+#endif
+
+// GEMM configuration
+#ifndef GEMM_PREFETCH_MIN_K
+#define GEMM_PREFETCH_MIN_K 128
+#endif
+
+#ifndef LINALG_GEMM_PREFETCH_A_LONG
+#define LINALG_GEMM_PREFETCH_A_LONG 0
+#endif
+
+#ifndef LINALG_NT_STORES
+#define LINALG_NT_STORES 1
+#endif
+
+#ifndef LINALG_ASSUME_ALIGNED
+#define LINALG_ASSUME_ALIGNED(p, n) (p)
+#endif
+
+// ========== END DEFINES ==========
 
 // Compare matrices with tolerance
 static int compare_matrices(const float *C, const float *C_ref, int M, int N,

@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <immintrin.h>
 #include <string.h>
+#include <stdlib.h>
 
 // External dependencies (same as original)
 // Requires: linalg_has_avx2(), linalg_aligned_alloc(), linalg_aligned_free()

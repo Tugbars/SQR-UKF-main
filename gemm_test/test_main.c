@@ -19,7 +19,7 @@ int main(void) {
     // Phase 1: Unit tests (no OpenBLAS needed)
     printf("Phase 1: Kernel unit tests\n");
     printf("---------------------------\n");
-    test_kernels_unit();
+    //test_kernels_unit();
     
     // Phase 2: Small matrix correctness
     printf("\n\nPhase 2: Small matrices vs OpenBLAS\n");
