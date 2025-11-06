@@ -579,7 +579,10 @@ static inline void gemm_16x8_panel_avx2fma_store(
         }
     }
 
-    const int use_nt = 0;  // ✅ NEVER stream on n==6 (partial width)
+    const int use_nt = LINALG_NT_STORES &&
+                   (n == 8) &&
+                   (((uintptr_t)(c) & 31u) == 0) &&
+                   ((ldc & 7u) == 0);
 
     if (m == 16 && n == 8)
     {
@@ -1240,7 +1243,10 @@ static inline void gemm_8x6_panel_avx2fma_store(
         }
     }
 
-    const int use_nt = 0;  // ✅ NEVER stream on n==6
+    const int use_nt = LINALG_NT_STORES &&
+                   (n == 8) &&
+                   (((uintptr_t)(c) & 31u) == 0) &&
+                   ((ldc & 7u) == 0);
 
     // Fast path: full 8×6 with in-register transpose
     if (m == 8 && n == 6)

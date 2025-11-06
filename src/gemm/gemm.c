@@ -169,26 +169,42 @@ static inline int linalg_has_avx512(void) { return 0; }
 /**
  * @brief Build AVX2 tail mask for n active lanes (clamped to NR)
  */
+/**
+ * @brief Build AVX2 tail mask for n active lanes (NR-aware)
+ * 
+ * For NR==16 panels with n in [9..15], this returns a mask for (n-8) lanes
+ * to be used on the second 8-wide chunk. For NR≤8 or n≤8, returns mask for n lanes.
+ */
 static inline __m256i avx2_tailmask_nr(size_t n, size_t NR)
 {
-    (void)NR;  // unused, kept for API compatibility
-    size_t lanes = (n <= 8) ? n : 8;
+    size_t lanes = n;
     
-    // ✅ FIX: Add alignas(32) for aligned load
-    static const int mask_table[9][8] __attribute__((aligned(32))) = {
-        {0, 0, 0, 0, 0, 0, 0, 0},         // 0 lanes
-        {-1, 0, 0, 0, 0, 0, 0, 0},        // 1 lane
-        {-1, -1, 0, 0, 0, 0, 0, 0},       // 2 lanes
-        {-1, -1, -1, 0, 0, 0, 0, 0},      // 3 lanes
-        {-1, -1, -1, -1, 0, 0, 0, 0},     // 4 lanes
-        {-1, -1, -1, -1, -1, 0, 0, 0},    // 5 lanes
-        {-1, -1, -1, -1, -1, -1, 0, 0},   // 6 lanes
-        {-1, -1, -1, -1, -1, -1, -1, 0},  // 7 lanes
-        {-1, -1, -1, -1, -1, -1, -1, -1}  // 8 lanes (all)
+    // For 16-wide panels, adjust mask for the high 8 lanes
+    if (NR >= 16) {
+        lanes = (n > 8) ? (n - 8) : n;
+    }
+    if (lanes > 8) lanes = 8;
+    
+    // Portable alignment attribute
+    #if defined(_MSC_VER)
+        __declspec(align(32))
+    #else
+        __attribute__((aligned(32)))
+    #endif
+    static const int mask_table[9][8] = {
+        { 0,  0,  0,  0,  0,  0,  0,  0},  // 0 lanes
+        {-1,  0,  0,  0,  0,  0,  0,  0},  // 1 lane
+        {-1, -1,  0,  0,  0,  0,  0,  0},  // 2 lanes
+        {-1, -1, -1,  0,  0,  0,  0,  0},  // 3 lanes
+        {-1, -1, -1, -1,  0,  0,  0,  0},  // 4 lanes
+        {-1, -1, -1, -1, -1,  0,  0,  0},  // 5 lanes
+        {-1, -1, -1, -1, -1, -1,  0,  0},  // 6 lanes
+        {-1, -1, -1, -1, -1, -1, -1,  0},  // 7 lanes
+        {-1, -1, -1, -1, -1, -1, -1, -1}   // 8 lanes (all)
     };
     
-    // Now safe to use aligned load
-    return _mm256_load_si256((const __m256i *)mask_table[lanes]);
+    // Use unaligned load for portability (MSVC may ignore alignas on statics)
+    return _mm256_loadu_si256((const __m256i*)mask_table[lanes]);
 }
 
 //==============================================================================

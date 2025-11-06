@@ -3,7 +3,26 @@
 #include <math.h>
 #include <stdint.h>
 #include "../gemm/gemm.h"
+#include <time.h>
 
+#ifdef _WIN32
+#include <windows.h>
+
+static double get_time_sec(void) {
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+}
+#else
+#include <time.h>
+
+static double get_time_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1e-9;
+}
+#endif
 
                // Aligned allocation helper
 static void* aligned_alloc_wrapper(size_t alignment, size_t size) {
@@ -39,7 +58,7 @@ static void naive_gemm(float *C, const float *A, const float *B,
 }
 
 static int compare_with_reference(int M, int K, int N, const char *name) {
-      #ifdef _WIN32
+    #ifdef _WIN32
         float *A = (float*)_aligned_malloc(M * K * sizeof(float), 32);
         float *B = (float*)_aligned_malloc(K * N * sizeof(float), 32);
         float *C_test = (float*)_aligned_malloc(M * N * sizeof(float), 32);
@@ -53,19 +72,10 @@ static int compare_with_reference(int M, int K, int N, const char *name) {
     
     if (!A || !B || !C_test || !C_ref) {
         printf("  %s: ALLOC FAILED\n", name);
-        #ifdef _WIN32
-            _aligned_free(A); _aligned_free(B); 
-            _aligned_free(C_test); _aligned_free(C_ref);
-        #else
-            free(A); free(B); free(C_test); free(C_ref);
-        #endif
-        return 0;
-    }
-    
-    
-    if (!A || !B || !C_test || !C_ref) {
-        printf("  %s: ALLOC FAILED\n", name);
-        free(A); free(B); free(C_test); free(C_ref);
+        aligned_free_wrapper(A); 
+        aligned_free_wrapper(B); 
+        aligned_free_wrapper(C_test); 
+        aligned_free_wrapper(C_ref);
         return 0;
     }
     
@@ -75,16 +85,24 @@ static int compare_with_reference(int M, int K, int N, const char *name) {
     for (int i = 0; i < K * N; i++)
         B[i] = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
     
-    // Your GEMM
+    // Benchmark optimized GEMM
+    double t_start = get_time_sec();
     int ret = mul(C_test, A, B, (uint16_t)M, (uint16_t)K, (uint16_t)K, (uint16_t)N);
+    double t_opt = get_time_sec() - t_start;
+    
     if (ret != 0) {
         printf("  %s: mul() returned error %d\n", name, ret);
-        free(A); free(B); free(C_test); free(C_ref);
+        aligned_free_wrapper(A); 
+        aligned_free_wrapper(B); 
+        aligned_free_wrapper(C_test); 
+        aligned_free_wrapper(C_ref);
         return 0;
     }
     
-    // Reference GEMM
+    // Benchmark naive GEMM
+    t_start = get_time_sec();
     naive_gemm(C_ref, A, B, M, K, N);
+    double t_naive = get_time_sec() - t_start;
     
     // Compare
     float max_err = 0.0f, sum_ref = 0.0f;
@@ -97,9 +115,20 @@ static int compare_with_reference(int M, int K, int N, const char *name) {
     float avg_ref = sum_ref / (M * N);
     float relative_err = max_err / (avg_ref + 1e-10f);
     
+    // Compute GFLOPS
+    double flops = 2.0 * M * N * K;  // 2*M*N*K FLOPs for GEMM
+    double gflops_opt = (flops / t_opt) * 1e-9;
+    double gflops_naive = (flops / t_naive) * 1e-9;
+    double speedup = t_naive / t_opt;
+    
     int pass = (relative_err < MAX_ERR_REL);
-    printf("  %s: %s (abs_err=%.2e, rel_err=%.2e)\n", name, 
-           pass ? "PASS" : "FAIL", max_err, relative_err);
+    printf("  %s: %s (err=%.2e) | Opt: %.3f ms (%.1f GFLOPS) | Naive: %.3f ms (%.1f GFLOPS) | Speedup: %.1fx\n", 
+           name, 
+           pass ? "PASS" : "FAIL", 
+           relative_err,
+           t_opt * 1000.0, gflops_opt,
+           t_naive * 1000.0, gflops_naive,
+           speedup);
     
     if (!pass) {
         // Find first error
@@ -112,14 +141,10 @@ static int compare_with_reference(int M, int K, int N, const char *name) {
         }
     }
     
-    #ifdef _WIN32
-        _aligned_free(A); 
-        _aligned_free(B); 
-        _aligned_free(C_test); 
-        _aligned_free(C_ref);
-    #else
-        free(A); free(B); free(C_test); free(C_ref);
-    #endif
+    aligned_free_wrapper(A); 
+    aligned_free_wrapper(B); 
+    aligned_free_wrapper(C_test); 
+    aligned_free_wrapper(C_ref);
     return pass;
 }
 
