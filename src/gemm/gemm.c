@@ -171,11 +171,10 @@ static inline int linalg_has_avx512(void) { return 0; }
  */
 static inline __m256i avx2_tailmask_nr(size_t n, size_t NR)
 {
-    // For n > 8, this function handles ONLY the second 8-element chunk
-    // The caller handles the split (e.g., first 8 full, second 8 partial)
+    (void)NR;  // unused, kept for API compatibility
     size_t lanes = (n <= 8) ? n : 8;
     
-    // Lookup table for 0-8 lanes
+    // ✅ FIX: Add alignas(32) for aligned load
     static const int mask_table[9][8] __attribute__((aligned(32))) = {
         {0, 0, 0, 0, 0, 0, 0, 0},         // 0 lanes
         {-1, 0, 0, 0, 0, 0, 0, 0},        // 1 lane
@@ -188,9 +187,8 @@ static inline __m256i avx2_tailmask_nr(size_t n, size_t NR)
         {-1, -1, -1, -1, -1, -1, -1, -1}  // 8 lanes (all)
     };
     
-    // Load 8 bytes and extend to 8 × 32-bit integers
-    __m128i b8 = _mm_loadl_epi64((const __m128i *)mask_table[lanes]);
-    return _mm256_cvtepi8_epi32(b8);
+    // Now safe to use aligned load
+    return _mm256_load_si256((const __m256i *)mask_table[lanes]);
 }
 
 //==============================================================================
@@ -496,30 +494,30 @@ static inline void pack_B_tile(
 {
     // ✅ MOVE NR==16 OUTSIDE AVX512 (needed for AVX2 8×16 kernel!)
     if (NR == 16) {
-        // Pack 16 columns: [8][8]
-        for (size_t k = 0; k < Kblk; ++k) {
-            const float *brow = B + (kk + k) * N + j0;  // ← FIX: j0 not j
-            float *dst = Bp + k * 16;
-            
-            // First 8 cols
-            if (jb >= 8) {  // ← FIX: jb not n_block
-                __m256 v = _mm256_loadu_ps(brow);
-                _mm256_storeu_ps(dst, v);
-            } else {
-                for (size_t t = 0; t < 8; ++t)
-                    dst[t] = (t < jb) ? brow[t] : 0.0f;
-            }
-            
-            // Next 8 cols
-            if (jb > 8) {  // ← FIX: jb not n_block
-                __m256 v = _mm256_loadu_ps(brow + 8);
-                _mm256_storeu_ps(dst + 8, v);
-            } else {
-                for (size_t t = 8; t < 16; ++t)
-                    dst[t] = 0.0f;
-            }
+    // Pack 16 columns: [8][8]
+    for (size_t k = 0; k < Kblk; ++k) {
+         const float *brow = B + (kk + k) * N + j0;  // ✅ CORRECT - j0 is the panel start
+        float *dst = Bp + k * 16;
+        
+        // First 8 cols
+        if (jb >= 8) {
+            __m256 v = _mm256_loadu_ps(brow);
+            _mm256_store_ps(dst, v);  // ✅ Use aligned store (dst is aligned)
+        } else {
+            for (size_t t = 0; t < 8; ++t)
+                dst[t] = (t < jb) ? brow[t] : 0.0f;
+        }
+        
+        // Next 8 cols
+        if (jb > 8) {
+            __m256 v = _mm256_loadu_ps(brow + 8);
+            _mm256_store_ps(dst + 8, v);  // ✅ Use aligned store
+        } else {
+            for (size_t t = 8; t < 16; ++t)
+                dst[t] = 0.0f;
         }
     }
+}
 #ifdef __AVX512F__
     else if (NR == 12)
         pack_B_12col_tile(Bp, B, K, N, kk, Kblk, j0, jb);

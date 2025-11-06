@@ -590,23 +590,14 @@ typedef float gemm_scalar_ps_t;
 #ifdef __AVX2__
 
 /**
- * @brief Build AVX2 mask for n active lanes (0 ≤ n ≤ 8)
- *
- * @details
- * Creates a mask suitable for maskload/maskstore operations.
- * Active lanes have all bits set (-1), inactive lanes are zero.
- *
- * Uses a precomputed lookup table for efficiency.
- *
+ * @brief Build AVX2 mask for n active lanes (0-8)
  * @param lanes Number of active lanes (0-8)
- * @return __m256i mask with first 'lanes' elements active
- *
- * @note This is inline to allow compiler optimizations
+ * @return AVX2 mask vector
  */
 static inline __m256i gemm_build_mask_avx2(int lanes)
 {
-    // Lookup table: 8-bit masks extended to 32-bit lanes
-    static const int8_t kMask8x8[9][8] __attribute__((aligned(64))) = {
+    // Use same implementation as avx2_tailmask_nr for consistency
+    static const int mask_table[9][8] __attribute__((aligned(32))) = {
         {0, 0, 0, 0, 0, 0, 0, 0},
         {-1, 0, 0, 0, 0, 0, 0, 0},
         {-1, -1, 0, 0, 0, 0, 0, 0},
@@ -618,9 +609,8 @@ static inline __m256i gemm_build_mask_avx2(int lanes)
         {-1, -1, -1, -1, -1, -1, -1, -1}
     };
     
-    // Load 8 bytes and extend to 8 x 32-bit integers
-    __m128i b8 = _mm_loadl_epi64((const __m128i *)kMask8x8[lanes]);
-    return _mm256_cvtepi8_epi32(b8);
+    lanes = (lanes < 0) ? 0 : ((lanes > 8) ? 8 : lanes);
+    return _mm256_load_si256((const __m256i *)mask_table[lanes]);
 }
 
 /**

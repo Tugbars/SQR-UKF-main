@@ -24,8 +24,8 @@
 #define GEMM_KERNELS_AVX2_COMPLETE_H
 
 #include "gemm_simd_ops.h"
-#include <stdalign.h> 
-#include <string.h>    
+#include <stdalign.h>
+#include <string.h>
 
 // Prefetch configuration
 #ifndef GEMM_PREFETCH_MIN_K
@@ -42,11 +42,11 @@
 
 // Prefetch macros (if not already defined)
 #ifndef PREFETCH_T0
-#define PREFETCH_T0(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T0)
+#define PREFETCH_T0(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T0)
 #endif
 
 #ifndef PREFETCH_T1
-#define PREFETCH_T1(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T1)
+#define PREFETCH_T1(ptr) _mm_prefetch((const char *)(ptr), _MM_HINT_T1)
 #endif
 
 // Restrict qualifier
@@ -579,10 +579,7 @@ static inline void gemm_16x8_panel_avx2fma_store(
         }
     }
 
-    const int use_nt = LINALG_NT_STORES &&
-                       (n == 8) &&
-                       (((uintptr_t)(c) & 31u) == 0) &&
-                       ((ldc & 7u) == 0);
+    const int use_nt = 0;  // ✅ NEVER stream on n==6 (partial width)
 
     if (m == 16 && n == 8)
     {
@@ -631,17 +628,13 @@ static inline void gemm_16x8_panel_avx2fma_store(
         {
             float *cr = c + r * ldc;
             __m256 sum = load_cols_from_temp(temp, 16, r, n);
-            if (use_nt && n == 8)
-                _mm256_stream_ps(cr, sum);
-            else
-                _mm256_maskstore_ps(cr, mask, sum);
+          
+            _mm256_maskstore_ps(cr, mask, sum);
         }
     }
 }
 
 // Continued in next message due to length...
-
-#endif /* GEMM_KERNELS_AVX2_COMPLETE_H */
 
 //==============================================================================
 // 8×8 KERNELS
@@ -925,16 +918,25 @@ static inline void gemm_16x6_panel_avx2fma_add(
         }
         gemm_transpose_8x8_avx2(cols_lo);
         gemm_transpose_8x8_avx2(cols_hi);
+
+        // ✅ MASKED ADD: Load old, add, store back
+        __m256i mask6 = gemm_build_mask_avx2(6);
+
         for (size_t r = 0; r < 8; ++r)
         {
             float *cr = c + r * ldc;
-            _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), cols_lo[r]));
+            __m256 old = _mm256_maskload_ps(cr, mask6);
+            __m256 result = _mm256_add_ps(old, cols_lo[r]);
+            _mm256_maskstore_ps(cr, mask6, result);
         }
         for (size_t r = 8; r < 16; ++r)
         {
             float *cr = c + r * ldc;
-            _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), cols_hi[r - 8]));
+            __m256 old = _mm256_maskload_ps(cr, mask6);
+            __m256 result = _mm256_add_ps(old, cols_hi[r - 8]);
+            _mm256_maskstore_ps(cr, mask6, result);
         }
+        return; // ✅ Exit early
     }
     else
     {
@@ -1015,6 +1017,7 @@ static inline void gemm_16x6_panel_avx2fma_store(
                        (((uintptr_t)(c) & 31u) == 0) &&
                        ((ldc & 7u) == 0);
 
+    // Fast path: full 16×6 with in-register transpose
     if (m == 16 && n == 6)
     {
         alignas(32) float temp_lo[8 * 8] = {0}, temp_hi[8 * 8] = {0};
@@ -1031,22 +1034,21 @@ static inline void gemm_16x6_panel_avx2fma_store(
         }
         gemm_transpose_8x8_avx2(cols_lo);
         gemm_transpose_8x8_avx2(cols_hi);
+
+        // ✅ MASKED STORE: Only write 6 elements
+        __m256i mask6 = gemm_build_mask_avx2(6);
+
         for (size_t r = 0; r < 8; ++r)
         {
             float *cr = c + r * ldc;
-            if (use_nt)
-                _mm256_stream_ps(cr, cols_lo[r]);
-            else
-                _mm256_storeu_ps(cr, cols_lo[r]);
+            _mm256_maskstore_ps(cr, mask6, cols_lo[r]);
         }
         for (size_t r = 8; r < 16; ++r)
         {
             float *cr = c + r * ldc;
-            if (use_nt)
-                _mm256_stream_ps(cr, cols_hi[r - 8]);
-            else
-                _mm256_storeu_ps(cr, cols_hi[r - 8]);
+            _mm256_maskstore_ps(cr, mask6, cols_hi[r - 8]);
         }
+        return; // ✅ Exit early
     }
     else
     {
@@ -1131,6 +1133,7 @@ static inline void gemm_8x6_panel_avx2fma_add(
         }
     }
 
+    // Fast path: full 8×6 with in-register transpose
     if (m == 8 && n == 6)
     {
         alignas(32) float temp[8 * 8] = {0};
@@ -1140,15 +1143,24 @@ static inline void gemm_8x6_panel_avx2fma_add(
         _mm256_store_ps(temp + 3 * 8, acc3);
         _mm256_store_ps(temp + 4 * 8, acc4);
         _mm256_store_ps(temp + 5 * 8, acc5);
+
         __m256 cols[8];
         for (int j = 0; j < 8; ++j)
             cols[j] = _mm256_load_ps(temp + j * 8);
+
         gemm_transpose_8x8_avx2(cols);
+
+        // ✅ MASKED ADD
+        __m256i mask6 = gemm_build_mask_avx2(6);
+
         for (size_t r = 0; r < 8; ++r)
         {
             float *cr = c + r * ldc;
-            _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), cols[r]));
+            __m256 old = _mm256_maskload_ps(cr, mask6);
+            __m256 result = _mm256_add_ps(old, cols[r]);
+            _mm256_maskstore_ps(cr, mask6, result);
         }
+        return;
     }
     else
     {
@@ -1228,11 +1240,9 @@ static inline void gemm_8x6_panel_avx2fma_store(
         }
     }
 
-    const int use_nt = LINALG_NT_STORES &&
-                       (n == 6) &&
-                       (((uintptr_t)(c) & 31u) == 0) &&
-                       ((ldc & 7u) == 0);
+    const int use_nt = 0;  // ✅ NEVER stream on n==6
 
+    // Fast path: full 8×6 with in-register transpose
     if (m == 8 && n == 6)
     {
         alignas(32) float temp[8 * 8] = {0};
@@ -1242,18 +1252,22 @@ static inline void gemm_8x6_panel_avx2fma_store(
         _mm256_store_ps(temp + 3 * 8, acc3);
         _mm256_store_ps(temp + 4 * 8, acc4);
         _mm256_store_ps(temp + 5 * 8, acc5);
+
         __m256 cols[8];
         for (int j = 0; j < 8; ++j)
             cols[j] = _mm256_load_ps(temp + j * 8);
+
         gemm_transpose_8x8_avx2(cols);
+
+        // ✅ MASKED STORE
+        __m256i mask6 = gemm_build_mask_avx2(6);
+
         for (size_t r = 0; r < 8; ++r)
         {
             float *cr = c + r * ldc;
-            if (use_nt)
-                _mm256_stream_ps(cr, cols[r]);
-            else
-                _mm256_storeu_ps(cr, cols[r]);
+            _mm256_maskstore_ps(cr, mask6, cols[r]);
         }
+        return;
     }
     else
     {
@@ -1268,10 +1282,8 @@ static inline void gemm_8x6_panel_avx2fma_store(
         {
             float *cr = c + r * ldc;
             __m256 sum = load_cols_from_temp(temp, 8, r, n);
-            if (use_nt && n == 6)
-                _mm256_stream_ps(cr, sum);
-            else
-                _mm256_maskstore_ps(cr, mask, sum);
+            
+            _mm256_maskstore_ps(cr, mask, sum);
         }
     }
 }
@@ -1346,7 +1358,7 @@ static inline void gemm_8x16_panel_avx2fma_add(
 
             // Load B row (16 elements = 2 vectors)
             // Load A row (8 elements) and B row (16 elements)
-            const float *a_row = Ap + kk * 8; 
+            const float *a_row = Ap + kk * 8;
             const float *b_row = Bp + kk * 16;
             __m256 b_lo = _mm256_load_ps(b_row + 0); // cols 0-7
             __m256 b_hi = _mm256_load_ps(b_row + 8); // cols 8-15
@@ -1647,3 +1659,5 @@ static inline void gemm_8x16_panel_avx2fma_store(
         }
     }
 }
+
+#endif

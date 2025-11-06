@@ -97,10 +97,20 @@ static void naive_gemm(float *C, const float *A, const float *B,
 static void test_8x8_store(void) {
     const int M = 8, K = 16, N = 8;
     
-    __attribute__((aligned(ALIGN_BYTES))) float A[M * K];
-    __attribute__((aligned(ALIGN_BYTES))) float B[K * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C[M * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C_expected[M * N];
+    // Use aligned malloc instead of stack arrays
+    float *A = (float*)_aligned_malloc(M * K * sizeof(float), ALIGN_BYTES);
+    float *B = (float*)_aligned_malloc(K * N * sizeof(float), ALIGN_BYTES);
+    float *C = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *C_expected = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *Ap = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    float *Bp = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    
+    if (!A || !B || !C || !C_expected || !Ap || !Bp) {
+        printf("  8×8 STORE: ALLOC FAILED\n");
+        _aligned_free(A); _aligned_free(B); _aligned_free(C);
+        _aligned_free(C_expected); _aligned_free(Ap); _aligned_free(Bp);
+        return;
+    }
     
     // Initialize with simple pattern
     for (int i = 0; i < M * K; i++) A[i] = (float)(i % 10 + 1);
@@ -109,14 +119,12 @@ static void test_8x8_store(void) {
     naive_gemm(C_expected, A, B, M, K, N);
     
     // Pack A (8 rows, column-major: K × 8)
-    __attribute__((aligned(ALIGN_BYTES))) float Ap[K * 8];
     for (int k = 0; k < K; k++) {
         for (int i = 0; i < M; i++)
             Ap[k * 8 + i] = A[i * K + k];
     }
     
     // Pack B (8 columns, row-major: K × 8)
-    __attribute__((aligned(ALIGN_BYTES))) float Bp[K * 8];
     for (int k = 0; k < K; k++)
         memcpy(Bp + k * 8, B + k * N, 8 * sizeof(float));
     
@@ -126,16 +134,32 @@ static void test_8x8_store(void) {
     gemm_8x8_panel_avx2fma_store(C, N, Ap, Bp, K, M, N, mask);
     
     compare_matrices(C, C_expected, M, N, "8×8 STORE");
+    
+    // Free all
+    _aligned_free(A); _aligned_free(B); _aligned_free(C);
+    _aligned_free(C_expected); _aligned_free(Ap); _aligned_free(Bp);
 }
+
 
 // Test 8×8 kernel (add mode)
 static void test_8x8_add(void) {
     const int M = 8, K = 16, N = 8;
     
-    __attribute__((aligned(ALIGN_BYTES))) float A[M * K];
-    __attribute__((aligned(ALIGN_BYTES))) float B[K * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C[M * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C_expected[M * N];
+    float *A = (float*)_aligned_malloc(M * K * sizeof(float), ALIGN_BYTES);
+    float *B = (float*)_aligned_malloc(K * N * sizeof(float), ALIGN_BYTES);
+    float *C = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *C_expected = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *C_product = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *Ap = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    float *Bp = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    
+    if (!A || !B || !C || !C_expected || !C_product || !Ap || !Bp) {
+        printf("  8×8 ADD: ALLOC FAILED\n");
+        _aligned_free(A); _aligned_free(B); _aligned_free(C);
+        _aligned_free(C_expected); _aligned_free(C_product);
+        _aligned_free(Ap); _aligned_free(Bp);
+        return;
+    }
     
     for (int i = 0; i < M * K; i++) A[i] = (float)(i % 10 + 1);
     for (int i = 0; i < K * N; i++) B[i] = (float)(i % 10 + 1);
@@ -143,18 +167,15 @@ static void test_8x8_add(void) {
     // Initialize C with existing values (ADD mode)
     for (int i = 0; i < M * N; i++) {
         C[i] = (float)(i % 5);
+        C_expected[i] = C[i];
     }
-    memcpy(C_expected, C, M * N * sizeof(float));
     
     // Expected = C_old + A*B
-    float C_product[M * N];
     naive_gemm(C_product, A, B, M, K, N);
     for (int i = 0; i < M * N; i++)
         C_expected[i] += C_product[i];
     
     // Pack matrices
-    __attribute__((aligned(ALIGN_BYTES))) float Ap[K * 8];
-    __attribute__((aligned(ALIGN_BYTES))) float Bp[K * 8];
     for (int k = 0; k < K; k++) {
         for (int i = 0; i < M; i++)
             Ap[k * 8 + i] = A[i * K + k];
@@ -166,16 +187,30 @@ static void test_8x8_add(void) {
     gemm_8x8_panel_avx2fma_add(C, N, Ap, Bp, K, M, N, mask);
     
     compare_matrices(C, C_expected, M, N, "8×8 ADD");
+    
+    _aligned_free(A); _aligned_free(B); _aligned_free(C);
+    _aligned_free(C_expected); _aligned_free(C_product);
+    _aligned_free(Ap); _aligned_free(Bp);
 }
+
 
 // Test 4×8 tail kernel
 static void test_4x8_tail(void) {
     const int M = 4, K = 8, N = 8;
     
-    __attribute__((aligned(ALIGN_BYTES))) float A[M * K];
-    __attribute__((aligned(ALIGN_BYTES))) float B[K * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C[M * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C_expected[M * N];
+    float *A = (float*)_aligned_malloc(M * K * sizeof(float), ALIGN_BYTES);
+    float *B = (float*)_aligned_malloc(K * N * sizeof(float), ALIGN_BYTES);
+    float *C = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *C_expected = (float*)_aligned_malloc(M * N * sizeof(float), ALIGN_BYTES);
+    float *Ap = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    float *Bp = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    
+    if (!A || !B || !C || !C_expected || !Ap || !Bp) {
+        printf("  4×8 TAIL: ALLOC FAILED\n");
+        _aligned_free(A); _aligned_free(B); _aligned_free(C);
+        _aligned_free(C_expected); _aligned_free(Ap); _aligned_free(Bp);
+        return;
+    }
     
     for (int i = 0; i < M * K; i++) A[i] = (float)(i + 1);
     for (int i = 0; i < K * N; i++) B[i] = (float)(i + 1);
@@ -183,14 +218,12 @@ static void test_4x8_tail(void) {
     naive_gemm(C_expected, A, B, M, K, N);
     
     // Pack A (padded to 8 rows)
-    __attribute__((aligned(ALIGN_BYTES))) float Ap[K * 8];
     memset(Ap, 0, K * 8 * sizeof(float));
     for (int k = 0; k < K; k++)
         for (int i = 0; i < M; i++)
             Ap[k * 8 + i] = A[i * K + k];
     
     // Pack B
-    __attribute__((aligned(ALIGN_BYTES))) float Bp[K * 8];
     for (int k = 0; k < K; k++)
         memcpy(Bp + k * 8, B + k * N, 8 * sizeof(float));
     
@@ -200,16 +233,29 @@ static void test_4x8_tail(void) {
     gemm_4x8_panel_avx2fma_store(C, N, Ap, Bp, K, N, mask);
     
     compare_matrices(C, C_expected, M, N, "4×8 TAIL");
+    
+    _aligned_free(A); _aligned_free(B); _aligned_free(C);
+    _aligned_free(C_expected); _aligned_free(Ap); _aligned_free(Bp);
 }
+
 
 // Test 1×8 tail kernel
 static void test_1x8_tail(void) {
     const int M = 1, K = 8, N = 8;
     
-    __attribute__((aligned(ALIGN_BYTES))) float A[K];
-    __attribute__((aligned(ALIGN_BYTES))) float B[K * N];
-    __attribute__((aligned(ALIGN_BYTES))) float C[N];
-    __attribute__((aligned(ALIGN_BYTES))) float C_expected[N];
+    float *A = (float*)_aligned_malloc(K * sizeof(float), ALIGN_BYTES);
+    float *B = (float*)_aligned_malloc(K * N * sizeof(float), ALIGN_BYTES);
+    float *C = (float*)_aligned_malloc(N * sizeof(float), ALIGN_BYTES);
+    float *C_expected = (float*)_aligned_malloc(N * sizeof(float), ALIGN_BYTES);
+    float *Ap = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    float *Bp = (float*)_aligned_malloc(K * 8 * sizeof(float), ALIGN_BYTES);
+    
+    if (!A || !B || !C || !C_expected || !Ap || !Bp) {
+        printf("  1×8 TAIL: ALLOC FAILED\n");
+        _aligned_free(A); _aligned_free(B); _aligned_free(C);
+        _aligned_free(C_expected); _aligned_free(Ap); _aligned_free(Bp);
+        return;
+    }
     
     for (int k = 0; k < K; k++) A[k] = (float)(k + 1);
     for (int i = 0; i < K * N; i++) B[i] = (float)(i + 1);
@@ -217,13 +263,11 @@ static void test_1x8_tail(void) {
     naive_gemm(C_expected, A, B, M, K, N);
     
     // Pack A (padded to 8 rows)
-    __attribute__((aligned(ALIGN_BYTES))) float Ap[K * 8];
     memset(Ap, 0, K * 8 * sizeof(float));
     for (int k = 0; k < K; k++)
         Ap[k * 8] = A[k];
     
     // Pack B
-    __attribute__((aligned(ALIGN_BYTES))) float Bp[K * 8];
     for (int k = 0; k < K; k++)
         memcpy(Bp + k * 8, B + k * N, 8 * sizeof(float));
     
@@ -233,6 +277,9 @@ static void test_1x8_tail(void) {
     gemm_1x8_panel_avx2fma_store(C, Ap, Bp, K, N, mask);
     
     compare_matrices(C, C_expected, M, N, "1×8 TAIL");
+    
+    _aligned_free(A); _aligned_free(B); _aligned_free(C);
+    _aligned_free(C_expected); _aligned_free(Ap); _aligned_free(Bp);
 }
 
 void test_kernels_unit(void) {
