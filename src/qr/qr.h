@@ -38,6 +38,7 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <immintrin.h>
+#include "inv.h"
 
 #include "linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs
 
@@ -255,6 +256,8 @@ size_t qr_workspace_bytes(const qr_workspace *ws)
 //==============================================================================
 // SCALAR (REFERENCE) QR - UNCHANGED FROM ORIGINAL
 //==============================================================================
+
+//USE NAIVE MUL HERE. 
 
 static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
                      float *RESTRICT R, uint16_t m, uint16_t n, bool only_R)
