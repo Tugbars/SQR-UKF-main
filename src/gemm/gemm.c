@@ -117,7 +117,7 @@ static inline int linalg_has_avx512(void) { return 0; }
 // COMPLETE KERNELS HEADERS
 //==============================================================================
 
-#include "gemm_kernels_avx2_complete.h"
+#include "gemm_kernels_avx2.h"
 #include "gemm_kernels_avx512.h"
 
 /**

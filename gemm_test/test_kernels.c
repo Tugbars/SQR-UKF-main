@@ -6,7 +6,7 @@
 
 // Include your kernel headers (adjust path as needed)
 // Note: You may need to stub out dependencies if these headers require full context
-#include "../gemm_kernels_avx2_complete.h"
+#include "../gemm/gemm_kernels_avx2.h"
 
 #define TOLERANCE 1e-4f
 #define ALIGN_BYTES 32

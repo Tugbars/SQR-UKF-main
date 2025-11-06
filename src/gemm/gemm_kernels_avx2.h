@@ -24,6 +24,50 @@
 #define GEMM_KERNELS_AVX2_COMPLETE_H
 
 #include "gemm_simd_ops.h"
+#include <stdalign.h> 
+#include <string.h>    
+
+// Prefetch configuration
+#ifndef GEMM_PREFETCH_MIN_K
+#define GEMM_PREFETCH_MIN_K 128
+#endif
+
+#ifndef LINALG_GEMM_PREFETCH_A_LONG
+#define LINALG_GEMM_PREFETCH_A_LONG 0
+#endif
+
+#ifndef LINALG_NT_STORES
+#define LINALG_NT_STORES 1
+#endif
+
+// Prefetch macros (if not already defined)
+#ifndef PREFETCH_T0
+#define PREFETCH_T0(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T0)
+#endif
+
+#ifndef PREFETCH_T1
+#define PREFETCH_T1(ptr) _mm_prefetch((const char*)(ptr), _MM_HINT_T1)
+#endif
+
+// Restrict qualifier
+#ifndef RESTRICT
+#if defined(__GNUC__) || defined(__clang__)
+#define RESTRICT __restrict__
+#elif defined(_MSC_VER)
+#define RESTRICT __restrict
+#else
+#define RESTRICT
+#endif
+#endif
+
+// Alignment helper
+#ifndef LINALG_ASSUME_ALIGNED
+#if defined(__GNUC__) || defined(__clang__)
+#define LINALG_ASSUME_ALIGNED(p, n) (p) = (__typeof__(p))__builtin_assume_aligned((p), (n))
+#else
+#define LINALG_ASSUME_ALIGNED(p, n) ((void)0)
+#endif
+#endif
 
 //==============================================================================
 // HELPER: Load columns from column-major temp buffer
@@ -1300,207 +1344,15 @@ static inline void gemm_8x16_panel_avx2fma_add(
             if (kk >= Kblk)
                 break;
 
-            // Load A column (8 elements)
-            __m256 a = _mm256_load_ps(Ap + kk * 8);
-
             // Load B row (16 elements = 2 vectors)
-            const float *b_row = Bp + kk * 16;
-            __m256 b_lo = _mm256_load_ps(b_row + 0); // cols 0-7
-            __m256 b_hi = _mm256_load_ps(b_row + 8); // cols 8-15
-
-            // Broadcast each element of A and FMA with B
-            __m256 a0 = _mm256_broadcast_ss(b_row_a + 0);
-            __m256 a1 = _mm256_broadcast_ss(b_row_a + 1);
-            __m256 a2 = _mm256_broadcast_ss(b_row_a + 2);
-            __m256 a3 = _mm256_broadcast_ss(b_row_a + 3);
-            __m256 a4 = _mm256_broadcast_ss(b_row_a + 4);
-            __m256 a5 = _mm256_broadcast_ss(b_row_a + 5);
-            __m256 a6 = _mm256_broadcast_ss(b_row_a + 6);
-            __m256 a7 = _mm256_broadcast_ss(b_row_a + 7);
-
-            // FMA: acc += a[i] * b[j] for each (i,j) pair
-            acc_lo0 = _mm256_fmadd_ps(a0, b_lo, acc_lo0);
-            acc_hi0 = _mm256_fmadd_ps(a0, b_hi, acc_hi0);
-            acc_lo1 = _mm256_fmadd_ps(a1, b_lo, acc_lo1);
-            acc_hi1 = _mm256_fmadd_ps(a1, b_hi, acc_hi1);
-            acc_lo2 = _mm256_fmadd_ps(a2, b_lo, acc_lo2);
-            acc_hi2 = _mm256_fmadd_ps(a2, b_hi, acc_hi2);
-            acc_lo3 = _mm256_fmadd_ps(a3, b_lo, acc_lo3);
-            acc_hi3 = _mm256_fmadd_ps(a3, b_hi, acc_hi3);
-            acc_lo4 = _mm256_fmadd_ps(a4, b_lo, acc_lo4);
-            acc_hi4 = _mm256_fmadd_ps(a4, b_hi, acc_hi4);
-            acc_lo5 = _mm256_fmadd_ps(a5, b_lo, acc_lo5);
-            acc_hi5 = _mm256_fmadd_ps(a5, b_hi, acc_hi5);
-            acc_lo6 = _mm256_fmadd_ps(a6, b_lo, acc_lo6);
-            acc_hi6 = _mm256_fmadd_ps(a6, b_hi, acc_hi6);
-            acc_lo7 = _mm256_fmadd_ps(a7, b_lo, acc_lo7);
-            acc_hi7 = _mm256_fmadd_ps(a7, b_hi, acc_hi7);
-        }
-    }
-
-    // Writeback: ADD mode (C += result)
-
-    // Fast path: full 8×16 with in-register transpose
-    if (m == 8 && n == 16)
-    {
-        // Transpose and write lo (cols 0-7)
-        __m256 cols_lo[8] = {acc_lo0, acc_lo1, acc_lo2, acc_lo3,
-                             acc_lo4, acc_lo5, acc_lo6, acc_lo7};
-        gemm_transpose_8x8_avx2(cols_lo);
-
-        for (size_t r = 0; r < 8; ++r)
-        {
-            float *cr = c + r * ldc;
-            __m256 old = _mm256_loadu_ps(cr);
-            _mm256_storeu_ps(cr, _mm256_add_ps(old, cols_lo[r]));
-        }
-
-        // Transpose and write hi (cols 8-15)
-        __m256 cols_hi[8] = {acc_hi0, acc_hi1, acc_hi2, acc_hi3,
-                             acc_hi4, acc_hi5, acc_hi6, acc_hi7};
-        gemm_transpose_8x8_avx2(cols_hi);
-
-        for (size_t r = 0; r < 8; ++r)
-        {
-            float *cr = c + r * ldc + 8;
-            __m256 old = _mm256_loadu_ps(cr);
-            _mm256_storeu_ps(cr, _mm256_add_ps(old, cols_hi[r]));
-        }
-    }
-    // Slow path: partial m or n
-    else
-    {
-        // Store to temp buffer, then scatter
-        alignas(32) float temp[8 * 16];
-
-        // Lo columns (0-7)
-        _mm256_store_ps(temp + 0 * 8, acc_lo0);
-        _mm256_store_ps(temp + 1 * 8, acc_lo1);
-        _mm256_store_ps(temp + 2 * 8, acc_lo2);
-        _mm256_store_ps(temp + 3 * 8, acc_lo3);
-        _mm256_store_ps(temp + 4 * 8, acc_lo4);
-        _mm256_store_ps(temp + 5 * 8, acc_lo5);
-        _mm256_store_ps(temp + 6 * 8, acc_lo6);
-        _mm256_store_ps(temp + 7 * 8, acc_lo7);
-
-        // Hi columns (8-15)
-        _mm256_store_ps(temp + 8 * 8, acc_hi0);
-        _mm256_store_ps(temp + 9 * 8, acc_hi1);
-        _mm256_store_ps(temp + 10 * 8, acc_hi2);
-        _mm256_store_ps(temp + 11 * 8, acc_hi3);
-        _mm256_store_ps(temp + 12 * 8, acc_hi4);
-        _mm256_store_ps(temp + 13 * 8, acc_hi5);
-        _mm256_store_ps(temp + 14 * 8, acc_hi6);
-        _mm256_store_ps(temp + 15 * 8, acc_hi7);
-
-        // Scatter with tail handling
-        for (size_t r = 0; r < m; ++r)
-        {
-            float *cr = c + r * ldc;
-
-            // First 8 cols
-            if (n >= 8)
-            {
-                __m256 sum_lo = load_cols_from_temp(temp, 8, r, 8);
-                __m256 old_lo = _mm256_loadu_ps(cr);
-                _mm256_storeu_ps(cr, _mm256_add_ps(old_lo, sum_lo));
-
-                // Next 8 cols
-                if (n > 8)
-                {
-                    __m256 sum_hi = load_cols_from_temp(temp + 8 * 8, 8, r, n - 8);
-                    __m256 old_hi = _mm256_maskload_ps(cr + 8, mask);
-                    _mm256_maskstore_ps(cr + 8, mask, _mm256_add_ps(old_hi, sum_hi));
-                }
-            }
-            else
-            {
-                // n < 8: only lo part with mask
-                __m256 sum_lo = load_cols_from_temp(temp, 8, r, n);
-                __m256 old_lo = _mm256_maskload_ps(cr, mask);
-                _mm256_maskstore_ps(cr, mask, _mm256_add_ps(old_lo, sum_lo));
-            }
-        }
-    }
-}
-
-//==============================================================================
-// 8×16 KERNEL (ADD): C += A*B
-//==============================================================================
-
-/**
- * @brief 8×16 kernel (ADD): C += A*B
- * @param c Output matrix (8×16, ld=ldc)
- * @param ldc Leading dimension of C
- * @param Ap Packed A (8×Kblk, column-major)
- * @param Bp Packed B (Kblk×16, layout: [8][8] per row)
- * @param Kblk Inner dimension
- * @param m Actual rows (≤8)
- * @param n Actual cols (≤16)
- * @param mask Tail mask for n < 16
- */
-static inline void gemm_8x16_panel_avx2fma_add(
-    float *RESTRICT c, size_t ldc,
-    const float *RESTRICT Ap,
-    const float *RESTRICT Bp,
-    size_t Kblk, size_t m, size_t n, __m256i mask)
-{
-    LINALG_ASSUME_ALIGNED(c, 32);
-    LINALG_ASSUME_ALIGNED(Ap, 32);
-    LINALG_ASSUME_ALIGNED(Bp, 32);
-
-    // 16 accumulators: 8 for cols 0-7 (lo), 8 for cols 8-15 (hi)
-    __m256 acc_lo0 = _mm256_setzero_ps(), acc_lo1 = _mm256_setzero_ps();
-    __m256 acc_lo2 = _mm256_setzero_ps(), acc_lo3 = _mm256_setzero_ps();
-    __m256 acc_lo4 = _mm256_setzero_ps(), acc_lo5 = _mm256_setzero_ps();
-    __m256 acc_lo6 = _mm256_setzero_ps(), acc_lo7 = _mm256_setzero_ps();
-
-    __m256 acc_hi0 = _mm256_setzero_ps(), acc_hi1 = _mm256_setzero_ps();
-    __m256 acc_hi2 = _mm256_setzero_ps(), acc_hi3 = _mm256_setzero_ps();
-    __m256 acc_hi4 = _mm256_setzero_ps(), acc_hi5 = _mm256_setzero_ps();
-    __m256 acc_hi6 = _mm256_setzero_ps(), acc_hi7 = _mm256_setzero_ps();
-
-    const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
-
-    // Prefetch output rows
-    for (size_t r = 0; r < m; r += 4)
-        PREFETCH_T0(c + r * ldc);
-
-    const size_t PF_LONG = 32;
-
-    // Main K loop: unroll by 8
-    for (size_t k = 0; k < Kblk; k += 8)
-    {
-        // Prefetch next B panel
-        if (do_pf)
-        {
-            size_t kpf_s = k + 8, kpf_l = k + PF_LONG;
-            if (kpf_s < Kblk)
-                PREFETCH_T0(Bp + kpf_s * 16);
-            if (kpf_l < Kblk)
-                PREFETCH_T0(Bp + kpf_l * 16);
-#if LINALG_GEMM_PREFETCH_A_LONG
-            if (kpf_l < Kblk)
-                PREFETCH_T0(Ap + kpf_l * 8);
-#endif
-        }
-
-        // U2 pipeline: process 8 k iterations
-        for (int u = 0; u < 8; ++u)
-        {
-            size_t kk = k + u;
-            if (kk >= Kblk)
-                break;
-
             // Load A row (8 elements) and B row (16 elements)
-            const float *a_row = Ap + kk * 8;
+            const float *a_row = Ap + kk * 8; 
             const float *b_row = Bp + kk * 16;
-
             __m256 b_lo = _mm256_load_ps(b_row + 0); // cols 0-7
             __m256 b_hi = _mm256_load_ps(b_row + 8); // cols 8-15
 
             // Broadcast each element of A and FMA with B
-            __m256 a0 = _mm256_broadcast_ss(a_row + 0);
+            __m256 a0 = _mm256_broadcast_ss(a_row + 0); // ← CORRECT
             __m256 a1 = _mm256_broadcast_ss(a_row + 1);
             __m256 a2 = _mm256_broadcast_ss(a_row + 2);
             __m256 a3 = _mm256_broadcast_ss(a_row + 3);
