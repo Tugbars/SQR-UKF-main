@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <time.h>
 
+
+#include "../gemm/gemm.h"
+
 // Test function declarations
 void test_kernels_unit(void);
 void test_reference_small(void);

@@ -1,5 +1,5 @@
 /**
- * @file gemm_complete.c  
+ * @file gemm.c  
  * @brief Complete GEMM Implementation - Faithful Refactoring
  *
  * This is a COMPLETE and FAITHFUL refactoring of the original GEMM code.
@@ -489,36 +489,30 @@ static inline void pack_B_tile(
 //==============================================================================
 
 enum kernel_shape {
-    K16x6,  // AVX2
-    K8x6,   // AVX2
-    K16x8,  // AVX2
-    K8x8,   // AVX2
+    K16x6,   // 0
+    K8x6,    // 1
+    K16x8,   // 2
+    K8x8,    // 3
+    K8x16,   // 4
 #ifdef __AVX512F__
-    K32x12, // AVX-512
-    K32x16  // AVX-512
+    K32x12,  // 5 (AVX-512)
+    K32x16   // 6 (AVX-512)
 #endif
 };
 
 static enum kernel_shape pick_kernel(size_t Mc, size_t Nc, size_t Kc) {
-    // AVX-512 path
-#ifdef __AVX512F__
-    if (linalg_has_avx512()) {
-        if (Mc >= 32 && Nc >= 16) return KERN_32x16_AVX512;
-        if (Mc >= 32 && Nc >= 12) return KERN_32x12_AVX512;
-    }
-#endif
+    (void)Kc;  // unused parameter
     
-    // AVX2 path
-    if (Mc >= 16 && Nc >= 8) return KERN_16x8_AVX2;
-    if (Mc >= 16 && Nc >= 6) return KERN_16x6_AVX2;
+    // Check larger kernels first (most efficient)
+    if (Mc >= 16 && Nc >= 8) return K16x8;
+    if (Mc >= 16 && Nc >= 6) return K16x6;
     
-    // ✨ NEW: Add 8×16 selection
-    if (Mc >= 8 && Nc >= 16) return KERN_8x16_AVX2;  // ← ADD THIS!
+    // ⚠️ IMPORTANT: Check 8×16 BEFORE 8×8!
+    if (Mc >= 8 && Nc >= 16) return K8x16;  // ← Must come before K8x8
+    if (Mc >= 8 && Nc >= 8) return K8x8;
+    if (Mc >= 8 && Nc >= 6) return K8x6;
     
-    if (Mc >= 8 && Nc >= 8) return KERN_8x8_AVX2;
-    if (Mc >= 8 && Nc >= 6) return KERN_8x6_AVX2;
-    
-    return KERN_8x8_AVX2; // fallback
+    return K8x8;  // fallback
 }
 
 //==============================================================================
@@ -570,12 +564,21 @@ int mul(
 
     // Kernel table (EXTENDED FOR AVX-512)
     static const struct ker KERS[] = {
-        // AVX2 kernels
-        {pack_A_block_16row_colmajor, pack_A_16row_tile, gemm_16x6_panel_avx2fma_add, gemm_16x6_panel_avx2fma_store, 16, 6, 16},
-        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor, gemm_8x6_panel_avx2fma_add, gemm_8x6_panel_avx2fma_store, 8, 6, 8},
-        {pack_A_block_16row_colmajor, pack_A_16row_tile, gemm_16x8_panel_avx2fma_add, gemm_16x8_panel_avx2fma_store, 16, 8, 16},
-        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor, gemm_8x8_panel_avx2fma_add, gemm_8x8_panel_avx2fma_store, 8, 8, 8},
-        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor, gemm_8x16_panel_avx2fma_add, gemm_8x16_panel_avx2fma_store, 8, 16, 8},  
+        // AVX2 kernels (order must match enum!)
+        {pack_A_block_16row_colmajor, pack_A_16row_tile,
+         gemm_16x6_panel_avx2fma_add, gemm_16x6_panel_avx2fma_store, 16, 6, 16}, // K16x6
+
+        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,
+         gemm_8x6_panel_avx2fma_add, gemm_8x6_panel_avx2fma_store, 8, 6, 8}, // K8x6
+
+        {pack_A_block_16row_colmajor, pack_A_16row_tile,
+         gemm_16x8_panel_avx2fma_add, gemm_16x8_panel_avx2fma_store, 16, 8, 16}, // K16x8
+
+        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,
+         gemm_8x8_panel_avx2fma_add, gemm_8x8_panel_avx2fma_store, 8, 8, 8}, // K8x8
+
+        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,                // ← ADD THIS
+         gemm_8x16_panel_avx2fma_add, gemm_8x16_panel_avx2fma_store, 8, 16, 8}, // K8x16
 #ifdef __AVX512F__
         // AVX-512 kernels
         {pack_A_block_32row_colmajor, pack_A_32row_tile, gemm_32x12_panel_avx512_add, gemm_32x12_panel_avx512_store, 32, 12, 32},

@@ -11,23 +11,6 @@
 #define TOLERANCE 1e-4f
 #define ALIGN_BYTES 32
 
-// Helper: Build mask (copy from your code)
-static inline __m256i gemm_build_mask_avx2(int lanes) {
-    static const int mask_table[9][8] __attribute__((aligned(32))) = {
-        {0, 0, 0, 0, 0, 0, 0, 0},
-        {-1, 0, 0, 0, 0, 0, 0, 0},
-        {-1, -1, 0, 0, 0, 0, 0, 0},
-        {-1, -1, -1, 0, 0, 0, 0, 0},
-        {-1, -1, -1, -1, 0, 0, 0, 0},
-        {-1, -1, -1, -1, -1, 0, 0, 0},
-        {-1, -1, -1, -1, -1, -1, 0, 0},
-        {-1, -1, -1, -1, -1, -1, -1, 0},
-        {-1, -1, -1, -1, -1, -1, -1, -1}
-    };
-    __m128i b8 = _mm_loadl_epi64((const __m128i *)mask_table[lanes]);
-    return _mm256_cvtepi8_epi32(b8);
-}
-
 // Compare matrices with tolerance
 static int compare_matrices(const float *C, const float *C_ref, int M, int N,
                            const char *name) {
