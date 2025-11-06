@@ -35,10 +35,55 @@
 #define RESTRICT __restrict__
 #endif
 
-// Declare external functions
-extern int linalg_has_avx2(void);
-extern void *linalg_aligned_alloc(size_t alignment, size_t size);
-extern void linalg_aligned_free(void *ptr);
+/**
+ * @brief Check if AVX2 is available on this CPU
+ */
+static inline int linalg_has_avx2(void)
+{
+#if defined(__AVX2__)
+    // Compiled with AVX2 support, assume available
+    // (A more robust implementation would use CPUID)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+/**
+ * @brief Aligned memory allocation (32-byte alignment for AVX2)
+ */
+static inline void *linalg_aligned_alloc(size_t alignment, size_t size)
+{
+#ifdef _WIN32
+    // Windows: use _aligned_malloc
+    return _aligned_malloc(size, alignment);
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    // C11: use aligned_alloc
+    // Note: size must be multiple of alignment for C11
+    size_t padded_size = ((size + alignment - 1) / alignment) * alignment;
+    return aligned_alloc(alignment, padded_size);
+#else
+    // Fallback: use posix_memalign
+    void *ptr = NULL;
+    if (posix_memalign(&ptr, alignment, size) != 0)
+        return NULL;
+    return ptr;
+#endif
+}
+
+/**
+ * @brief Free aligned memory
+ */
+static inline void linalg_aligned_free(void *ptr)
+{
+    if (!ptr) return;
+    
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
+}
 
 // AVX-512 detection (add if not available in linalg_simd.h)
 #ifdef __AVX512F__
