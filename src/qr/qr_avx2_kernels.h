@@ -19,6 +19,51 @@
 #define L3_CACHE_SIZE (36 * 1024 * 1024)
 #endif
 
+//==============================================================================
+// PREFETCH TUNING KNOBS (Intel 14900KF optimized)
+//==============================================================================
+
+/**
+ * @brief Prefetch distance for V row elements (in rows ahead)
+ * 
+ * Tuning guide for Intel 14900KF:
+ * - L1D latency: ~5 cycles
+ * - L2 latency: ~12 cycles  
+ * - Recommended range: 6-12 rows ahead
+ * - Default: 8 (conservative, works well for most cases)
+ * 
+ * To tune: compile with -DQR_PF_V_AHEAD=X and benchmark
+ */
+#ifndef QR_PF_V_AHEAD
+#define QR_PF_V_AHEAD 8
+#endif
+
+/**
+ * @brief Prefetch distance for Cpack row elements (in rows ahead)
+ * 
+ * Tuning guide:
+ * - Cpack is packed contiguous, so prefetch is less critical than V
+ * - Recommended range: 6-10 rows ahead
+ * - Default: 8
+ */
+#ifndef QR_PF_C_AHEAD
+#define QR_PF_C_AHEAD 8
+#endif
+
+/**
+ * @brief Prefetch next panel V elements (in panels ahead)
+ * 
+ * For compute_Y kernel: prefetch V elements from next panel
+ * while processing current panel.
+ * 
+ * Tuning guide:
+ * - Only useful when ib >= 12 (multiple 6-row blocks)
+ * - Default: 6 (one full 6-row block ahead)
+ */
+#ifndef QR_PF_PANEL_AHEAD
+#define QR_PF_PANEL_AHEAD 6
+#endif
+
 #ifdef __cplusplus
 extern "C"
 {

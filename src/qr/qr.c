@@ -1213,6 +1213,32 @@ int qr(const float *RESTRICT A,
     return ret;
 }
 
+int qr_ws_inplace(qr_workspace *ws, float *RESTRICT A_inout,
+                  float *RESTRICT Q, uint16_t m, uint16_t n, bool only_R)
+{
+    if (!ws || !A_inout) return -EINVAL;
+    const uint16_t mn = (m < n) ? m : n;
+    
+    if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2()) {
+        // Need temp for scalar path
+        float *tmp = (float*)aligned_alloc32((size_t)m*n*sizeof(float));
+        if (!tmp) return -ENOMEM;
+        memcpy(tmp, A_inout, (size_t)m*n*sizeof(float));
+        int ret = qr_scalar(tmp, Q, A_inout, m, n, only_R);
+        aligned_free32(tmp);
+        return ret;
+    }
+    
+    int rc = qrw_geqrf_blocked_wy_ws(A_inout, m, n, ws);
+    if (rc) return rc;
+    
+    if (!only_R) {
+        rc = qrw_orgqr_full_ws(Q, m, A_inout, n, ws->tau, mn, ws);
+        if (rc) return rc;
+    }
+    return 0;
+}
+
 /**
  * @brief Legacy CPQR function (UNCHANGED API - backward compatible)
  *
