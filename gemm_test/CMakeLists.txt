@@ -44,6 +44,7 @@ add_executable(test_gemm
     test_main.c 
     test_kernels.c 
     test_reference.c
+    test_benchmark.c
 )
 
 target_link_libraries(test_gemm PRIVATE gemm_avx2)

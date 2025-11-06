@@ -9,6 +9,7 @@
 void test_kernels_unit(void);
 void test_reference_small(void);
 void test_reference_large(void);
+void run_benchmark_suite(void);
 
 int main(void) {
     printf("=== GEMM Test Suite ===\n");
@@ -30,7 +31,12 @@ int main(void) {
     printf("\n\nPhase 3: Large matrices\n");
     printf("-----------------------\n");
     test_reference_large();
-    
+
+     printf("\n\nPhase 4: Benchmarks (optional)\n");
+    printf("------------------------------\n");
+    //run_benchmark_suite();          // or bench_case(256,256,256, 15, 1);
+
+
     printf("\n\n=== All tests completed! ===\n");
     return 0;
 }
