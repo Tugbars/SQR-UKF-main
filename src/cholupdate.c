@@ -26,6 +26,7 @@
 #include <math.h>
 #include <immintrin.h>
 #include "linalg_simd.h"
+#include "../qr/qr.h" 
 
 #ifndef CHOLK_COL_TILE
 #define CHOLK_COL_TILE 32
@@ -92,6 +93,9 @@ typedef struct cholupdate_workspace_s
     float *tau;  // min(n,n+k) - Householder scalars for QR
     float *Utmp; // n×n - temporary for transpose operations
 
+    // QR workspace (embedded) ← ADD THIS
+    qr_workspace *qr_ws;
+
     // Memory accounting
     size_t total_bytes;
 } cholupdate_workspace;
@@ -124,7 +128,6 @@ cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
     ws->k_max = k_max;
     ws->total_bytes = sizeof(cholupdate_workspace);
 
-// Allocate buffers
 #define ALLOC_BUF(ptr, count)                           \
     do                                                  \
     {                                                   \
@@ -143,6 +146,15 @@ cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
         ALLOC_BUF(M, (size_t)n_max * m_cols);
         ALLOC_BUF(tau, n_max < m_cols ? n_max : m_cols);
         ALLOC_BUF(Utmp, (size_t)n_max * n_max);
+        
+        // ============================================
+        // NEW: Allocate QR workspace
+        // ============================================
+        // QR needs to factor M (n × (n+k) matrix)
+        ws->qr_ws = qr_workspace_alloc(n_max, (uint16_t)(n_max + k_max), QRW_IB_DEFAULT);
+        if (!ws->qr_ws)
+            goto cleanup_fail;
+        ws->total_bytes += qr_workspace_bytes(ws->qr_ws);
     }
 
 #undef ALLOC_BUF
@@ -158,6 +170,8 @@ cleanup_fail:
         aligned_free32(ws->tau);
     if (ws->Utmp)
         aligned_free32(ws->Utmp);
+    if (ws->qr_ws)
+        qr_workspace_free(ws->qr_ws);  // ← ADD THIS
     free(ws);
     return NULL;
 }
@@ -176,6 +190,13 @@ void cholupdate_workspace_free(cholupdate_workspace *ws)
     aligned_free32(ws->M);
     aligned_free32(ws->tau);
     aligned_free32(ws->Utmp);
+    
+    // ============================================
+    // NEW: Free QR workspace
+    // ============================================
+    if (ws->qr_ws)
+        qr_workspace_free(ws->qr_ws);
+    
     free(ws);
 }
 
@@ -445,10 +466,9 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
     float *tau = ws->tau;
     float *Utmp = ws->Utmp;
 
-    // Build M = [U | s*X]
+    // Build M = [U | s*X] (UNCHANGED)
     if (is_upper)
     {
-        // Copy U into M[:,0:n]
         for (uint16_t i = 0; i < n; ++i)
         {
             float *dst = M + (size_t)i * m_cols;
@@ -460,7 +480,6 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
     }
     else
     {
-        // Build U = L^T into M[:,0:n]
         for (uint16_t i = 0; i < n; ++i)
         {
             float *dst = M + (size_t)i * m_cols;
@@ -472,7 +491,7 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
         }
     }
 
-    // Copy scaled X into M[:,n:n+k]
+    // Copy scaled X into M[:,n:n+k] (UNCHANGED)
     const float s = (add >= 0) ? 1.0f : -1.0f;
     for (uint16_t i = 0; i < n; ++i)
     {
@@ -482,19 +501,20 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
             dst[j] = s * src[j];
     }
 
-    // QR factorization (uses workspace tau - NO MALLOC)
-    int rc = qrw_geqrf_blocked_wy(M, n, m_cols, QRW_IB_DEFAULT, tau);
+    // ============================================
+    // CHANGED: Call QR workspace version
+    // ============================================
+    int rc = qr_ws_inplace(ws->qr_ws, M, NULL, n, m_cols, true);  // ← Use workspace version
     if (rc)
         return rc;
 
-    // Extract new Cholesky factor
+    // Extract new Cholesky factor (UNCHANGED)
     if (is_upper)
     {
         copy_upper_nxn_from_qr(L_or_U, M, n, m_cols);
     }
     else
     {
-        // Extract U, transpose to L (uses workspace Utmp - NO MALLOC)
         copy_upper_nxn_from_qr(Utmp, M, n, m_cols);
 
         for (uint16_t i = 0; i < n; ++i)
