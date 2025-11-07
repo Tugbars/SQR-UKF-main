@@ -4,6 +4,7 @@
         "linalg_simd.h": "c",
         "compare": "c",
         "immintrin.h": "c",
-        "gemm_simd_ops.h": "c"
+        "gemm_simd_ops.h": "c",
+        "qr_avx2_kernels.h": "c"
     }
 }

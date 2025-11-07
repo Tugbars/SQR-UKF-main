@@ -59,6 +59,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 #include <math.h>
 #include <errno.h>
@@ -68,9 +69,9 @@
 #include "../includes/linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs, linalg_aligned_alloc/free
 // also exports mul(), inv() that qr_scalar uses
 
-#if LINALG_SIMD_ENABLE
+#define LINALG_SIMD_ENABLE 1
 #include "qr_avx2_kernels.h" // Highly optimized AVX2 kernels with 6x16 register blocking
-#endif
+
 
 #ifndef LINALG_SMALL_N_THRESH
 #define LINALG_SMALL_N_THRESH 48
@@ -410,6 +411,12 @@ static void qrw_panel_geqr2(qrw_t *RESTRICT A, uint16_t m, uint16_t n,
 
         qrw_t beta;
         qrw_t tauj = qrw_householder_robust(tmp, rows, &beta);
+
+        if (!isfinite(tauj) || !isfinite(beta)) {
+            printf("ERROR: Householder failed at j=%u: tau=%f, beta=%f\n", j, tauj, beta);
+            // Don't return, just flag it
+        }
+
         tau_panel[j - k] = tauj;
 
         // Scatter back
@@ -648,11 +655,15 @@ static void qrw_apply_VZ_scalar(qrw_t *RESTRICT Cpack, uint16_t m_sub, uint16_t 
 static int qrw_geqrf_blocked_wy_ws(qrw_t *RESTRICT A, uint16_t m, uint16_t n,
                                    qr_workspace *ws)
 {
+
+     printf("DEBUG qrw_geqrf_blocked_wy_ws: m=%u, n=%u\n", m, n);
     if (m == 0 || n == 0)
         return 0;
 
     const uint16_t ib = ws->ib;
     const uint16_t kmax = (m < n) ? m : n;
+
+     printf("DEBUG: ib=%u, kmax=%u\n", ib, kmax);
 
     // Use workspace buffers (NO MALLOC)
     qrw_t *tau_out = ws->tau;
@@ -670,6 +681,13 @@ static int qrw_geqrf_blocked_wy_ws(qrw_t *RESTRICT A, uint16_t m, uint16_t n,
 
         // 1) Panel factorization (UNCHANGED - uses tmp from workspace)
         qrw_panel_geqr2(A, m, n, k, ib_k, tau_panel, tmp);
+
+        for (uint16_t i = 0; i < ib_k; ++i) {
+            if (!isfinite(tau_panel[i])) {
+                printf("ERROR: tau[%u] = %f (NaN/Inf detected)\n", k+i, tau_panel[i]);
+                return -EDOM;
+            }
+        }
 
         // 2) Build T (UNCHANGED - reuses T from workspace)
         qrw_larft(T, ib_k, A, m, n, k, tau_panel);
@@ -1214,9 +1232,9 @@ int geqp3_hybrid_ws(float *RESTRICT A, uint16_t m, uint16_t n,
  * @note User responsible for correct dimensions (m ≤ m_max, n ≤ n_max)
  */
 int qr_ws(qr_workspace *ws,
-          const float *RESTRICT A,
-          float *RESTRICT Q,
-          float *RESTRICT R,
+          const float *restrict A,
+          float *restrict Q,
+          float *restrict R,
           uint16_t m, uint16_t n,
           bool only_R)
 {
@@ -1226,16 +1244,15 @@ int qr_ws(qr_workspace *ws,
     if (m == 0 || n == 0)
         return -EINVAL;
 
-    // User's responsibility to provide correct dimensions
-    // (We could add assert(m <= ws->m_max && n <= ws->n_max) in debug builds)
-
     const uint16_t mn = (m < n) ? m : n;
 
+    // ⚠️ ADD DIAGNOSTIC
+    printf("DEBUG qr_ws: m=%u, n=%u, mn=%u, THRESH=%d, has_avx2=%d\n",
+           m, n, mn, LINALG_SMALL_N_THRESH, linalg_has_avx2());
+
     // Small matrix or no AVX2: use scalar fallback
-    if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2())
-    {
-       // return qr_scalar(A, Q, R, m, n, only_R);
-    }
+
+    printf("DEBUG: Using blocked AVX2 path\n");
 
     // Copy A → R
     memcpy(R, A, (size_t)m * n * sizeof(float));
@@ -1255,7 +1272,6 @@ int qr_ws(qr_workspace *ws,
 
     return 0;
 }
-
 /**
  * @brief Execute CPQR using workspace (HOT PATH - ZERO MALLOC)
  *
@@ -1324,33 +1340,28 @@ int qr(const float *RESTRICT A,
     return ret;
 }
 
-int qr_ws_inplace(qr_workspace *ws, float *RESTRICT A_inout,
-                  float *RESTRICT Q, uint16_t m, uint16_t n, bool only_R)
+int qr_ws_inplace(qr_workspace *ws, float *restrict A_inout,
+                  float *restrict Q, uint16_t m, uint16_t n, bool only_R)
 {
-    if (!ws || !A_inout) return -EINVAL;
-    const uint16_t mn = (m < n) ? m : n;
-    /*
-    if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2()) {
-        // Need temp for scalar path
-        float *tmp = (float*)aligned_alloc32((size_t)m*n*sizeof(float));
-        if (!tmp) return -ENOMEM;
-        memcpy(tmp, A_inout, (size_t)m*n*sizeof(float));
-       // int ret = qr_scalar(tmp, Q, A_inout, m, n, only_R);
-       int ret = 0;
-        aligned_free32(tmp);
-        return ret;
-    }
-        */
+    if (!ws || !A_inout) 
+        return -EINVAL;
     
+    const uint16_t mn = (m < n) ? m : n;
+    
+    // ⚠️ ALWAYS USE BLOCKED PATH - NO SCALAR FALLBACK
     int rc = qrw_geqrf_blocked_wy_ws(A_inout, m, n, ws);
-    if (rc) return rc;
+    if (rc) 
+        return rc;
     
     if (!only_R) {
         rc = qrw_orgqr_full_ws(Q, m, A_inout, n, ws->tau, mn, ws);
-        if (rc) return rc;
+        if (rc) 
+            return rc;
     }
+    
     return 0;
 }
+
 
 /**
  * @brief Legacy CPQR function (UNCHANGED API - backward compatible)
