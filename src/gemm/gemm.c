@@ -23,6 +23,7 @@
 #include <string.h>
 #include <stdlib.h>
 
+
 // External dependencies (same as original)
 // Requires: linalg_has_avx2(), linalg_aligned_alloc(), linalg_aligned_free()
 // and LINALG_DEFAULT_ALIGNMENT, RESTRICT from linalg_simd.h
@@ -158,6 +159,7 @@ static inline int linalg_has_avx512(void) { return 0; }
 //==============================================================================
 
 #include "gemm_simd_ops.h"
+#include "gemm.h"
 
 //==============================================================================
 // COMPLETE KERNELS HEADERS
@@ -165,6 +167,93 @@ static inline int linalg_has_avx512(void) { return 0; }
 
 #include "gemm_kernels_avx2.h"
 #include "gemm_kernels_avx512.h"
+
+//==============================================================================
+// WORKSPACE IMPLEMENTATION
+//==============================================================================
+
+struct gemm_workspace {
+    void *buffer;
+    size_t size;
+    size_t used;       // Bump allocator for sub-allocation
+    int owns_memory;
+};
+
+size_t gemm_workspace_query(uint16_t M, uint16_t K, uint16_t N)
+{
+    (void)M; (void)N;
+    
+    const size_t Kc = LINALG_BLOCK_KC;
+    
+#ifdef __AVX512F__
+    size_t max_mr = 32, max_nr = 16;
+#else
+    size_t max_mr = 16, max_nr = 16;
+#endif
+    
+    size_t Ap_size = max_mr * Kc * sizeof(float);
+    
+    size_t max_panels = (LINALG_BLOCK_JC + max_nr - 1) / max_nr;
+    size_t Bp_size = Kc * max_panels * max_nr * sizeof(float);
+    
+    return Ap_size + Bp_size + 64;
+}
+
+gemm_workspace_t *gemm_workspace_create(size_t size)
+{
+    gemm_workspace_t *ws = malloc(sizeof(*ws));
+    if (!ws) return NULL;
+    
+    ws->buffer = linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, size);
+    if (!ws->buffer) {
+        free(ws);
+        return NULL;
+    }
+    
+    ws->size = size;
+    ws->used = 0;
+    ws->owns_memory = 1;
+    return ws;
+}
+
+gemm_workspace_t *gemm_workspace_init(void *buffer, size_t size)
+{
+    if (!buffer) return NULL;
+    
+    gemm_workspace_t *ws = malloc(sizeof(*ws));
+    if (!ws) return NULL;
+    
+    ws->buffer = buffer;
+    ws->size = size;
+    ws->used = 0;
+    ws->owns_memory = 0;
+    return ws;
+}
+
+void gemm_workspace_destroy(gemm_workspace_t *ws)
+{
+    if (!ws) return;
+    if (ws->owns_memory)
+        linalg_aligned_free(ws->buffer);
+    free(ws);
+}
+
+// Internal sub-allocator
+static inline void *ws_alloc(gemm_workspace_t *ws, size_t bytes, size_t align)
+{
+    size_t offset = (ws->used + align - 1) & ~(align - 1);
+    if (offset + bytes > ws->size)
+        return NULL;
+    
+    void *ptr = (char *)ws->buffer + offset;
+    ws->used = offset + bytes;
+    return ptr;
+}
+
+static inline void ws_reset(gemm_workspace_t *ws)
+{
+    ws->used = 0;
+}
 
 /**
  * @brief Build AVX2 tail mask for n active lanes (clamped to NR)
@@ -579,18 +668,23 @@ static enum kernel_shape pick_kernel(size_t Mc, size_t Nc, size_t Kc) {
 // MAIN GEMM FUNCTION
 //==============================================================================
 
-int mul(
+
+/**
+ * @brief Internal GEMM core implementation
+ * @param Ap Pre-allocated A packing buffer (Kc × max_mr, 32-byte aligned)
+ * @param Bp Pre-allocated B packing buffer (Kc × max_nr × panels, 32-byte aligned)
+ * @note This is INTERNAL - called by mul() and gemm_ws()
+ */
+static int gemm_core(
     float *RESTRICT C,
     const float *RESTRICT A,
     const float *RESTRICT B,
-    uint16_t row_a, uint16_t column_a,
-    uint16_t row_b, uint16_t column_b)
+    uint16_t M, uint16_t K, uint16_t N,
+    float alpha,
+    float beta,
+    float *RESTRICT Ap,
+    float *RESTRICT Bp)
 {
-    if (column_a != row_b)
-        return -EINVAL;
-
-    const size_t M = row_a, K = column_a, N = column_b;
-
     // Scalar fallback for tiny matrices or no AVX2
     if (!linalg_has_avx2() || M == 0 || N == 0 || K == 0 ||
         (M < LINALG_SMALL_N_THRESH && N < LINALG_SMALL_N_THRESH))
@@ -602,7 +696,12 @@ int mul(
                 float s = 0.f;
                 for (size_t k = 0; k < K; ++k)
                     s += ai[k] * bj[k * N];
-                C[i * N + j] = s;
+                
+                // Apply alpha/beta
+                if (beta == 0.0f)
+                    C[i * N + j] = alpha * s;
+                else
+                    C[i * N + j] = beta * C[i * N + j] + alpha * s;
             }
         }
         return 0;
@@ -613,7 +712,9 @@ int mul(
     const size_t Nc = (size_t)LINALG_BLOCK_JC;
     const size_t Mc = (size_t)LINALG_BLOCK_MC;
 
-    // Kernel descriptor structure
+    // ============================================
+    // KERNEL DESCRIPTOR STRUCTURE
+    // ============================================
     struct ker {
         void (*packA_blk)(float *, const float *, size_t, size_t, size_t, size_t, size_t, size_t);
         void (*packA_tail)(float *, const float *, size_t, size_t, size_t, size_t, size_t, size_t);
@@ -622,7 +723,9 @@ int mul(
         size_t MR, NR, A_ld;
     };
 
-    // Kernel table (EXTENDED FOR AVX-512)
+    // ============================================
+    // KERNEL TABLE (EXTENDED FOR AVX-512)
+    // ============================================
     static const struct ker KERS[] = {
         // AVX2 kernels (order must match enum!)
         {pack_A_block_16row_colmajor, pack_A_16row_tile,
@@ -637,37 +740,23 @@ int mul(
         {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,
          gemm_8x8_panel_avx2fma_add, gemm_8x8_panel_avx2fma_store, 8, 8, 8}, // K8x8
 
-        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,                // ← ADD THIS
+        {pack_A_block_8row_colmajor, pack_A_block_8row_colmajor,
          gemm_8x16_panel_avx2fma_add, gemm_8x16_panel_avx2fma_store, 8, 16, 8}, // K8x16
 #ifdef __AVX512F__
         // AVX-512 kernels
-        {pack_A_block_32row_colmajor, pack_A_32row_tile, gemm_32x12_panel_avx512_add, gemm_32x12_panel_avx512_store, 32, 12, 32},
-        {pack_A_block_32row_colmajor, pack_A_32row_tile, gemm_32x16_panel_avx512_add, gemm_32x16_panel_avx512_store, 32, 16, 32}
+        {pack_A_block_32row_colmajor, pack_A_32row_tile, 
+         gemm_32x12_panel_avx512_add, gemm_32x12_panel_avx512_store, 32, 12, 32},
+        {pack_A_block_32row_colmajor, pack_A_32row_tile, 
+         gemm_32x16_panel_avx512_add, gemm_32x16_panel_avx512_store, 32, 16, 32}
 #endif
     };
 
-    // Allocate packing buffers (sized for maximum: AVX-512 if available)
-#ifdef __AVX512F__
-    const size_t max_nr = linalg_has_avx512() ? 16 : 16;  // ← 16 for both!
-    const size_t max_mr = linalg_has_avx512() ? 32 : 16;
-#else
-    const size_t max_nr = 16;  // ← Changed from 8 to 16
-    const size_t max_mr = 16;
-#endif
-    const size_t max_n_panels = (Nc + max_nr - 1) / max_nr;
-    const size_t max_Bp_elems = Kc * max_n_panels * max_nr;
-    float *Bp = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, max_Bp_elems * sizeof(float));
-    if (!Bp)
-        return -ENOMEM;
+    // Handle beta=-1 case: negate C once before accumulation
+    int need_negate = (beta == -1.0f);
 
-    const size_t max_Ap_elems = Kc * max_mr;
-    float *Ap = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, max_Ap_elems * sizeof(float));
-    if (!Ap) {
-        linalg_aligned_free(Bp);
-        return -ENOMEM;
-    }
-
-    // Three-level blocking loop (EXACT FROM ORIGINAL)
+    // ============================================
+    // THREE-LEVEL BLOCKING LOOP
+    // ============================================
     for (size_t j0 = 0; j0 < N; j0 += Nc) {
         const size_t jb_tile = (j0 + Nc <= N) ? Nc : (N - j0);
 
@@ -716,14 +805,36 @@ int mul(
                         const size_t n_block = (j + NR <= j0 + jb_tile) ? NR : (j0 + jb_tile - j);
                         __m256i mask = avx2_tailmask_nr(n_block, NR);
                         
-                        if (kk == 0)
-                            ker->gemm_store(C + (i0 + i) * N + j, N, Ap, Bp + panel_off2, Kblk, mr, n_block, mask);
-                        else
-                            ker->gemm_add(C + (i0 + i) * N + j, N, Ap, Bp + panel_off2, Kblk, mr, n_block, mask);
+                        float *cptr = C + (i0 + i) * N + j;
+                        const float *bptr = Bp + panel_off2;
+                        
+                        // Kernel selection based on kk and beta
+                        if (kk == 0) {
+                            // First K-block: apply beta
+                            if (beta == 0.0f) {
+                                ker->gemm_store(cptr, N, Ap, bptr, Kblk, mr, n_block, mask);
+                            } else if (beta == 1.0f || need_negate) {
+                                // Negate C tile if beta=-1
+                                if (need_negate) {
+                                    for (size_t ii = 0; ii < mr; ++ii) {
+                                        for (size_t jj = 0; jj < n_block; ++jj) {
+                                            cptr[ii * N + jj] *= -1.0f;
+                                        }
+                                    }
+                                }
+                                ker->gemm_add(cptr, N, Ap, bptr, Kblk, mr, n_block, mask);
+                            } else {
+                                // General beta not implemented
+                                return -EINVAL;
+                            }
+                        } else {
+                            // Subsequent K-blocks: always accumulate
+                            ker->gemm_add(cptr, N, Ap, bptr, Kblk, mr, n_block, mask);
+                        }
                     }
                 }
 
-                // TAIL HANDLING (EXACT FROM ORIGINAL - CRITICAL!)
+                // TAIL HANDLING (CRITICAL - from your original mul())
                 if (i < ib_tile) {
                     size_t m_rem = ib_tile - i;
 
@@ -740,10 +851,20 @@ int mul(
                                 float *cptr = C + (i0 + i) * N + j;
                                 const float *bptr = Bp + panel_off2;
 
-                                if (kk == 0)
-                                    gemm_4x8_panel_avx2fma_store(cptr, N, Ap, bptr, Kblk, n_block, mask);
-                                else
+                                if (kk == 0) {
+                                    if (beta == 0.0f) {
+                                        gemm_4x8_panel_avx2fma_store(cptr, N, Ap, bptr, Kblk, n_block, mask);
+                                    } else {
+                                        if (need_negate) {
+                                            for (size_t ii = 0; ii < 4; ++ii)
+                                                for (size_t jj = 0; jj < n_block; ++jj)
+                                                    cptr[ii * N + jj] *= -1.0f;
+                                        }
+                                        gemm_4x8_panel_avx2fma_add(cptr, N, Ap, bptr, Kblk, n_block, mask);
+                                    }
+                                } else {
                                     gemm_4x8_panel_avx2fma_add(cptr, N, Ap, bptr, Kblk, n_block, mask);
+                                }
                             }
 
                             i += 4;
@@ -761,10 +882,19 @@ int mul(
                                 float *cptr = C + (i0 + i) * N + j;
                                 const float *bptr = Bp + panel_off2;
 
-                                if (kk == 0)
-                                    gemm_1x8_panel_avx2fma_store(cptr, Ap, bptr, Kblk, n_block, mask);
-                                else
+                                if (kk == 0) {
+                                    if (beta == 0.0f) {
+                                        gemm_1x8_panel_avx2fma_store(cptr, Ap, bptr, Kblk, n_block, mask);
+                                    } else {
+                                        if (need_negate) {
+                                            for (size_t jj = 0; jj < n_block; ++jj)
+                                                cptr[jj] *= -1.0f;
+                                        }
+                                        gemm_1x8_panel_avx2fma_add(cptr, Ap, bptr, Kblk, n_block, mask);
+                                    }
+                                } else {
                                     gemm_1x8_panel_avx2fma_add(cptr, Ap, bptr, Kblk, n_block, mask);
+                                }
                             }
 
                             i += 1;
@@ -782,10 +912,21 @@ int mul(
                             const size_t n_block = (j + ker->NR <= j0 + jb_tile) ? ker->NR : (j0 + jb_tile - j);
                             __m256i mask = avx2_tailmask_nr(n_block, ker->NR);
                             
-                            if (kk == 0)
-                                ker->gemm_store(C + (i0 + i) * N + j, N, Ap, Bp + panel_off2, Kblk, m_block, n_block, mask);
-                            else
+                            if (kk == 0) {
+                                if (beta == 0.0f) {
+                                    ker->gemm_store(C + (i0 + i) * N + j, N, Ap, Bp + panel_off2, Kblk, m_block, n_block, mask);
+                                } else {
+                                    float *cptr = C + (i0 + i) * N + j;
+                                    if (need_negate) {
+                                        for (size_t ii = 0; ii < m_block; ++ii)
+                                            for (size_t jj = 0; jj < n_block; ++jj)
+                                                cptr[ii * N + jj] *= -1.0f;
+                                    }
+                                    ker->gemm_add(cptr, N, Ap, Bp + panel_off2, Kblk, m_block, n_block, mask);
+                                }
+                            } else {
                                 ker->gemm_add(C + (i0 + i) * N + j, N, Ap, Bp + panel_off2, Kblk, m_block, n_block, mask);
+                            }
                         }
 
                         i += m_block;
@@ -795,13 +936,123 @@ int mul(
         }
     }
 
-    linalg_aligned_free(Ap);
-    linalg_aligned_free(Bp);
     return 0;
 #else
-    (void)C; (void)A; (void)B;
-    (void)row_a; (void)column_a;
-    (void)row_b; (void)column_b;
+    (void)C; (void)A; (void)B; (void)Ap; (void)Bp;
+    (void)alpha; (void)beta;
     return -ENOTSUP;
 #endif
 }
+
+int mul(
+    float *RESTRICT C,
+    const float *RESTRICT A,
+    const float *RESTRICT B,
+    uint16_t row_a, uint16_t column_a,
+    uint16_t row_b, uint16_t column_b)
+{
+    if (column_a != row_b)
+        return -EINVAL;
+
+    const size_t M = row_a, K = column_a, N = column_b;
+
+    // Allocate packing buffers with malloc
+    const size_t Kc = LINALG_BLOCK_KC;
+    const size_t max_nr = 16;
+    const size_t max_mr = 16;
+    const size_t max_n_panels = (LINALG_BLOCK_JC + max_nr - 1) / max_nr;
+    const size_t max_Bp_elems = Kc * max_n_panels * max_nr;
+    const size_t max_Ap_elems = Kc * max_mr;
+    
+    float *Bp = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, 
+                                              max_Bp_elems * sizeof(float));
+    if (!Bp)
+        return -ENOMEM;
+
+    float *Ap = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, 
+                                              max_Ap_elems * sizeof(float));
+    if (!Ap) {
+        linalg_aligned_free(Bp);
+        return -ENOMEM;
+    }
+
+    // Call core with alpha=1.0, beta=0.0 (C = A*B)
+    int rc = gemm_core(C, A, B, M, K, N, 1.0f, 0.0f, Ap, Bp);
+
+    linalg_aligned_free(Ap);
+    linalg_aligned_free(Bp);
+    return rc;
+}
+
+int gemm_ws(
+    float *RESTRICT C,
+    const float *RESTRICT A,
+    const float *RESTRICT B,
+    uint16_t M, uint16_t K, uint16_t N,
+    float alpha,
+    float beta,
+    gemm_workspace_t *ws)
+{
+    if (!ws || !ws->buffer)
+        return -EINVAL;
+    
+    // Validate workspace size
+    size_t required = gemm_workspace_query(M, K, N);
+    if (ws->size < required)
+        return -ENOSPC;
+    
+    // Reset workspace for reuse
+    ws_reset(ws);
+    
+    // Sub-allocate packing buffers from workspace
+    const size_t Kc = LINALG_BLOCK_KC;
+    const size_t max_nr = 16;
+    const size_t max_mr = 16;
+    const size_t max_n_panels = (LINALG_BLOCK_JC + max_nr - 1) / max_nr;
+    
+    size_t Ap_size = max_mr * Kc * sizeof(float);
+    size_t Bp_size = Kc * max_n_panels * max_nr * sizeof(float);
+    
+    float *Ap = ws_alloc(ws, Ap_size, 32);
+    float *Bp = ws_alloc(ws, Bp_size, 32);
+    
+    if (!Ap || !Bp)
+        return -ENOSPC;
+    
+    // Call core with provided alpha/beta
+    return gemm_core(C, A, B, M, K, N, alpha, beta, Ap, Bp);
+}
+
+/*
+┌─────────────────────────────────────────────────┐
+│  GEMM (Foundation)                              │
+│  - 8×16 AVX2 kernel                             │
+│  - Packing, blocking                            │
+└──────────────┬──────────────────────────────────┘
+               │
+       ┌───────┴────────┬─────────────┬────────────┐
+       │                │             │            │
+       ▼                ▼             ▼            ▼
+   ┌───────┐      ┌─────────┐   ┌──────┐     ┌──────┐
+   │  QR   │      │   LUP   │   │ INV  │     │ CHOL │
+   │       │      │         │   │      │     │      │
+   └───┬───┘      └────┬────┘   └──┬───┘     └──┬───┘
+       │               │           │            │
+       │               └───────────┤            │
+       │                           │            │
+       │                           ▼            │
+       │                      ┌─────────┐       │
+       │                      │   INV   │       │
+       │                      │ (needs  │       │
+       │                      │  LUP)   │       │
+       │                      └─────────┘       │
+       │                                        │
+       └────────────────────────────────────────┘
+                             │
+                             ▼
+                    ┌──────────────────┐
+                    │  cholupdate      │
+                    │  (calls QR, not  │
+                    │   the reverse)   │
+                    └──────────────────┘
+*/

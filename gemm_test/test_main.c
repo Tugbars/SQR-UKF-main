@@ -34,7 +34,7 @@ int main(void) {
 
      printf("\n\nPhase 4: Benchmarks (optional)\n");
     printf("------------------------------\n");
-    //run_benchmark_suite();          // or bench_case(256,256,256, 15, 1);
+    run_benchmark_suite();          // or bench_case(256,256,256, 15, 1);
 
 
     printf("\n\n=== All tests completed! ===\n");

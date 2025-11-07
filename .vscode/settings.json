@@ -3,6 +3,7 @@
         ".fantomasignore": "ignore",
         "linalg_simd.h": "c",
         "compare": "c",
-        "immintrin.h": "c"
+        "immintrin.h": "c",
+        "gemm_simd_ops.h": "c"
     }
 }

@@ -1,32 +1,22 @@
 /**
- * @file cholupdatek.c
- * @brief Rank-k Cholesky update and downdate routines with tiled and BLAS-3 variants.
+ * @file cholupdate.c
+ * @brief Rank-k Cholesky update with workspace-based zero-malloc design
  *
  * @details
- * This module provides both a tiled AVX2-optimized and a BLAS-3 QR-based
- * implementation of rank-k Cholesky updates and downdates.
+ * FFTW-style planning: all allocations happen once in workspace creation,
+ * hot-path execution (`cholupdatek_ws`, `cholupdatek_blockqr_ws`) is allocation-free.
  *
- * It supports both lower and upper triangular factors, updating them in-place:
+ * Provides both tiled AVX2-optimized and BLAS-3 QR-based implementations
+ * for rank-k Cholesky updates/downdates:
  * \f[
  *    L L^T \leftarrow L L^T \pm X X^T
  * \f]
- * where the sign depends on the `add` parameter.
  *
- * Functions in this file are used in covariance maintenance, Kalman filtering,
- * and numerical optimization algorithms where maintaining a Cholesky factor
- * is cheaper and more stable than refactoring the full matrix.
- *
- * ### Provided interfaces:
- * - `cholupdate_rank1_core()` — internal Givens-style single-vector update.
- * - `cholupdatek()` — tiled rank-k update (cache-friendly, AVX2-accelerated).
- * - `cholupdatek_blockqr()` — BLAS-3 blocked QR algorithm (compact-WY based).
- * - `cholupdatek_blas3()` — high-level dispatcher that chooses the best path.
- *
- * ### Key properties:
- * - Handles both upper and lower triangular Cholesky factors.
- * - Supports downdates (negative updates) safely with SPD validation.
- * - SIMD vectorized with AVX2 for fast rank-1 operations.
- * - Fully BLAS-3 capable when used with blocked QR kernels.
+ * ### Key improvements over original:
+ * - Zero hot-path allocations (workspace pre-allocated)
+ * - Thread-safe by design (each workspace is independent)
+ * - Backward-compatible legacy API (allocates internally)
+ * - BLAS-3 capable with blocked QR
  */
 
 #include <stdint.h>
@@ -38,43 +28,182 @@
 #include "linalg_simd.h"
 
 #ifndef CHOLK_COL_TILE
-#define CHOLK_COL_TILE 32 /* columns of X per batch (try 32–128) */
+#define CHOLK_COL_TILE 32
 #endif
 
 #ifndef CHOLK_AVX_MIN_N
 #define CHOLK_AVX_MIN_N LINALG_SMALL_N_THRESH
 #endif
 
+#ifndef QRW_IB_DEFAULT
+#define QRW_IB_DEFAULT 64
+#endif
+
+// Forward declaration for QR (if not in header)
+extern int qrw_geqrf_blocked_wy(float *A, uint16_t m, uint16_t n,
+                                uint16_t ib, float *tau);
+
+//==============================================================================
+// PLATFORM-SPECIFIC ALLOCATION
+//==============================================================================
+
+static void *aligned_alloc32(size_t size)
+{
+#if defined(_WIN32)
+    return _aligned_malloc(size, 32);
+#else
+    void *p = NULL;
+    if (posix_memalign(&p, 32, size) != 0)
+        return NULL;
+    return p;
+#endif
+}
+
+static void aligned_free32(void *p)
+{
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
+//==============================================================================
+// WORKSPACE STRUCTURE
+//==============================================================================
+
 /**
- * @brief Internal robust rank-1 Cholesky update/downdate kernel.
+ * @brief Cholesky update workspace - all buffers pre-allocated
  *
- * @details
- * Updates a Cholesky factor \f$L\f$ (lower or upper) in-place for a single vector `x`,
- * performing the transformation:
- * \f[
- *    L L^T \leftarrow L L^T \pm x x^T
- * \f]
- * where the sign is determined by the `add` parameter.
+ * @note Thread-safe: each thread should have its own workspace
+ * @note Sized for maximum dimensions (n_max, k_max) specified at creation
+ */
+typedef struct cholupdate_workspace_s
+{
+    // Dimensions
+    uint16_t n_max;
+    uint16_t k_max;
+
+    // Tiled rank-1 update buffers (32-byte aligned)
+    float *xbuf; // n_max - work vector for rank-1 updates
+
+    // Blocked QR buffers (32-byte aligned)
+    float *M;    // (n+k)×n - augmented matrix [U | X]
+    float *tau;  // min(n,n+k) - Householder scalars for QR
+    float *Utmp; // n×n - temporary for transpose operations
+
+    // Memory accounting
+    size_t total_bytes;
+} cholupdate_workspace;
+
+//==============================================================================
+// WORKSPACE API
+//==============================================================================
+
+/**
+ * @brief Allocate Cholesky update workspace
  *
- * Uses a Givens-style rotation method, which is numerically stable for both
- * updates and downdates. AVX2 vectorization is applied to the row update loop
- * for large matrices to improve throughput.
+ * @param n_max Maximum matrix dimension
+ * @param k_max Maximum rank of updates
  *
- * This is the fundamental primitive used by the tiled rank-k update.
+ * @return Workspace pointer on success, NULL on allocation failure
  *
- * @param[in,out] L        Pointer to in-place Cholesky factor (n×n, row-major).
- * @param[in,out] x        Work vector (length n); modified during computation.
- * @param[in]     n        Matrix dimension.
- * @param[in]     is_upper True if `L` is upper-triangular, false if lower.
- * @param[in]     add      +1 for update, -1 for downdate.
- * @retval 0     Success.
- * @retval -EDOM Downdate would destroy SPD (non-positive r2 detected).
+ * @note COLD PATH - call once, reuse many times
+ */
+cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
+{
+    if (n_max == 0)
+        return NULL;
+
+    cholupdate_workspace *ws = (cholupdate_workspace *)malloc(sizeof(cholupdate_workspace));
+    if (!ws)
+        return NULL;
+
+    memset(ws, 0, sizeof(cholupdate_workspace));
+    ws->n_max = n_max;
+    ws->k_max = k_max;
+    ws->total_bytes = sizeof(cholupdate_workspace);
+
+// Allocate buffers
+#define ALLOC_BUF(ptr, count)                           \
+    do                                                  \
+    {                                                   \
+        size_t bytes = (size_t)(count) * sizeof(float); \
+        ws->ptr = (float *)aligned_alloc32(bytes);      \
+        if (!ws->ptr)                                   \
+            goto cleanup_fail;                          \
+        ws->total_bytes += bytes;                       \
+    } while (0)
+
+    ALLOC_BUF(xbuf, n_max);
+
+    if (k_max > 0)
+    {
+        const size_t m_cols = (size_t)n_max + k_max;
+        ALLOC_BUF(M, (size_t)n_max * m_cols);
+        ALLOC_BUF(tau, n_max < m_cols ? n_max : m_cols);
+        ALLOC_BUF(Utmp, (size_t)n_max * n_max);
+    }
+
+#undef ALLOC_BUF
+
+    return ws;
+
+cleanup_fail:
+    if (ws->xbuf)
+        aligned_free32(ws->xbuf);
+    if (ws->M)
+        aligned_free32(ws->M);
+    if (ws->tau)
+        aligned_free32(ws->tau);
+    if (ws->Utmp)
+        aligned_free32(ws->Utmp);
+    free(ws);
+    return NULL;
+}
+
+/**
+ * @brief Free Cholesky update workspace
+ *
+ * @param ws Workspace to free (NULL-safe)
+ */
+void cholupdate_workspace_free(cholupdate_workspace *ws)
+{
+    if (!ws)
+        return;
+
+    aligned_free32(ws->xbuf);
+    aligned_free32(ws->M);
+    aligned_free32(ws->tau);
+    aligned_free32(ws->Utmp);
+    free(ws);
+}
+
+/**
+ * @brief Query workspace memory usage
+ *
+ * @param ws Workspace to query
+ * @return Total bytes allocated (0 if ws=NULL)
+ */
+size_t cholupdate_workspace_bytes(const cholupdate_workspace *ws)
+{
+    return ws ? ws->total_bytes : 0;
+}
+
+//==============================================================================
+// INTERNAL: RANK-1 UPDATE KERNEL (UNCHANGED ALGORITHM)
+//==============================================================================
+
+/**
+ * @brief Internal robust rank-1 Cholesky update/downdate kernel
+ *
+ * @note Algorithm unchanged - only uses workspace xbuf instead of allocating
  */
 static int cholupdate_rank1_core(float *RESTRICT L,
-                                 float *RESTRICT x, /* in/out work */
+                                 float *RESTRICT x, /* workspace buffer */
                                  uint16_t n,
                                  bool is_upper,
-                                 int add /* +1 or -1 */)
+                                 int add)
 {
     const float sign = (add >= 0) ? 1.0f : -1.0f;
 
@@ -102,7 +231,6 @@ static int cholupdate_rank1_core(float *RESTRICT L,
         if (xi == 0.0f)
             continue;
 
-        /* Scalar tail for short segments or no-AVX. */
         if (!use_avx || (i + 8 >= n))
         {
             for (uint32_t k = i + 1; k < n; ++k)
@@ -118,10 +246,9 @@ static int cholupdate_rank1_core(float *RESTRICT L,
         }
 
 #if LINALG_SIMD_ENABLE
-        /* AVX2 vectorized body over k=i+1..n-1 */
         uint32_t k = (uint32_t)i + 1;
 
-        /* Align x to 32B for aligned loads; peel until aligned */
+        // Align to 32B
         while ((k < n) && ((uintptr_t)(&x[k]) & 31u))
         {
             const size_t off = is_upper ? (size_t)i * n + k
@@ -139,8 +266,8 @@ static int cholupdate_rank1_core(float *RESTRICT L,
 
         for (; k + 7 < n; k += 8)
         {
-            float *baseL = is_upper ? &L[(size_t)i * n + k]  /* contiguous */
-                                    : &L[(size_t)k * n + i]; /* strided by n */
+            float *baseL = is_upper ? &L[(size_t)i * n + k]
+                                    : &L[(size_t)k * n + i];
             __m256 Lik;
             if (is_upper)
             {
@@ -149,13 +276,11 @@ static int cholupdate_rank1_core(float *RESTRICT L,
             else
             {
 #ifdef __AVX2__
-                /* gather indices 0,n,2n,... */
                 alignas(32) int idx[8];
                 for (int t = 0; t < 8; ++t)
                     idx[t] = t * (int)n;
                 Lik = _mm256_i32gather_ps(baseL, _mm256_load_si256((const __m256i *)idx), sizeof(float));
 #else
-                /* fallback (shouldn’t happen with AVX2 defined) */
                 alignas(32) float tmp[8];
                 for (int t = 0; t < 8; ++t)
                     tmp[t] = baseL[(size_t)t * n];
@@ -165,7 +290,8 @@ static int cholupdate_rank1_core(float *RESTRICT L,
 
             __m256 xk = _mm256_load_ps(&x[k]);
 
-            __m256 Lik_new = _mm256_mul_ps(_mm256_fmadd_ps(ss_v, xk, Lik), _mm256_div_ps(_mm256_set1_ps(1.0f), c_v));
+            __m256 Lik_new = _mm256_mul_ps(_mm256_fmadd_ps(ss_v, xk, Lik),
+                                           _mm256_div_ps(_mm256_set1_ps(1.0f), c_v));
             __m256 xk_new = _mm256_fnmadd_ps(s_v, Lik, _mm256_mul_ps(c_v, xk));
 
             _mm256_store_ps(&x[k], xk_new);
@@ -197,47 +323,34 @@ static int cholupdate_rank1_core(float *RESTRICT L,
     return 0;
 }
 
+//==============================================================================
+// TILED RANK-K UPDATE WITH WORKSPACE (ZERO MALLOC)
+//==============================================================================
+
 /**
- * @brief Tiled rank-k Cholesky update/downdate with AVX2 acceleration.
+ * @brief Tiled rank-k Cholesky update using workspace (HOT PATH - ZERO MALLOC)
  *
- * @details
- * Extends the rank-1 core to handle a rank-k update by processing columns of
- * \f$X\f$ in cache-friendly batches (`CHOLK_COL_TILE` wide). Each column is
- * applied sequentially through the robust rank-1 update kernel.
+ * @param ws Pre-allocated workspace
+ * @param L In-place Cholesky factor (n×n)
+ * @param X Update matrix (n×k, row-major)
+ * @param n Matrix dimension (must be ≤ n_max from workspace)
+ * @param k Rank of update (must be ≤ k_max from workspace)
+ * @param is_upper True for upper-triangular, false for lower
+ * @param add +1 for update, -1 for downdate
  *
- * For example, when `add=+1`, performs:
- * \f[
- *    L L^T \leftarrow L L^T + X X^T
- * \f]
- * If `add=-1`, performs a downdate:
- * \f[
- *    L L^T \leftarrow L L^T - X X^T
- * \f]
+ * @return 0 on success, negative errno on failure
  *
- * AVX2 SIMD instructions are used inside each rank-1 update for the row updates.
- * This version is optimized for moderate `n` and small to medium `k`.
- *
- * Used in numerical applications where updates to covariance matrices
- * are frequent but re-factorization is too costly.
- *
- * @param[in,out] L        In-place Cholesky factor (lower or upper, n×n).
- * @param[in]     X        Matrix of update vectors (n×k, row-major).
- * @param[in]     n        Matrix dimension.
- * @param[in]     k        Number of rank-1 updates to apply.
- * @param[in]     is_upper True for upper-triangular, false for lower-triangular.
- * @param[in]     add      +1 for update, -1 for downdate.
- * @retval 0     Success.
- * @retval -EDOM Downdate would break SPD.
- * @retval -ENOMEM Allocation failure for temporary buffer.
- * @retval -EINVAL Invalid arguments.
+ * @note ZERO allocations - fully cache-optimized
  */
-int cholupdatek(float *RESTRICT L,
-                const float *RESTRICT X, /* n×k, row-major */
-                uint16_t n,
-                uint16_t k,
-                bool is_upper,
-                int add /* +1 update, -1 downdate */)
+int cholupdatek_ws(cholupdate_workspace *ws,
+                   float *RESTRICT L,
+                   const float *RESTRICT X,
+                   uint16_t n, uint16_t k,
+                   bool is_upper, int add)
 {
+    if (!ws || !L || !X)
+        return -EINVAL;
+
     if (n == 0)
         return -EINVAL;
     if (k == 0)
@@ -245,115 +358,80 @@ int cholupdatek(float *RESTRICT L,
     if (add != +1 && add != -1)
         return -EINVAL;
 
+    // User's responsibility to provide correct dimensions
+    // (Could add assert(n <= ws->n_max && k <= ws->k_max) in debug)
+
     const uint16_t T = (CHOLK_COL_TILE == 0) ? 32 : (uint16_t)CHOLK_COL_TILE;
 
-    /* Work buffer for a single vector (reused); 32B-aligned. */
-    float *xbuf = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)n * sizeof(float));
-    if (!xbuf)
-        return -ENOMEM;
+    // Use workspace buffer (NO MALLOC)
+    float *xbuf = ws->xbuf;
 
     int rc = 0;
     for (uint16_t p0 = 0; p0 < k; p0 += T)
     {
         const uint16_t jb = (uint16_t)((p0 + T <= k) ? T : (k - p0));
 
-        /* Process the tile’s columns one by one (warm caches). */
         for (uint16_t t = 0; t < jb; ++t)
         {
-            /* x := X[:, p0+t] */
-            const float *xcol = X + (size_t)0 * k + (p0 + t); /* interleaved by columns? We were told row-major.
-                                                                 So X[r*k + (p0+t)] is element (r, p0+t). */
-            /* Gather the column into a contiguous row-major vector xbuf[r] = X[r, p] */
+            // Gather column into contiguous buffer
+            const float *xcol = X + (p0 + t);
             for (uint16_t r = 0; r < n; ++r)
                 xbuf[r] = xcol[(size_t)r * k];
 
             rc = cholupdate_rank1_core(L, xbuf, n, is_upper, add);
             if (rc)
-            {
-                linalg_aligned_free(xbuf);
                 return rc;
-            }
         }
     }
 
-    linalg_aligned_free(xbuf);
     return 0;
 }
 
+//==============================================================================
+// BLOCKED QR UPDATE WITH WORKSPACE (ZERO MALLOC)
+//==============================================================================
+
 /**
- * @brief Extracts the leading n×n upper-triangular block (R₁₁) from a QR result.
- *
- * @details
- * Copies the upper-triangular portion of `Rsrc` into `Udst`, zeroing the
- * elements below the diagonal. Used internally by `cholupdatek_blockqr`
- * to extract the new Cholesky factor from the blocked QR factorization.
- *
- * @param[out] Udst Destination buffer for the upper-triangular block (n×n).
- * @param[in]  Rsrc Source matrix (result of QR factorization, n×ldR).
- * @param[in]  n    Dimension of the block to extract.
- * @param[in]  ldR  Leading dimension of `Rsrc` (typically n+k).
+ * @brief Extract upper-triangular block from QR result
  */
-static void copy_upper_nxn_from_qr(float *RESTRICT Udst, const float *RESTRICT Rsrc,
+static void copy_upper_nxn_from_qr(float *RESTRICT Udst,
+                                   const float *RESTRICT Rsrc,
                                    uint16_t n, uint16_t ldR)
 {
     for (uint16_t i = 0; i < n; ++i)
     {
         const float *row = Rsrc + (size_t)i * ldR;
-        /* zeros below diag */
         for (uint16_t j = 0; j < i; ++j)
             Udst[(size_t)i * n + j] = 0.0f;
-        /* copy diag..end */
         memcpy(Udst + (size_t)i * n + i, row + i, (size_t)(n - i) * sizeof(float));
     }
 }
 
 /**
- * @brief BLAS-3 rank-k Cholesky update/downdate using blocked QR.
+ * @brief BLAS-3 rank-k Cholesky update using workspace (HOT PATH - ZERO MALLOC)
  *
- * @details
- * Implements a high-performance, numerically stable update based on the
- * identity:
- * \f[
- *    A_{\text{new}} = A \pm X X^T = U^T U \pm X X^T
- * \f]
- * Construct
- * \f[
- *    M = [U \,|\, \sqrt{\text{sign}} X],
- * \f]
- * then compute its compact-WY QR factorization:
- * \f[
- *    M = Q R.
- * \f]
- * The new Cholesky factor is simply \f$U_{\text{new}} = R_{11}\f$.
+ * @param ws Pre-allocated workspace
+ * @param L_or_U In-place Cholesky factor (n×n)
+ * @param X Update matrix (n×k, row-major)
+ * @param n Matrix dimension (must be ≤ n_max)
+ * @param k Rank (must be ≤ k_max)
+ * @param is_upper True for upper, false for lower
+ * @param add +1 for update, -1 for downdate
  *
- * For lower-triangular inputs, we apply the same logic to \(U = L^T\)
- * and transpose the result back.
+ * @return 0 on success, negative errno on failure
  *
- * This formulation pushes all heavy work into your blocked QR routine,
- * which internally uses GEMM-shaped operations — achieving full BLAS-3 efficiency.
- *
- * @param[in,out] L_or_U   In-place Cholesky factor (lower or upper, n×n).
- * @param[in]     X        Update matrix (n×k, row-major).
- * @param[in]     n        Matrix dimension.
- * @param[in]     k        Number of columns in X (rank of the update).
- * @param[in]     is_upper True if `L_or_U` is upper, false if lower.
- * @param[in]     add      +1 for update, -1 for downdate.
- * @retval 0      Success.
- * @retval -ENOMEM Allocation failure.
- * @retval -EINVAL Invalid arguments.
- *
- * @note
- *  - Relies on `qrw_geqrf_blocked_wy()` (your blocked compact-WY QR).
- *  - When downdating, if SPD is lost, the result may no longer represent a
- *    valid Cholesky factor — caller should verify diagonal positivity.
- *  - This is the **BLAS-3 path**; heavy computations are GEMM-optimized.
+ * @note Uses blocked QR for BLAS-3 efficiency
+ * @note ZERO allocations - all buffers from workspace
  */
-int cholupdatek_blockqr(float *RESTRICT L_or_U,
-                        const float *RESTRICT X, /* n×k */
-                        uint16_t n, uint16_t k,
-                        bool is_upper,
-                        int add /* +1 update, -1 downdate */)
+int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
+                           float *RESTRICT L_or_U,
+                           const float *RESTRICT X,
+                           uint16_t n, uint16_t k,
+                           bool is_upper, int add)
 {
+    if (!ws || !L_or_U || !X)
+        return -EINVAL;
+
     if (n == 0)
         return -EINVAL;
     if (k == 0)
@@ -361,25 +439,20 @@ int cholupdatek_blockqr(float *RESTRICT L_or_U,
     if (add != +1 && add != -1)
         return -EINVAL;
 
-    /* Work: build M = [U | s*X] in row-major, where:
-       - if is_upper: U = L_or_U (upper)
-       - else       : U = L_or_Uᵀ (we’ll materialize U into M’s left block) */
-    const uint16_t m_rows = n;
+    // Use workspace buffers (NO MALLOC)
     const uint16_t m_cols = (uint16_t)(n + k);
+    float *M = ws->M;
+    float *tau = ws->tau;
+    float *Utmp = ws->Utmp;
 
-    float *M = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)m_rows * m_cols * sizeof(float));
-    if (!M)
-        return -ENOMEM;
-
-    /* Left block: copy U */
+    // Build M = [U | s*X]
     if (is_upper)
     {
-        /* L_or_U already holds U (upper n×n) in row-major; copy into M[:,0:n] */
+        // Copy U into M[:,0:n]
         for (uint16_t i = 0; i < n; ++i)
         {
             float *dst = M + (size_t)i * m_cols;
             const float *src = L_or_U + (size_t)i * n;
-            /* zeros below diag for cleanliness (not required for GEQRF) */
             for (uint16_t j = 0; j < i; ++j)
                 dst[j] = 0.0f;
             memcpy(dst + i, src + i, (size_t)(n - i) * sizeof(float));
@@ -387,64 +460,43 @@ int cholupdatek_blockqr(float *RESTRICT L_or_U,
     }
     else
     {
-        /* Build U := Lᵀ explicitly into M[:,0:n] (upper) */
+        // Build U = L^T into M[:,0:n]
         for (uint16_t i = 0; i < n; ++i)
         {
             float *dst = M + (size_t)i * m_cols;
-            /* j < i → dst[j] = Lᵀ(i,j) = L(j,i) (below diag of L) */
             for (uint16_t j = 0; j < i; ++j)
                 dst[j] = L_or_U[(size_t)j * n + i];
-            /* j >= i → dst[j] = U(i,j) = 0 if j<i, else Lᵀ(i,j) = L(j,i)=0 for j>i unless L diag at j=i */
-            dst[i] = L_or_U[(size_t)i * n + i]; /* diag */
+            dst[i] = L_or_U[(size_t)i * n + i];
             for (uint16_t j = (uint16_t)(i + 1); j < n; ++j)
-                dst[j] = 0.0f; /* strictly upper of U is 0 for Lᵀ if L lower */
+                dst[j] = 0.0f;
         }
     }
 
-    /* Right block: scaled X (sign = +1 for update, -1 for downdate) */
+    // Copy scaled X into M[:,n:n+k]
     const float s = (add >= 0) ? 1.0f : -1.0f;
     for (uint16_t i = 0; i < n; ++i)
     {
-        float *dst = M + (size_t)i * m_cols + n; /* start of right block */
-        const float *src = X + (size_t)i * k;    /* row-major X */
+        float *dst = M + (size_t)i * m_cols + n;
+        const float *src = X + (size_t)i * k;
         for (uint16_t j = 0; j < k; ++j)
             dst[j] = s * src[j];
     }
 
-    /* GEQRF (blocked compact-WY) on M (n×(n+k)), no need to form Q; we only need R. */
-    float *tau = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)((n < m_cols ? n : m_cols)) * sizeof(float));
-    if (!tau)
-    {
-        linalg_aligned_free(M);
-        return -ENOMEM;
-    }
-
-    int rc = qrw_geqrf_blocked_wy(M, m_rows, m_cols, QRW_IB_DEFAULT, tau);
-    linalg_aligned_free(tau);
+    // QR factorization (uses workspace tau - NO MALLOC)
+    int rc = qrw_geqrf_blocked_wy(M, n, m_cols, QRW_IB_DEFAULT, tau);
     if (rc)
-    {
-        linalg_aligned_free(M);
         return rc;
-    }
 
-    /* Extract U_new = leading upper-tri R11 (n×n) */
+    // Extract new Cholesky factor
     if (is_upper)
     {
-        copy_upper_nxn_from_qr(/*Udst=*/L_or_U, /*Rsrc=*/M, n, /*ldR=*/m_cols);
+        copy_upper_nxn_from_qr(L_or_U, M, n, m_cols);
     }
     else
     {
-        /* lower case: L_new = U_newᵀ. Extract U_new, then transpose to L. */
-        /* Temp upper block */
-        float *Utmp = (float *)linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, (size_t)n * n * sizeof(float));
-        if (!Utmp)
-        {
-            linalg_aligned_free(M);
-            return -ENOMEM;
-        }
+        // Extract U, transpose to L (uses workspace Utmp - NO MALLOC)
         copy_upper_nxn_from_qr(Utmp, M, n, m_cols);
 
-        /* Write L_or_U ← Utmpᵀ as lower-tri */
         for (uint16_t i = 0; i < n; ++i)
         {
             for (uint16_t j = 0; j < i; ++j)
@@ -457,44 +509,74 @@ int cholupdatek_blockqr(float *RESTRICT L_or_U,
                 L_or_U[(size_t)i * n + j] = 0.0f;
             }
         }
-        linalg_aligned_free(Utmp);
     }
 
-    linalg_aligned_free(M);
     return 0;
 }
 
+//==============================================================================
+// LEGACY API (BACKWARD COMPATIBLE - CREATES TEMPORARY WORKSPACE)
+//==============================================================================
+
 /**
- * @brief Dispatcher for BLAS-3 Cholesky update; falls back to tiled path.
+ * @brief Legacy tiled rank-k update (UNCHANGED API - backward compatible)
  *
- * @details
- * Calls the blocked QR implementation (`cholupdatek_blockqr`) when available
- * and numerically appropriate. If the QR path fails or is not supported,
- * falls back to the tiled rank-1 update (`cholupdatek`).
+ * @note Allocates workspace internally - for performance-critical code, use cholupdatek_ws()
+ */
+int cholupdatek(float *RESTRICT L,
+                const float *RESTRICT X,
+                uint16_t n, uint16_t k,
+                bool is_upper, int add)
+{
+    // Create temporary workspace
+    cholupdate_workspace *ws = cholupdate_workspace_alloc(n, k);
+    if (!ws)
+        return -ENOMEM;
+
+    // Execute using workspace
+    int ret = cholupdatek_ws(ws, L, X, n, k, is_upper, add);
+
+    // Cleanup
+    cholupdate_workspace_free(ws);
+
+    return ret;
+}
+
+/**
+ * @brief Legacy blocked QR update (UNCHANGED API - backward compatible)
  *
- * This function is the preferred public entry point for rank-k updates and
- * downdates, automatically selecting the optimal algorithm.
- *
- * @param[in,out] L_or_U   In-place Cholesky factor (lower or upper, n×n).
- * @param[in]     X        Update matrix (n×k, row-major).
- * @param[in]     n        Matrix dimension.
- * @param[in]     k        Rank of the update.
- * @param[in]     is_upper True if `L_or_U` is upper, false if lower.
- * @param[in]     add      +1 for update, -1 for downdate.
- * @retval 0      Success.
- * @retval -EDOM  SPD violation detected.
- * @retval -ENOMEM Memory allocation failure.
- * @retval -EINVAL Invalid arguments.
+ * @note Allocates workspace internally - for performance-critical code, use cholupdatek_blockqr_ws()
+ */
+int cholupdatek_blockqr(float *RESTRICT L_or_U,
+                        const float *RESTRICT X,
+                        uint16_t n, uint16_t k,
+                        bool is_upper, int add)
+{
+    // Create temporary workspace
+    cholupdate_workspace *ws = cholupdate_workspace_alloc(n, k);
+    if (!ws)
+        return -ENOMEM;
+
+    // Execute using workspace
+    int ret = cholupdatek_blockqr_ws(ws, L_or_U, X, n, k, is_upper, add);
+
+    // Cleanup
+    cholupdate_workspace_free(ws);
+
+    return ret;
+}
+
+/**
+ * @brief Legacy BLAS-3 dispatcher (UNCHANGED API)
  */
 int cholupdatek_blas3(float *RESTRICT L_or_U,
-                      const float *RESTRICT X, uint16_t n, uint16_t k,
+                      const float *RESTRICT X,
+                      uint16_t n, uint16_t k,
                       bool is_upper, int add)
 {
-    /* If your build guarantees qrw_geqrf_blocked_wy is present, you can just call cholupdatek_blockqr directly. */
     int rc = cholupdatek_blockqr(L_or_U, X, n, k, is_upper, add);
     if (rc == -ENOTSUP)
     {
-        /* Fallback to tiled rank-1 version (still correct, less BLAS-3 heavy) */
         return cholupdatek(L_or_U, X, n, k, is_upper, add);
     }
     return rc;
