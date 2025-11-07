@@ -65,11 +65,11 @@
 #include <immintrin.h>
 #include "qr.h"
 
-#include "linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs, linalg_aligned_alloc/free
+#include "../includes/linalg_simd.h" // RESTRICT, linalg_has_avx2(), LINALG_* knobs, linalg_aligned_alloc/free
 // also exports mul(), inv() that qr_scalar uses
 
 #if LINALG_SIMD_ENABLE
-#include "linalg_qr_avx2_kernels.h" // Highly optimized AVX2 kernels with 6x16 register blocking
+#include "qr_avx2_kernels.h" // Highly optimized AVX2 kernels with 6x16 register blocking
 #endif
 
 #ifndef LINALG_SMALL_N_THRESH
@@ -102,10 +102,37 @@
 
 _Static_assert(LINALG_DEFAULT_ALIGNMENT >= 32, "Need 32B alignment for AVX loads");
 
+
+//==============================================================================
+// PLATFORM-SPECIFIC ALLOCATION (32-byte aligned for AVX2)
+// ⚠️ MUST BE DEFINED BEFORE WORKSPACE FUNCTIONS
+//==============================================================================
+
+static void* aligned_alloc32(size_t size) {
+#if defined(_WIN32)
+    return _aligned_malloc(size, 32);
+#else
+    void* p = NULL;
+    if (posix_memalign(&p, 32, size) != 0)
+        return NULL;
+    return p;
+#endif
+}
+
+static void aligned_free32(void* p) {
+#if defined(_WIN32)
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
+
 /* ===========================================================================================
  * Scalar (reference) QR (unchanged, small matrices or no-AVX fallback)
  * ===========================================================================================
  */
+
+ /*
 static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
                      float *RESTRICT R, uint16_t m, uint16_t n, bool only_R)
 {
@@ -209,6 +236,7 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
     free(HiR);
     return 0;
 }
+    */
 
 /* ===========================================================================================
  * Blocked compact-WY QR (single precision; scalar + AVX2 kernels)
@@ -216,6 +244,89 @@ static int qr_scalar(const float *RESTRICT A, float *RESTRICT Q,
  */
 
 typedef float qrw_t;
+
+
+qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
+{
+    if (m_max == 0 || n_max == 0)
+        return NULL;
+    
+    if (ib == 0)
+        ib = QRW_IB_DEFAULT;
+    
+    qr_workspace *ws = (qr_workspace*)malloc(sizeof(qr_workspace));
+    if (!ws)
+        return NULL;
+    
+    memset(ws, 0, sizeof(qr_workspace));
+    ws->m_max = m_max;
+    ws->n_max = n_max;
+    ws->ib = ib;
+    ws->total_bytes = sizeof(qr_workspace);
+    
+    // Calculate buffer sizes
+    const uint16_t mn_max = (m_max < n_max) ? m_max : n_max;
+    const size_t kc = LINALG_BLOCK_KC;
+    const size_t mc = LINALG_BLOCK_MC;
+    
+    // Allocate all buffers (fail-safe with goto cleanup)
+    #define ALLOC_BUF(ptr, count) do { \
+        size_t bytes = (size_t)(count) * sizeof(qrw_t); \
+        ws->ptr = (qrw_t*)aligned_alloc32(bytes); \
+        if (!ws->ptr) goto cleanup_fail; \
+        ws->total_bytes += bytes; \
+    } while(0)
+    
+    ALLOC_BUF(tau, mn_max);
+    ALLOC_BUF(tmp, m_max);
+    ALLOC_BUF(work, m_max);
+    ALLOC_BUF(T, (size_t)ib * ib);
+    ALLOC_BUF(Cpack, mc * kc);
+    ALLOC_BUF(Y, (size_t)ib * kc);
+    ALLOC_BUF(Z, (size_t)ib * kc);
+    ALLOC_BUF(vn1, n_max);
+    ALLOC_BUF(vn2, n_max);
+    
+    #undef ALLOC_BUF
+    
+    return ws;
+    
+cleanup_fail:
+    // Free any successfully allocated buffers
+    if (ws->tau) aligned_free32(ws->tau);
+    if (ws->tmp) aligned_free32(ws->tmp);
+    if (ws->work) aligned_free32(ws->work);
+    if (ws->T) aligned_free32(ws->T);
+    if (ws->Cpack) aligned_free32(ws->Cpack);
+    if (ws->Y) aligned_free32(ws->Y);
+    if (ws->Z) aligned_free32(ws->Z);
+    if (ws->vn1) aligned_free32(ws->vn1);
+    if (ws->vn2) aligned_free32(ws->vn2);
+    free(ws);
+    return NULL;
+}
+
+void qr_workspace_free(qr_workspace *ws)
+{
+    if (!ws)
+        return;
+    
+    aligned_free32(ws->tau);
+    aligned_free32(ws->tmp);
+    aligned_free32(ws->work);
+    aligned_free32(ws->T);
+    aligned_free32(ws->Cpack);
+    aligned_free32(ws->Y);
+    aligned_free32(ws->Z);
+    aligned_free32(ws->vn1);
+    aligned_free32(ws->vn2);
+    free(ws);
+}
+
+size_t qr_workspace_bytes(const qr_workspace *ws)
+{
+    return ws ? ws->total_bytes : 0;
+}
 
 //==============================================================================
 // HOUSEHOLDER + PANEL FACTORIZATION - UNCHANGED ALGORITHMS
@@ -1123,7 +1234,7 @@ int qr_ws(qr_workspace *ws,
     // Small matrix or no AVX2: use scalar fallback
     if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2())
     {
-        return qr_scalar(A, Q, R, m, n, only_R);
+       // return qr_scalar(A, Q, R, m, n, only_R);
     }
 
     // Copy A → R
@@ -1196,7 +1307,7 @@ int qr(const float *RESTRICT A,
     // Small matrix fallback
     if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2())
     {
-        return qr_scalar(A, Q, R, m, n, only_R);
+       // return qr_scalar(A, Q, R, m, n, only_R);
     }
 
     // Create temporary workspace
@@ -1218,16 +1329,18 @@ int qr_ws_inplace(qr_workspace *ws, float *RESTRICT A_inout,
 {
     if (!ws || !A_inout) return -EINVAL;
     const uint16_t mn = (m < n) ? m : n;
-    
+    /*
     if (mn < LINALG_SMALL_N_THRESH || !linalg_has_avx2()) {
         // Need temp for scalar path
         float *tmp = (float*)aligned_alloc32((size_t)m*n*sizeof(float));
         if (!tmp) return -ENOMEM;
         memcpy(tmp, A_inout, (size_t)m*n*sizeof(float));
-        int ret = qr_scalar(tmp, Q, A_inout, m, n, only_R);
+       // int ret = qr_scalar(tmp, Q, A_inout, m, n, only_R);
+       int ret = 0;
         aligned_free32(tmp);
         return ret;
     }
+        */
     
     int rc = qrw_geqrf_blocked_wy_ws(A_inout, m, n, ws);
     if (rc) return rc;

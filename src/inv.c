@@ -40,6 +40,65 @@
 
 _Static_assert(LINALG_DEFAULT_ALIGNMENT >= 32, "Need 32B alignment for AVX2 loads");
 
+//==============================================================================
+// FORWARD DECLARATIONS (Internal Functions)
+//==============================================================================
+
+// Scalar fallback TRSM kernels (defined at bottom of file)
+static void trsm_ll_unit_unblocked_scalar(const float *restrict Lii, uint16_t n,
+                                          float *restrict Bi, uint16_t mb, uint16_t nb);
+
+static int trsm_uu_nonunit_unblocked_scalar(const float *restrict Uii, uint16_t n,
+                                            float *restrict Bi, uint16_t mb, uint16_t nb);
+
+// AVX2-optimized TRSM kernels (defined after forward declarations)
+#if LINALG_SIMD_ENABLE
+static void trsm_ll_unit_unblocked_avx2(const float *restrict Lii, uint16_t n,
+                                        float *restrict B, uint16_t nb, uint16_t jb);
+
+static int trsm_uu_nonunit_unblocked_avx2(const float *restrict Uii, uint16_t n,
+                                          float *restrict B, uint16_t nb, uint16_t jb);
+#endif
+
+// Packing helpers
+#if LINALG_SIMD_ENABLE
+static inline void pack_A_mr8_kc_avx2(const float *restrict A, uint16_t lda,
+                                      uint16_t M, uint16_t K,
+                                      uint16_t i0, uint16_t k0,
+                                      float *restrict Ap);
+
+static inline void pack_B_kc_nr16_avx2(const float *restrict B, uint16_t ldb,
+                                       uint16_t K, uint16_t N,
+                                       uint16_t k0, uint16_t j0,
+                                       float *restrict Bp);
+#endif
+
+// GEMM helpers
+static inline void gemm_mkn_scalar(const float *restrict A, uint16_t lda,
+                                   const float *restrict B, uint16_t ldb,
+                                   float *restrict C, uint16_t ldc,
+                                   uint16_t M, uint16_t N, uint16_t K,
+                                   int op_minus);
+
+#if LINALG_SIMD_ENABLE
+static inline void gemm_mkn_avx8x16(const float *restrict A, uint16_t lda,
+                                    const float *restrict B, uint16_t ldb,
+                                    float *restrict C, uint16_t ldc,
+                                    uint16_t M, uint16_t N, uint16_t K,
+                                    int op_minus);
+#endif
+
+// Blocked TRSM
+static void forward_trsm_blocked_L(const float *restrict LU, uint16_t n,
+                                   float *restrict RHS, uint16_t jb);
+
+static int backward_trsm_blocked_U(const float *restrict LU, uint16_t n,
+                                   float *restrict RHS, uint16_t jb);
+
+// Pivot application
+static void apply_pivots_to_rhs(float *restrict RHS, uint16_t n, uint16_t jb,
+                                const uint8_t *restrict P);
+
 /* =========================================================================================
  * Pivot application: UNCHANGED from original
  * ========================================================================================= */

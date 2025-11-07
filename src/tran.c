@@ -266,3 +266,4 @@ static inline void pack_T_Kx16(const float *RESTRICT B, uint16_t Ktot, uint16_t 
         memcpy(Bp + (size_t)t * 16, row, 16 * sizeof(float));
     }
 }
+
