@@ -8,6 +8,10 @@
 extern "C" {
 #endif
 
+#ifndef LINALG_DEFAULT_ALIGNMENT
+#  define LINALG_DEFAULT_ALIGNMENT 32
+#endif
+
 //==============================================================================
 // OPAQUE WORKSPACE TYPE
 //==============================================================================
