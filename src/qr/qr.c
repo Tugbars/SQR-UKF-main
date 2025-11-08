@@ -47,11 +47,10 @@ qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
     const uint16_t mn = (m_max < n_max) ? m_max : n_max;
     ws->m_max = m_max;
     ws->n_max = n_max;
-    ws->ib    = ib ? ib : 32;  // Default block size
+    ws->ib    = ib ? ib : 32;
 
     size_t bytes = 0;
     
-    // Original buffers
     ws->tau   = (float*)malloc(mn * sizeof(float)); 
     bytes += mn * sizeof(float);
     
@@ -61,7 +60,6 @@ qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
     ws->work  = (float*)malloc(m_max * sizeof(float)); 
     bytes += m_max * sizeof(float);
     
-    // Blocked QR buffers
     ws->T     = (float*)malloc(ws->ib * ws->ib * sizeof(float)); 
     bytes += ws->ib * ws->ib * sizeof(float);
     
@@ -70,6 +68,10 @@ qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
     
     ws->Y     = (float*)malloc((size_t)m_max * ws->ib * sizeof(float)); 
     bytes += (size_t)m_max * ws->ib * sizeof(float);
+    
+    // ✅ NEW: Pre-transposed Y buffer
+    ws->YT    = (float*)malloc((size_t)ws->ib * m_max * sizeof(float)); 
+    bytes += (size_t)ws->ib * m_max * sizeof(float);
     
     ws->Z     = (float*)malloc((size_t)ws->ib * n_max * sizeof(float)); 
     bytes += (size_t)ws->ib * n_max * sizeof(float);
@@ -81,7 +83,7 @@ qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
     bytes += n_max * sizeof(float);
 
     if (!ws->tau || !ws->tmp || !ws->work || !ws->T || !ws->Cpack || 
-        !ws->Y || !ws->Z || !ws->vn1 || !ws->vn2) {
+        !ws->Y || !ws->YT || !ws->Z || !ws->vn1 || !ws->vn2) {  // ✅ Add YT check
         qr_workspace_free(ws);
         return NULL;
     }
@@ -99,6 +101,7 @@ void qr_workspace_free(qr_workspace *ws)
     free(ws->T);
     free(ws->Cpack);
     free(ws->Y);
+    free(ws->YT);  // ✅ NEW
     free(ws->Z);
     free(ws->vn1);
     free(ws->vn2);
@@ -153,12 +156,13 @@ static void apply_reflector(float *A, uint16_t m, uint16_t n, const float *v, fl
 // PANEL FACTORIZATION
 //==============================================================================
 
-static void panel_qr(float *panel, float *Y, float *tau, 
+static void panel_qr(float *panel, float *Y, float *YT, float *tau, 
                      uint16_t m, uint16_t panel_stride, uint16_t ib)
 {
     // Factor ib columns of the panel
     // panel[m×panel_stride] - row-major input
     // Y[m×ib] - row-major output (Householder vectors)
+    // YT[ib×m] - row-major output (transposed Y)
     // tau[ib] - output tau values
     
     for (uint16_t k = 0; k < ib; ++k) {
@@ -176,14 +180,17 @@ static void panel_qr(float *panel, float *Y, float *tau,
                           rows_below, ib - k - 1, col, tau[k]);
         }
         
-        // Store Householder vector to Y (row-major: Y[i, k] = Y[i*ib + k])
+        // ✅ DUAL PACK: Store to both Y and YT simultaneously
         for (uint16_t i = k; i < m; ++i) {
-            Y[i * ib + k] = (i == k) ? 1.0f : col[i - k];
+            float val = (i == k) ? 1.0f : col[i - k];
+            Y[i * ib + k] = val;      // Y[i, k]
+            YT[k * m + i] = val;      // Y^T[k, i] (transposed!)
         }
         
-        // Zero out upper part
+        // Zero out upper parts in both
         for (uint16_t i = 0; i < k; ++i) {
             Y[i * ib + k] = 0.0f;
+            YT[k * m + i] = 0.0f;
         }
     }
 }
@@ -288,9 +295,153 @@ int qr_scalar_only(const float *A, float *Q, float *R,
     return ret;
 }
 
+//==============================================================================
+// REFERENCE MATRIX MULTIPLY (for debugging)
+//==============================================================================
+
+static int matmul_ref(float *C, const float *A, const float *B,
+                      uint16_t m, uint16_t k, uint16_t n)
+{
+    // C[m×n] = A[m×k] * B[k×n]
+    for (uint16_t i = 0; i < m; ++i) {
+        for (uint16_t j = 0; j < n; ++j) {
+            double sum = 0.0;
+            for (uint16_t p = 0; p < k; ++p) {
+                sum += (double)A[i * k + p] * (double)B[p * n + j];
+            }
+            C[i * n + j] = (float)sum;
+        }
+    }
+    return 0;
+}
+
 
 //==============================================================================
-// BLOCKED QR (NO GEMM YET - JUST PANEL)
+// APPLY BLOCK REFLECTOR (Using mul with aligned buffers)
+//==============================================================================
+
+static int apply_block_reflector(float *C, const float *Y, const float *YT,
+                                 const float *T, uint16_t m, uint16_t n, uint16_t ib,
+                                 float *Z)
+{
+    // Apply (I - Y*T*Y^T) to C
+    // YT is pre-transposed - NO TRANSPOSE NEEDED!
+    
+    int ret;
+    
+    float *Z_temp = (float*)malloc((size_t)ib * n * sizeof(float));
+    if (!Z_temp) return -ENOMEM;
+    
+    // Step 1: Z = Y^T * C  [ib×n] = [ib×m] * [m×n]
+    // ✅ Use pre-packed YT directly - NO TRANSPOSE!
+    ret = matmul_ref(Z, YT, C, ib, m, n);
+    if (ret != 0) {
+        free(Z_temp);
+        return ret;
+    }
+    
+    // Step 2: Z = T * Z  [ib×n] = [ib×ib] * [ib×n]
+    memcpy(Z_temp, Z, (size_t)ib * n * sizeof(float));
+    ret = matmul_ref(Z, T, Z_temp, ib, ib, n);
+    if (ret != 0) {
+        free(Z_temp);
+        return ret;
+    }
+    free(Z_temp);
+    
+    // Step 3: C = C - Y * Z  [m×n] -= [m×ib] * [ib×n]
+    float *YZ = (float*)malloc((size_t)m * n * sizeof(float));
+    if (!YZ) return -ENOMEM;
+    
+    ret = matmul_ref(YZ, Y, Z, m, ib, n);
+    if (ret != 0) {
+        free(YZ);
+        return ret;
+    }
+    
+    // C = C - YZ
+    for (size_t i = 0; i < (size_t)m * n; ++i) {
+        C[i] -= YZ[i];
+    }
+    free(YZ);
+    
+    return 0;
+}
+
+//==============================================================================
+// BLOCKED Q FORMATION
+//==============================================================================
+
+static int form_Q_blocked(float *Q, const float *Awork, const float *tau,
+                         uint16_t m, uint16_t n, uint16_t ib,
+                         qr_workspace *ws)
+{
+    // Form Q by applying block reflectors to identity
+    const uint16_t kmax = (m < n) ? m : n;
+    
+    // Initialize Q = I
+    memset(Q, 0, (size_t)m * m * sizeof(float));
+    for (uint16_t i = 0; i < m; ++i)
+        Q[i * m + i] = 1.0f;
+    
+    // Apply blocks in reverse order
+    for (int k_block = (int)(kmax - 1); k_block >= 0; k_block -= ib) {
+        // Determine block boundaries
+        uint16_t k = (k_block >= (int)ib) ? (uint16_t)(k_block - ib + 1) : 0;
+        uint16_t block_size = (uint16_t)(k_block + 1 - k);
+        if (block_size > ib) block_size = ib;
+        
+        const uint16_t rows_below = m - k;
+        
+        // Extract Y from Awork and pack both Y and YT
+        for (uint16_t i = k; i < m; ++i) {
+            for (uint16_t j = 0; j < block_size; ++j) {
+                uint16_t col = k + j;
+                float val;
+                
+                if (i < col) {
+                    val = 0.0f;
+                } else if (i == col) {
+                    val = 1.0f;
+                } else {
+                    val = Awork[i * n + col];
+                }
+                
+                // Pack to both Y and YT
+                ws->Y[i * ib + j] = val;                    // Y[i, j]
+                ws->YT[j * rows_below + (i - k)] = val;    // YT[j, i-k] with stride=rows_below
+            }
+        }
+        
+        // Zero upper parts
+        for (uint16_t i = 0; i < k; ++i) {
+            for (uint16_t j = 0; j < block_size; ++j) {
+                ws->Y[i * ib + j] = 0.0f;
+                // YT doesn't need zeroing since we only use rows k:m
+            }
+        }
+        
+        // Build T matrix for this block
+        build_T_matrix(ws->Y, &tau[k], ws->T, rows_below, block_size);
+        
+        // Apply block reflector to Q[k:m, :]
+        // We're updating rows k:m of Q, which is m columns wide
+        int ret = apply_block_reflector(&Q[k * m],      // Start at row k
+                                       ws->Y + k * ib,  // Y starting at row k
+                                       ws->YT,          // YT with stride=rows_below
+                                       ws->T,
+                                       rows_below,      // Number of rows
+                                       m,               // Number of columns (full width of Q)
+                                       block_size,
+                                       ws->Z);
+        if (ret != 0) return ret;
+    }
+    
+    return 0;
+}
+
+//==============================================================================
+// COMPLETE BLOCKED QR
 //==============================================================================
 
 int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
@@ -304,17 +455,30 @@ int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
     
     const uint16_t kmax = (m < n) ? m : n;
     
-    // For now: just do first panel to test
-    if (kmax > 0) {
-        uint16_t block_size = (ws->ib < kmax) ? ws->ib : kmax;
+    // Main blocked loop
+    for (uint16_t k = 0; k < kmax; k += ws->ib) {
+        const uint16_t block_size = (k + ws->ib <= kmax) ? ws->ib : (kmax - k);
+        const uint16_t rows_below = m - k;
+        const uint16_t cols_right = n - k - block_size;
         
-        // Factor first panel
-        panel_qr(Awork, ws->Y, ws->tau, m, n, block_size);
+        // 1. Panel factorization - ✅ Now dual-packs Y and YT
+        panel_qr(&Awork[k * n + k], ws->Y, ws->YT, &ws->tau[k], 
+                rows_below, n, block_size);
+
         
-        // Build T matrix
-        build_T_matrix(ws->Y, ws->tau, ws->T, m, block_size);
+        // 2. Build T matrix
+        build_T_matrix(ws->Y, &ws->tau[k], ws->T, rows_below, block_size);
         
-        printf("[DEBUG] First panel factored, block_size=%d\n", block_size);
+        // 3. Apply block reflector to trailing matrix
+        if (cols_right > 0) {
+            int ret = apply_block_reflector(&Awork[k * n + k + block_size],
+                                           ws->Y, ws->YT, ws->T,  // ✅ Added YT
+                                           rows_below, cols_right, block_size,
+                                           ws->Z);
+            if (ret != 0) {
+                return ret;
+            }
+        }
     }
     
     // Extract R
@@ -322,14 +486,14 @@ int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
         for (uint16_t j = 0; j < n; ++j)
             R[i * n + j] = (i <= j) ? Awork[i * n + j] : 0.0f;
     
-    // Q formation - use scalar for now
+    // Form Q if needed
     if (!only_R && Q) {
         // Initialize Q = I
         memset(Q, 0, (size_t)m * m * sizeof(float));
         for (uint16_t i = 0; i < m; ++i)
             Q[i * m + i] = 1.0f;
         
-        // Apply reflectors from Y
+        // Apply reflectors in reverse
         for (int k = (int)kmax - 1; k >= 0; --k) {
             if (ws->tau[k] == 0.0f) continue;
             

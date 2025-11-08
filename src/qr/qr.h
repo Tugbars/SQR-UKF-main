@@ -30,6 +30,7 @@ typedef struct qr_workspace_s {
     float *T;            // ib×ib - triangular factor
     float *Cpack;        // mc×kc - packed trailing matrix
     float *Y;            // ib×kc - intermediate Y = Vᵀ·C
+    float *YT;
     float *Z;            // ib×kc - intermediate Z = T·Y
     
     // CPQR-specific
