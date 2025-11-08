@@ -15,29 +15,22 @@
  * @note Thread-safe: each thread should have its own workspace
  * @note Sized for maximum dimensions (m_max, n_max) specified at creation
  */
-typedef struct qr_workspace_s {
-    // Dimensions
+typedef struct {
     uint16_t m_max;
     uint16_t n_max;
     uint16_t ib;
-    
-    // QR/GEQP3 shared buffers (32-byte aligned)
-    float *tau;          // min(m,n) - Householder scalars
-    float *tmp;          // m - panel factorization workspace
-    float *work;         // m - CPQR Householder gather buffer
-    
-    // Compact-WY buffers
-    float *T;            // ib×ib - triangular factor
-    float *Cpack;        // mc×kc - packed trailing matrix
-    float *Y;            // ib×kc - intermediate Y = Vᵀ·C
-    float *YT;
-    float *Z;            // ib×kc - intermediate Z = T·Y
-    
-    // CPQR-specific
-    float *vn1;          // n - working column norms
-    float *vn2;          // n - reference column norms
-    
-    // Memory accounting
+    float *tau;
+    float *tmp;
+    float *work;
+    float *T;      // Aligned
+    float *Cpack;  // Aligned
+    float *Y;      // Aligned
+    float *YT;     // Aligned (pre-transposed Y)
+    float *Z;      // Aligned
+    float *Z_temp; // ✅ NEW: Aligned temp buffer
+    float *YZ;     // ✅ NEW: Aligned temp buffer
+    float *vn1;
+    float *vn2;
     size_t total_bytes;
 } qr_workspace;
 

@@ -60,21 +60,27 @@ qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
     ws->work  = (float*)malloc(m_max * sizeof(float)); 
     bytes += m_max * sizeof(float);
     
-    ws->T     = (float*)malloc(ws->ib * ws->ib * sizeof(float)); 
+    ws->T     = (float*)portable_aligned_alloc(32, ws->ib * ws->ib * sizeof(float)); 
     bytes += ws->ib * ws->ib * sizeof(float);
     
-    ws->Cpack = (float*)malloc((size_t)m_max * n_max * sizeof(float)); 
+    ws->Cpack = (float*)portable_aligned_alloc(32, (size_t)m_max * n_max * sizeof(float)); 
     bytes += (size_t)m_max * n_max * sizeof(float);
     
-    ws->Y     = (float*)malloc((size_t)m_max * ws->ib * sizeof(float)); 
+    ws->Y     = (float*)portable_aligned_alloc(32, (size_t)m_max * ws->ib * sizeof(float)); 
     bytes += (size_t)m_max * ws->ib * sizeof(float);
     
-    // ✅ NEW: Pre-transposed Y buffer
-    ws->YT    = (float*)malloc((size_t)ws->ib * m_max * sizeof(float)); 
+    ws->YT    = (float*)portable_aligned_alloc(32, (size_t)ws->ib * m_max * sizeof(float)); 
     bytes += (size_t)ws->ib * m_max * sizeof(float);
     
-    ws->Z     = (float*)malloc((size_t)ws->ib * n_max * sizeof(float)); 
+    ws->Z     = (float*)portable_aligned_alloc(32, (size_t)ws->ib * n_max * sizeof(float)); 
     bytes += (size_t)ws->ib * n_max * sizeof(float);
+    
+    // ✅ NEW: Pre-allocate temporary buffers for apply_block_reflector
+    ws->Z_temp = (float*)portable_aligned_alloc(32, (size_t)ws->ib * n_max * sizeof(float));
+    bytes += (size_t)ws->ib * n_max * sizeof(float);
+    
+    ws->YZ     = (float*)portable_aligned_alloc(32, (size_t)m_max * n_max * sizeof(float));
+    bytes += (size_t)m_max * n_max * sizeof(float);
     
     ws->vn1   = (float*)malloc(n_max * sizeof(float)); 
     bytes += n_max * sizeof(float);
@@ -83,7 +89,8 @@ qr_workspace* qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
     bytes += n_max * sizeof(float);
 
     if (!ws->tau || !ws->tmp || !ws->work || !ws->T || !ws->Cpack || 
-        !ws->Y || !ws->YT || !ws->Z || !ws->vn1 || !ws->vn2) {  // ✅ Add YT check
+        !ws->Y || !ws->YT || !ws->Z || !ws->Z_temp || !ws->YZ || 
+        !ws->vn1 || !ws->vn2) {
         qr_workspace_free(ws);
         return NULL;
     }
@@ -98,11 +105,13 @@ void qr_workspace_free(qr_workspace *ws)
     free(ws->tau);
     free(ws->tmp);
     free(ws->work);
-    free(ws->T);
-    free(ws->Cpack);
-    free(ws->Y);
-    free(ws->YT);  // ✅ NEW
-    free(ws->Z);
+    portable_aligned_free(ws->T);
+    portable_aligned_free(ws->Cpack);
+    portable_aligned_free(ws->Y);
+    portable_aligned_free(ws->YT);
+    portable_aligned_free(ws->Z);
+    portable_aligned_free(ws->Z_temp);  // ✅ NEW
+    portable_aligned_free(ws->YZ);      // ✅ NEW
     free(ws->vn1);
     free(ws->vn2);
     free(ws);
@@ -186,7 +195,7 @@ static void panel_qr(float *panel, float *Y, float *YT, float *tau,
             Y[i * ib + k] = val;      // Y[i, k]
             YT[k * m + i] = val;      // Y^T[k, i] (transposed!)
         }
-        
+
         // Zero out upper parts in both
         for (uint16_t i = 0; i < k; ++i) {
             Y[i * ib + k] = 0.0f;
@@ -319,56 +328,34 @@ static int matmul_ref(float *C, const float *A, const float *B,
 //==============================================================================
 // APPLY BLOCK REFLECTOR (Using mul with aligned buffers)
 //==============================================================================
-
 static int apply_block_reflector(float *C, const float *Y, const float *YT,
                                  const float *T, uint16_t m, uint16_t n, uint16_t ib,
-                                 float *Z)
+                                 float *Z, float *Z_temp, float *YZ)
 {
+    // ✅ CRITICAL: Zero buffers before use
+    memset(Z, 0, (size_t)ib * n * sizeof(float));
+    memset(Z_temp, 0, (size_t)ib * n * sizeof(float));
+    memset(YZ, 0, (size_t)m * n * sizeof(float));
+    
     // Apply (I - Y*T*Y^T) to C
-    // YT is pre-transposed - NO TRANSPOSE NEEDED!
-    
-    int ret;
-    
-    float *Z_temp = (float*)malloc((size_t)ib * n * sizeof(float));
-    if (!Z_temp) return -ENOMEM;
     
     // Step 1: Z = Y^T * C  [ib×n] = [ib×m] * [m×n]
-    // ✅ Use pre-packed YT directly - NO TRANSPOSE!
-    ret = matmul_ref(Z, YT, C, ib, m, n);
-    if (ret != 0) {
-        free(Z_temp);
-        return ret;
-    }
+    mul(Z, YT, C, ib, m, m, n);
     
     // Step 2: Z = T * Z  [ib×n] = [ib×ib] * [ib×n]
     memcpy(Z_temp, Z, (size_t)ib * n * sizeof(float));
-    ret = matmul_ref(Z, T, Z_temp, ib, ib, n);
-    if (ret != 0) {
-        free(Z_temp);
-        return ret;
-    }
-    free(Z_temp);
+    mul(Z, T, Z_temp, ib, ib, ib, n);
     
     // Step 3: C = C - Y * Z  [m×n] -= [m×ib] * [ib×n]
-    float *YZ = (float*)malloc((size_t)m * n * sizeof(float));
-    if (!YZ) return -ENOMEM;
-    
-    ret = matmul_ref(YZ, Y, Z, m, ib, n);
-    if (ret != 0) {
-        free(YZ);
-        return ret;
-    }
+    mul(YZ, Y, Z, m, ib, ib, n);
     
     // C = C - YZ
     for (size_t i = 0; i < (size_t)m * n; ++i) {
         C[i] -= YZ[i];
     }
-    free(YZ);
     
     return 0;
 }
-
-
 
 //==============================================================================
 // COMPLETE BLOCKED QR
@@ -402,9 +389,9 @@ int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
         // 3. Apply block reflector to trailing matrix
         if (cols_right > 0) {
             int ret = apply_block_reflector(&Awork[k * n + k + block_size],
-                                           ws->Y, ws->YT, ws->T,  // ✅ Added YT
-                                           rows_below, cols_right, block_size,
-                                           ws->Z);
+                                   ws->Y, ws->YT, ws->T,
+                                   rows_below, cols_right, block_size,
+                                   ws->Z, ws->Z_temp, ws->YZ);  // ✅ Pass workspace buffers
             if (ret != 0) {
                 return ret;
             }

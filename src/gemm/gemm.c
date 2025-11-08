@@ -172,21 +172,31 @@ struct gemm_workspace
 
 size_t gemm_workspace_query(uint16_t M, uint16_t K, uint16_t N)
 {
-    (void)M;
-    (void)N;
+    (void)M; (void)N;
+
     const size_t Kc = LINALG_BLOCK_KC;
+
+    /* --- WIDEST NR WE EVER PACK --- */
+#ifndef GEMM_NR_MAX
+#  ifdef __AVX512F__
+#    define GEMM_NR_MAX 16    /* kernels: 32x16 / 32x12 → widest 16 */
+#  else
+#    define GEMM_NR_MAX 16    /* kernels: 8x16 exists → widest 16 */
+#  endif
+#endif
 
 #ifdef __AVX512F__
     const size_t max_mr = 32;
 #else
     const size_t max_mr = 16;
 #endif
+
+    /* Ap: MR × Kc */
     const size_t Ap_size = max_mr * Kc * sizeof(float);
 
-    /* Worst-case NR = 6 */
-    const size_t NR_MIN = 6;
+    /* Bp: Kc × round_up(JC, GEMM_NR_MAX) */
     const size_t B_cols_rounded =
-        ((size_t)LINALG_BLOCK_JC + (NR_MIN - 1)) / NR_MIN * NR_MIN;
+        ((size_t)LINALG_BLOCK_JC + (GEMM_NR_MAX - 1)) / GEMM_NR_MAX * GEMM_NR_MAX;
     const size_t Bp_size = Kc * B_cols_rounded * sizeof(float);
 
     return Ap_size + Bp_size + 64;
@@ -608,78 +618,77 @@ static inline void pack_B_12col_tile(
 /**
  * @brief Pack B dispatcher (based on NR)
  */
+// Single-panel dispatcher: packs exactly one panel of width jb (<= NR)
+// Writes Kblk * NR floats at Bp, zero-pads lanes > jb.
 static inline void pack_B_tile(
     float *RESTRICT Bp,
     const float *RESTRICT B,
     size_t K, size_t N,
     size_t kk, size_t Kblk,
-    size_t j0, size_t jb, // jb = actual columns in this panel
-    size_t NR)            // NR = panel width (6, 8, 12, 16)
+    size_t j0, size_t jb,   // jb = actual columns in this one panel (<= NR)
+    size_t NR)              // NR = 6, 8, 12, or 16 (kernel panel width)
 {
-    // Tail-safe 16-wide path (needed for AVX2 8x16 kernel)
-    if (NR == 16)
-    {
-        for (size_t k = 0; k < Kblk; ++k)
-        {
-            const float *brow = B + (kk + k) * N + j0; // row start for this K
-            float *dst = Bp + k * 16;                  // packed row (16 floats)
-
-#if defined(__AVX2__)
-            if (jb == 16)
-            {
-                // Fast path: full 16 columns
-                _mm256_store_ps(dst, _mm256_loadu_ps(brow));
-                _mm256_store_ps(dst + 8, _mm256_loadu_ps(brow + 8));
-            }
-            else if (jb > 8)
-            {
-                // Low 8 fully valid
-                _mm256_store_ps(dst, _mm256_loadu_ps(brow));
-
-                // High 8: only (jb-8) lanes valid
-                const size_t w2 = jb - 8;                      // 1..7
-                __m256i mhi = avx2_tailmask_nr(w2, 8);         // mask for w2 lanes
-                _mm256_store_ps(dst + 8, _mm256_setzero_ps()); // zero pad first
-                __m256 hi = _mm256_maskload_ps(brow + 8, mhi); // safe load
-                _mm256_maskstore_ps(dst + 8, mhi, hi);         // write valid lanes
-            }
-            else if (jb == 8)
-            {
-                // Exactly 8: high half is all zeros, never read it
-                _mm256_store_ps(dst, _mm256_loadu_ps(brow));
-                _mm256_store_ps(dst + 8, _mm256_setzero_ps());
-            }
-            else
-            { // jb < 8
-                // Only low part has data
-                __m256i mlo = avx2_tailmask_nr(jb, 8); // mask for jb lanes
-                _mm256_store_ps(dst, _mm256_setzero_ps());
-                __m256 lo = _mm256_maskload_ps(brow, mlo); // safe load
-                _mm256_maskstore_ps(dst, mlo, lo);         // write valid lanes
-                _mm256_store_ps(dst + 8, _mm256_setzero_ps());
-            }
-#else
-            // Scalar fallback
-            size_t t = 0;
-            for (; t < jb; ++t)
-                dst[t] = brow[t];
-            for (; t < 16; ++t)
-                dst[t] = 0.0f;
+    // Sanity (debug-only)
+#ifndef NDEBUG
+    if (jb > NR) { __builtin_trap(); }
 #endif
+
+    if (NR == 16) {
+#if defined(__AVX512F__)
+        // AVX-512 path (you already have a 16-col packer)
+        pack_B_16col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
+        return;
+#elif defined(__AVX2__)
+        // AVX2 16-wide (for 8x16 kernel). Tail-safe with masks.
+        for (size_t k = 0; k < Kblk; ++k) {
+            const float *brow = B + (kk + k) * N + j0;
+            float *dst = Bp + k * 16;
+
+            if (jb == 16) {
+                _mm256_store_ps(dst + 0, _mm256_loadu_ps(brow + 0));
+                _mm256_store_ps(dst + 8, _mm256_loadu_ps(brow + 8));
+            } else if (jb > 8) {
+                // low 8 full
+                _mm256_store_ps(dst + 0, _mm256_loadu_ps(brow + 0));
+                // high 8 partial
+                const size_t w2 = jb - 8;             // 1..7
+                __m256i mhi = avx2_tailmask_nr(w2, 8);// mask for w2 lanes
+                _mm256_store_ps(dst + 8, _mm256_setzero_ps());
+                __m256 hi = _mm256_maskload_ps(brow + 8, mhi);
+                _mm256_maskstore_ps(dst + 8, mhi, hi);
+            } else if (jb == 8) {
+                _mm256_store_ps(dst + 0, _mm256_loadu_ps(brow + 0));
+                _mm256_store_ps(dst + 8, _mm256_setzero_ps());
+            } else { // jb < 8
+                __m256i mlo = avx2_tailmask_nr(jb, 8);
+                _mm256_store_ps(dst + 0, _mm256_setzero_ps());
+                __m256 lo = _mm256_maskload_ps(brow + 0, mlo);
+                _mm256_maskstore_ps(dst + 0, mlo, lo);
+                _mm256_store_ps(dst + 8, _mm256_setzero_ps());
+            }
         }
         return;
+#else
+        // scalar fallback
+        for (size_t k = 0; k < Kblk; ++k) {
+            const float *src = B + (kk + k) * N + j0;
+            float *dst = Bp + k * 16;
+            size_t t = 0;
+            for (; t < jb; ++t) dst[t] = src[t];
+            for (; t < 16; ++t) dst[t] = 0.0f;
+        }
+        return;
+#endif
     }
 
 #ifdef __AVX512F__
-    if (NR == 12)
-    {
+    if (NR == 12) {
         pack_B_12col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
         return;
     }
 #endif
 
-    if (NR == 8)
-    {
+    if (NR == 8) {
         pack_B_8col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
         return;
     }
@@ -687,6 +696,8 @@ static inline void pack_B_tile(
     // NR == 6
     pack_B_6col_tile(Bp, B, K, N, kk, Kblk, j0, jb);
 }
+
+
 //==============================================================================
 // KERNEL SELECTION
 //==============================================================================
@@ -1071,23 +1082,28 @@ int mul(
         return -EINVAL;
 
     const size_t M = row_a, K = column_a, N = column_b;
+    const size_t Kc = (size_t)LINALG_BLOCK_KC;
 
-    const size_t Kc = LINALG_BLOCK_KC;
+#ifndef GEMM_NR_MAX
+#  ifdef __AVX512F__
+#    define GEMM_NR_MAX 16
+#  else
+#    define GEMM_NR_MAX 16
+#  endif
+#endif
 
-    /* Worst-case NR = 6 → total cols per JC tile must round up to 6 */
-    const size_t NR_MIN = 6;
-    const size_t B_cols_rounded =
-        ((size_t)LINALG_BLOCK_JC + (NR_MIN - 1)) / NR_MIN * NR_MIN;
-
-    /* Ap: MR × Kc  (MR=16 for AVX2, 32 for AVX-512) */
 #ifdef __AVX512F__
     const size_t max_mr = 32;
 #else
     const size_t max_mr = 16;
 #endif
+
+    /* Ap: MR × Kc */
     const size_t max_Ap_elems = Kc * max_mr;
 
-    /* Bp: Kc × round_up(JC, 6) */
+    /* Bp: Kc × round_up(JC, GEMM_NR_MAX) */
+    const size_t B_cols_rounded =
+        ((size_t)LINALG_BLOCK_JC + (GEMM_NR_MAX - 1)) / GEMM_NR_MAX * GEMM_NR_MAX;
     const size_t max_Bp_elems = Kc * B_cols_rounded;
 
     float *Bp = (float *)gemm_aligned_alloc(LINALG_DEFAULT_ALIGNMENT,
@@ -1128,18 +1144,26 @@ int gemm_ws(
 
     ws_reset(ws);
 
-    const size_t Kc = LINALG_BLOCK_KC;
+    const size_t Kc = (size_t)LINALG_BLOCK_KC;
+
+#ifndef GEMM_NR_MAX
+#  ifdef __AVX512F__
+#    define GEMM_NR_MAX 16
+#  else
+#    define GEMM_NR_MAX 16
+#  endif
+#endif
 
 #ifdef __AVX512F__
     const size_t max_mr = 32;
 #else
     const size_t max_mr = 16;
 #endif
+
     const size_t Ap_size = max_mr * Kc * sizeof(float);
 
-    const size_t NR_MIN = 6;
     const size_t B_cols_rounded =
-        ((size_t)LINALG_BLOCK_JC + (NR_MIN - 1)) / NR_MIN * NR_MIN;
+        ((size_t)LINALG_BLOCK_JC + (GEMM_NR_MAX - 1)) / GEMM_NR_MAX * GEMM_NR_MAX;
     const size_t Bp_size = Kc * B_cols_rounded * sizeof(float);
 
     float *Ap = (float *)ws_alloc(ws, Ap_size, 32);
@@ -1149,7 +1173,6 @@ int gemm_ws(
 
     return gemm_core(C, A, B, M, K, N, alpha, beta, Ap, Bp);
 }
-
 /*
 ┌─────────────────────────────────────────────────┐
 │  GEMM (Foundation)                              │
