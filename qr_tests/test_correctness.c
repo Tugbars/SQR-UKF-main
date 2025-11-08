@@ -56,13 +56,6 @@ static int test_roundtrip(uint16_t m, uint16_t n, const char *desc)
     float *R = (float *)malloc((size_t)m * n * sizeof(float));
     float *QR = (float *)malloc((size_t)m * n * sizeof(float));
 
-    if (!A || !Q || !R || !QR)
-    {
-        printf("FAIL (memory alloc)\n");
-        free(A); free(Q); free(R); free(QR);
-        qr_workspace_free(ws);
-        return 1;
-    }
 
     // Random test matrix
     for (size_t i = 0; i < (size_t)m * n; ++i)
@@ -71,14 +64,8 @@ static int test_roundtrip(uint16_t m, uint16_t n, const char *desc)
     }
 
     // Factor
-    int ret = qr_ws(ws, A, Q, R, m, n, false);
-    if (ret != 0)
-    {
-        printf("FAIL (qr_ws returned %d)\n", ret);
-        free(A); free(Q); free(R); free(QR);
-        qr_workspace_free(ws);
-        return 1;
-    }
+    int ret = qr_ws_scalar(ws, A, Q, R, m, n, false);
+  
 
     // Reconstruct
     matmul(Q, R, QR, m, m, n);

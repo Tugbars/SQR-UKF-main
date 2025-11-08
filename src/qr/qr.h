@@ -173,4 +173,28 @@ int geqp3_ws(qr_workspace *ws, float *A, uint16_t m, uint16_t n,
 int geqp3_blocked(float *A, uint16_t m, uint16_t n, uint16_t ib, 
                   float *tau, int *jpvt);
 
+
+
+/**
+ * @brief QR decomposition using pre-allocated workspace (SCALAR reference path)
+ *
+ * @param ws Pre-allocated workspace
+ * @param A  Input matrix (m×n, row-major)
+ * @param Q  Output orthogonal matrix (m×m, row-major), may be NULL if only_R=true
+ * @param R  Output upper-triangular (m×n, row-major)
+ * @param m  Rows (≤ m_max)
+ * @param n  Cols (≤ n_max)
+ * @param only_R If true, skip Q formation
+ *
+ * @return 0 on success, negative errno on failure
+ */
+int qr_ws_scalar(qr_workspace *ws, const float *A, float *Q, float *R,
+                 uint16_t m, uint16_t n, bool only_R);
+
+/**
+ * @brief Convenience wrapper for scalar path (allocates/free workspace internally)
+ */
+int qr_scalar_only(const float *A, float *Q, float *R,
+                   uint16_t m, uint16_t n, bool only_R);
+
 #endif // QR_H
