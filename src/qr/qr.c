@@ -368,77 +368,7 @@ static int apply_block_reflector(float *C, const float *Y, const float *YT,
     return 0;
 }
 
-//==============================================================================
-// BLOCKED Q FORMATION
-//==============================================================================
 
-static int form_Q_blocked(float *Q, const float *Awork, const float *tau,
-                         uint16_t m, uint16_t n, uint16_t ib,
-                         qr_workspace *ws)
-{
-    // Form Q by applying block reflectors to identity
-    const uint16_t kmax = (m < n) ? m : n;
-    
-    // Initialize Q = I
-    memset(Q, 0, (size_t)m * m * sizeof(float));
-    for (uint16_t i = 0; i < m; ++i)
-        Q[i * m + i] = 1.0f;
-    
-    // Apply blocks in reverse order
-    for (int k_block = (int)(kmax - 1); k_block >= 0; k_block -= ib) {
-        // Determine block boundaries
-        uint16_t k = (k_block >= (int)ib) ? (uint16_t)(k_block - ib + 1) : 0;
-        uint16_t block_size = (uint16_t)(k_block + 1 - k);
-        if (block_size > ib) block_size = ib;
-        
-        const uint16_t rows_below = m - k;
-        
-        // Extract Y from Awork and pack both Y and YT
-        for (uint16_t i = k; i < m; ++i) {
-            for (uint16_t j = 0; j < block_size; ++j) {
-                uint16_t col = k + j;
-                float val;
-                
-                if (i < col) {
-                    val = 0.0f;
-                } else if (i == col) {
-                    val = 1.0f;
-                } else {
-                    val = Awork[i * n + col];
-                }
-                
-                // Pack to both Y and YT
-                ws->Y[i * ib + j] = val;                    // Y[i, j]
-                ws->YT[j * rows_below + (i - k)] = val;    // YT[j, i-k] with stride=rows_below
-            }
-        }
-        
-        // Zero upper parts
-        for (uint16_t i = 0; i < k; ++i) {
-            for (uint16_t j = 0; j < block_size; ++j) {
-                ws->Y[i * ib + j] = 0.0f;
-                // YT doesn't need zeroing since we only use rows k:m
-            }
-        }
-        
-        // Build T matrix for this block
-        build_T_matrix(ws->Y, &tau[k], ws->T, rows_below, block_size);
-        
-        // Apply block reflector to Q[k:m, :]
-        // We're updating rows k:m of Q, which is m columns wide
-        int ret = apply_block_reflector(&Q[k * m],      // Start at row k
-                                       ws->Y + k * ib,  // Y starting at row k
-                                       ws->YT,          // YT with stride=rows_below
-                                       ws->T,
-                                       rows_below,      // Number of rows
-                                       m,               // Number of columns (full width of Q)
-                                       block_size,
-                                       ws->Z);
-        if (ret != 0) return ret;
-    }
-    
-    return 0;
-}
 
 //==============================================================================
 // COMPLETE BLOCKED QR

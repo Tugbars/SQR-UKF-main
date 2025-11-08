@@ -23,7 +23,7 @@ if (MSVC)
     target_compile_options(gemm_avx2 PRIVATE /arch:AVX2 /fp:fast)
 else()
     target_compile_options(gemm_avx2 PRIVATE 
-        -mavx2 -mfma -O3 
+        -mavx2 -mfma -O3 -ffast-math
         -Wall -Wextra -Wpedantic -Wno-unused-parameter
     )
 endif()
