@@ -21,35 +21,37 @@
  */
 static inline void gemm_transpose_8x8_avx2(__m256 *rows)
 {
-    // Step 1: Unpack pairs
-    __m256 t0 = _mm256_unpacklo_ps(rows[0], rows[1]);
-    __m256 t1 = _mm256_unpackhi_ps(rows[0], rows[1]);
-    __m256 t2 = _mm256_unpacklo_ps(rows[2], rows[3]);
-    __m256 t3 = _mm256_unpackhi_ps(rows[2], rows[3]);
-    __m256 t4 = _mm256_unpacklo_ps(rows[4], rows[5]);
-    __m256 t5 = _mm256_unpackhi_ps(rows[4], rows[5]);
-    __m256 t6 = _mm256_unpacklo_ps(rows[6], rows[7]);
-    __m256 t7 = _mm256_unpackhi_ps(rows[6], rows[7]);
+    __m256 r0 = rows[0], r1 = rows[1], r2 = rows[2], r3 = rows[3];
+    __m256 r4 = rows[4], r5 = rows[5], r6 = rows[6], r7 = rows[7];
 
-    // Step 2: Shuffle 4-element blocks
-    __m256 tt0 = _mm256_shuffle_ps(t0, t2, 0x44);
-    __m256 tt1 = _mm256_shuffle_ps(t0, t2, 0xEE);
-    __m256 tt2 = _mm256_shuffle_ps(t1, t3, 0x44);
-    __m256 tt3 = _mm256_shuffle_ps(t1, t3, 0xEE);
-    __m256 tt4 = _mm256_shuffle_ps(t4, t6, 0x44);
-    __m256 tt5 = _mm256_shuffle_ps(t4, t6, 0xEE);
-    __m256 tt6 = _mm256_shuffle_ps(t5, t7, 0x44);
-    __m256 tt7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+    __m256 u0 = _mm256_unpacklo_ps(r0, r1);
+    __m256 u1 = _mm256_unpackhi_ps(r0, r1);
+    __m256 u2 = _mm256_unpacklo_ps(r2, r3);
+    __m256 u3 = _mm256_unpackhi_ps(r2, r3);
 
-    // Step 3: Permute 128-bit lanes
-    rows[0] = _mm256_permute2f128_ps(tt0, tt4, 0x20);
-    rows[1] = _mm256_permute2f128_ps(tt1, tt5, 0x20);
-    rows[2] = _mm256_permute2f128_ps(tt2, tt6, 0x20);
-    rows[3] = _mm256_permute2f128_ps(tt3, tt7, 0x20);
-    rows[4] = _mm256_permute2f128_ps(tt0, tt4, 0x31);
-    rows[5] = _mm256_permute2f128_ps(tt1, tt5, 0x31);
-    rows[6] = _mm256_permute2f128_ps(tt2, tt6, 0x31);
-    rows[7] = _mm256_permute2f128_ps(tt3, tt7, 0x31);
+    __m256 v0 = _mm256_shuffle_ps(u0, u2, 0x44);
+    __m256 v1 = _mm256_shuffle_ps(u0, u2, 0xEE);
+    __m256 v2 = _mm256_shuffle_ps(u1, u3, 0x44);
+    __m256 v3 = _mm256_shuffle_ps(u1, u3, 0xEE);
+
+    __m256 w0 = _mm256_unpacklo_ps(r4, r5);
+    __m256 w1 = _mm256_unpackhi_ps(r4, r5);
+    __m256 w2 = _mm256_unpacklo_ps(r6, r7);
+    __m256 w3 = _mm256_unpackhi_ps(r6, r7);
+
+    __m256 x0 = _mm256_shuffle_ps(w0, w2, 0x44);
+    __m256 x1 = _mm256_shuffle_ps(w0, w2, 0xEE);
+    __m256 x2 = _mm256_shuffle_ps(w1, w3, 0x44);
+    __m256 x3 = _mm256_shuffle_ps(w1, w3, 0xEE);
+
+    rows[0] = _mm256_permute2f128_ps(v0, x0, 0x20);
+    rows[4] = _mm256_permute2f128_ps(v0, x0, 0x31);
+    rows[1] = _mm256_permute2f128_ps(v1, x1, 0x20);
+    rows[5] = _mm256_permute2f128_ps(v1, x1, 0x31);
+    rows[2] = _mm256_permute2f128_ps(v2, x2, 0x20);
+    rows[6] = _mm256_permute2f128_ps(v2, x2, 0x31);
+    rows[3] = _mm256_permute2f128_ps(v3, x3, 0x20);
+    rows[7] = _mm256_permute2f128_ps(v3, x3, 0x31);
 }
 
 /**

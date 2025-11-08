@@ -23,7 +23,7 @@ if (MSVC)
     target_compile_options(gemm_avx2 PRIVATE /arch:AVX2 /fp:fast)
 else()
     target_compile_options(gemm_avx2 PRIVATE 
-        -mavx2 -mfma -O3 -ffast-math
+        -mavx2 -mfma -O3 
         -Wall -Wextra -Wpedantic -Wno-unused-parameter
     )
 endif()
@@ -35,7 +35,7 @@ target_compile_definitions(gemm_avx2 PRIVATE LINALG_SIMD_ENABLE=1)
 # ============================================
 set(QR_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/qr/qr.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/inv.c           # ← ADD for inv()
+    #${CMAKE_CURRENT_SOURCE_DIR}/../src/inv.c           # ← ADD for inv()
 )
 
 set(QR_HEADERS

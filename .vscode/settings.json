@@ -5,6 +5,7 @@
         "compare": "c",
         "immintrin.h": "c",
         "gemm_simd_ops.h": "c",
-        "qr_avx2_kernels.h": "c"
+        "qr_avx2_kernels.h": "c",
+        "cstdlib": "c"
     }
 }
