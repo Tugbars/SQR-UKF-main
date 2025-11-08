@@ -547,6 +547,7 @@ static inline void gemm_1x8_panel_avx2fma_store(
 /**
  * @brief 8×8 kernel (ADD): C += A*B
  */
+
 static inline void gemm_8x8_panel_avx2fma_add(
     float *RESTRICT c, size_t ldc,
     const float *RESTRICT Ap,
@@ -565,46 +566,55 @@ static inline void gemm_8x8_panel_avx2fma_add(
     const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
     gemm_prefetch_c_rows(c, ldc, m);
 
-    const size_t PF_LONG = 32;
-    for (size_t k = 0; k < Kblk; k += 8)
+    if (Kblk)
     {
-        if (do_pf)
-            gemm_prefetch_panels(Bp, Ap, k, Kblk, 8, 8, PF_LONG);
+        // --- Prime ---
+        size_t k = 0;
+        __m256 a      = _mm256_load_ps(Ap + 0*8);
+        const float *brow = Bp + 0*8;
 
-        for (int u = 0; u < 8; ++u)
+        // --- Steady state: 1-step pipeline ---
+        for (; k + 1 < Kblk; ++k)
         {
-            size_t kk = k + u;
-            if (kk >= Kblk)
-                break;
-            __m256 a = _mm256_load_ps(Ap + kk * 8);
-            const float *b_row = Bp + kk * 8;
+            if (do_pf) PREFETCH_T0(Bp + (k + 8) * 8);
+
+            __m256 a_next        = _mm256_load_ps(Ap + (k + 1)*8);
+            const float *b_next  = Bp + (k + 1)*8;
+
             __m256 b;
-            b = _mm256_broadcast_ss(b_row + 0);
-            acc0 = _mm256_fmadd_ps(a, b, acc0);
-            b = _mm256_broadcast_ss(b_row + 1);
-            acc1 = _mm256_fmadd_ps(a, b, acc1);
-            b = _mm256_broadcast_ss(b_row + 2);
-            acc2 = _mm256_fmadd_ps(a, b, acc2);
-            b = _mm256_broadcast_ss(b_row + 3);
-            acc3 = _mm256_fmadd_ps(a, b, acc3);
-            b = _mm256_broadcast_ss(b_row + 4);
-            acc4 = _mm256_fmadd_ps(a, b, acc4);
-            b = _mm256_broadcast_ss(b_row + 5);
-            acc5 = _mm256_fmadd_ps(a, b, acc5);
-            b = _mm256_broadcast_ss(b_row + 6);
-            acc6 = _mm256_fmadd_ps(a, b, acc6);
-            b = _mm256_broadcast_ss(b_row + 7);
-            acc7 = _mm256_fmadd_ps(a, b, acc7);
+            b = _mm256_broadcast_ss(brow + 0); acc0 = _mm256_fmadd_ps(a, b, acc0);
+            b = _mm256_broadcast_ss(brow + 1); acc1 = _mm256_fmadd_ps(a, b, acc1);
+            b = _mm256_broadcast_ss(brow + 2); acc2 = _mm256_fmadd_ps(a, b, acc2);
+            b = _mm256_broadcast_ss(brow + 3); acc3 = _mm256_fmadd_ps(a, b, acc3);
+            b = _mm256_broadcast_ss(brow + 4); acc4 = _mm256_fmadd_ps(a, b, acc4);
+            b = _mm256_broadcast_ss(brow + 5); acc5 = _mm256_fmadd_ps(a, b, acc5);
+            b = _mm256_broadcast_ss(brow + 6); acc6 = _mm256_fmadd_ps(a, b, acc6);
+            b = _mm256_broadcast_ss(brow + 7); acc7 = _mm256_fmadd_ps(a, b, acc7);
+
+            a     = a_next;
+            brow  = b_next;
+        }
+
+        // --- Epilogue (process last primed k) ---
+        {
+            __m256 b;
+            b = _mm256_broadcast_ss(brow + 0); acc0 = _mm256_fmadd_ps(a, b, acc0);
+            b = _mm256_broadcast_ss(brow + 1); acc1 = _mm256_fmadd_ps(a, b, acc1);
+            b = _mm256_broadcast_ss(brow + 2); acc2 = _mm256_fmadd_ps(a, b, acc2);
+            b = _mm256_broadcast_ss(brow + 3); acc3 = _mm256_fmadd_ps(a, b, acc3);
+            b = _mm256_broadcast_ss(brow + 4); acc4 = _mm256_fmadd_ps(a, b, acc4);
+            b = _mm256_broadcast_ss(brow + 5); acc5 = _mm256_fmadd_ps(a, b, acc5);
+            b = _mm256_broadcast_ss(brow + 6); acc6 = _mm256_fmadd_ps(a, b, acc6);
+            b = _mm256_broadcast_ss(brow + 7); acc7 = _mm256_fmadd_ps(a, b, acc7);
         }
     }
 
-    // Fast path: full 8×8 tile
+    // --- Writeback (unchanged) ---
     if (m == 8 && n == 8)
     {
         __m256 cols[8] = {acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7};
         gemm_transpose_add_8x8(c, ldc, cols, 0);
     }
-    // Slow path: partial tile via temp buffer
     else
     {
         alignas(32) float temp[8 * 8];
@@ -647,37 +657,47 @@ static inline void gemm_8x8_panel_avx2fma_store(
 
     const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
     gemm_prefetch_c_rows(c, ldc, m);
-    const size_t PF_LONG = 32;
 
-    for (size_t k = 0; k < Kblk; k += 8)
+    if (Kblk)
     {
-        if (do_pf)
-            gemm_prefetch_panels(Bp, Ap, k, Kblk, 8, 8, PF_LONG);
+        // --- Prime ---
+        size_t k = 0;
+        __m256 a      = _mm256_load_ps(Ap + 0*8);
+        const float *brow = Bp + 0*8;
 
-        for (int u = 0; u < 8; ++u)
+        // --- Steady state: 1-step pipeline ---
+        for (; k + 1 < Kblk; ++k)
         {
-            size_t kk = k + u;
-            if (kk >= Kblk)
-                break;
-            __m256 a = _mm256_load_ps(Ap + kk * 8);
-            const float *b_row = Bp + kk * 8;
+            if (do_pf) PREFETCH_T0(Bp + (k + 8) * 8);
+
+            __m256 a_next        = _mm256_load_ps(Ap + (k + 1)*8);
+            const float *b_next  = Bp + (k + 1)*8;
+
             __m256 b;
-            b = _mm256_broadcast_ss(b_row + 0);
-            acc0 = _mm256_fmadd_ps(a, b, acc0);
-            b = _mm256_broadcast_ss(b_row + 1);
-            acc1 = _mm256_fmadd_ps(a, b, acc1);
-            b = _mm256_broadcast_ss(b_row + 2);
-            acc2 = _mm256_fmadd_ps(a, b, acc2);
-            b = _mm256_broadcast_ss(b_row + 3);
-            acc3 = _mm256_fmadd_ps(a, b, acc3);
-            b = _mm256_broadcast_ss(b_row + 4);
-            acc4 = _mm256_fmadd_ps(a, b, acc4);
-            b = _mm256_broadcast_ss(b_row + 5);
-            acc5 = _mm256_fmadd_ps(a, b, acc5);
-            b = _mm256_broadcast_ss(b_row + 6);
-            acc6 = _mm256_fmadd_ps(a, b, acc6);
-            b = _mm256_broadcast_ss(b_row + 7);
-            acc7 = _mm256_fmadd_ps(a, b, acc7);
+            b = _mm256_broadcast_ss(brow + 0); acc0 = _mm256_fmadd_ps(a, b, acc0);
+            b = _mm256_broadcast_ss(brow + 1); acc1 = _mm256_fmadd_ps(a, b, acc1);
+            b = _mm256_broadcast_ss(brow + 2); acc2 = _mm256_fmadd_ps(a, b, acc2);
+            b = _mm256_broadcast_ss(brow + 3); acc3 = _mm256_fmadd_ps(a, b, acc3);
+            b = _mm256_broadcast_ss(brow + 4); acc4 = _mm256_fmadd_ps(a, b, acc4);
+            b = _mm256_broadcast_ss(brow + 5); acc5 = _mm256_fmadd_ps(a, b, acc5);
+            b = _mm256_broadcast_ss(brow + 6); acc6 = _mm256_fmadd_ps(a, b, acc6);
+            b = _mm256_broadcast_ss(brow + 7); acc7 = _mm256_fmadd_ps(a, b, acc7);
+
+            a     = a_next;
+            brow  = b_next;
+        }
+
+        // --- Epilogue ---
+        {
+            __m256 b;
+            b = _mm256_broadcast_ss(brow + 0); acc0 = _mm256_fmadd_ps(a, b, acc0);
+            b = _mm256_broadcast_ss(brow + 1); acc1 = _mm256_fmadd_ps(a, b, acc1);
+            b = _mm256_broadcast_ss(brow + 2); acc2 = _mm256_fmadd_ps(a, b, acc2);
+            b = _mm256_broadcast_ss(brow + 3); acc3 = _mm256_fmadd_ps(a, b, acc3);
+            b = _mm256_broadcast_ss(brow + 4); acc4 = _mm256_fmadd_ps(a, b, acc4);
+            b = _mm256_broadcast_ss(brow + 5); acc5 = _mm256_fmadd_ps(a, b, acc5);
+            b = _mm256_broadcast_ss(brow + 6); acc6 = _mm256_fmadd_ps(a, b, acc6);
+            b = _mm256_broadcast_ss(brow + 7); acc7 = _mm256_fmadd_ps(a, b, acc7);
         }
     }
 
@@ -689,7 +709,13 @@ static inline void gemm_8x8_panel_avx2fma_store(
     if (m == 8 && n == 8)
     {
         __m256 cols[8] = {acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7};
-        gemm_transpose_store_8x8(c, ldc, cols, use_nt);
+        gemm_transpose_8x8_avx2(cols);
+        for (size_t r = 0; r < 8; ++r)
+        {
+            float *cr = c + r * ldc;
+            if (use_nt) GEMM_STREAM_PS(cr, cols[r]);
+            else        GEMM_STORE_PS(cr, cols[r]);
+        }
     }
     else
     {
@@ -707,10 +733,7 @@ static inline void gemm_8x8_panel_avx2fma_store(
         {
             float *cr = c + r * ldc;
             __m256 sum = load_cols_from_temp(temp, 8, r, n);
-            if (use_nt && n == 8)
-                GEMM_STREAM_PS(cr, sum);
-            else
-                GEMM_MASKSTORE_PS(cr, mask, sum);
+            GEMM_MASKSTORE_PS(cr, mask, sum);
         }
     }
 }
