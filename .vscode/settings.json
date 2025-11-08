@@ -6,6 +6,8 @@
         "immintrin.h": "c",
         "gemm_simd_ops.h": "c",
         "qr_avx2_kernels.h": "c",
-        "cstdlib": "c"
+        "cstdlib": "c",
+        "string.h": "c",
+        "cmath": "c"
     }
 }

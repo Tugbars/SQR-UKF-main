@@ -13,6 +13,7 @@ set(GEMM_SOURCES
 )
 
 set(GEMM_HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm_helper.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm_simd_ops.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm_kernels_avx2.h

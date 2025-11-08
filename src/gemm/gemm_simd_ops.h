@@ -15,6 +15,15 @@
 
 #ifdef __AVX2__
 
+static inline float gemm_hsum_ps_avx2(__m256 v) {
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    __m128 sum2 = _mm_hadd_ps(sum4, sum4);
+    __m128 sum1 = _mm_hadd_ps(sum2, sum2);
+    return _mm_cvtss_f32(sum1);
+}
+
 /**
  * @brief In-register 8×8 transpose for AVX2
  * @param[in,out] rows Array of 8 vectors (input: columns, output: rows)
@@ -52,33 +61,6 @@ static inline void gemm_transpose_8x8_avx2(__m256 *rows)
     rows[6] = _mm256_permute2f128_ps(v2, x2, 0x31);
     rows[3] = _mm256_permute2f128_ps(v3, x3, 0x20);
     rows[7] = _mm256_permute2f128_ps(v3, x3, 0x31);
-}
-
-/**
- * @brief Build AVX2 mask for n active lanes (0-8)
- */
-static inline __m256i gemm_build_mask_avx2(int lanes)
-{
-    // Portable alignment
-    #if defined(_MSC_VER)
-        __declspec(align(32))
-    #else
-        __attribute__((aligned(32)))
-    #endif
-    static const int mask_table[9][8] = {
-        { 0,  0,  0,  0,  0,  0,  0,  0},
-        {-1,  0,  0,  0,  0,  0,  0,  0},
-        {-1, -1,  0,  0,  0,  0,  0,  0},
-        {-1, -1, -1,  0,  0,  0,  0,  0},
-        {-1, -1, -1, -1,  0,  0,  0,  0},
-        {-1, -1, -1, -1, -1,  0,  0,  0},
-        {-1, -1, -1, -1, -1, -1,  0,  0},
-        {-1, -1, -1, -1, -1, -1, -1,  0},
-        {-1, -1, -1, -1, -1, -1, -1, -1}
-    };
-    
-    lanes = (lanes < 0) ? 0 : ((lanes > 8) ? 8 : lanes);
-    return _mm256_loadu_si256((const __m256i*)mask_table[lanes]);
 }
 
 #endif /* __AVX2__ */
