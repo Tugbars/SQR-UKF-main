@@ -64,7 +64,7 @@ static int test_roundtrip(uint16_t m, uint16_t n, const char *desc)
     }
 
     // Factor
-    int ret = qr_ws_scalar(ws, A, Q, R, m, n, false);
+    int ret = qr_ws_blocked(ws, A, Q, R, m, n, false);
   
 
     // Reconstruct

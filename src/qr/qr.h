@@ -197,4 +197,7 @@ int qr_ws_scalar(qr_workspace *ws, const float *A, float *Q, float *R,
 int qr_scalar_only(const float *A, float *Q, float *R,
                    uint16_t m, uint16_t n, bool only_R);
 
+int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
+                  uint16_t m, uint16_t n, bool only_R);
+
 #endif // QR_H
