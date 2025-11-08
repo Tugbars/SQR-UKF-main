@@ -25,6 +25,8 @@ typedef struct qr_workspace_s {
     float *tau;          // min(m,n) - Householder scalars
     float *tmp;          // m - panel factorization workspace
     float *work;         // m - CPQR Householder gather buffer
+
+    float *work_YT;  // ← Add this
     
     // Compact-WY buffers
     float *T;            // ib×ib - triangular factor
