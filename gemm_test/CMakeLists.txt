@@ -1,65 +1,90 @@
 cmake_minimum_required(VERSION 3.16)
-project(gemm_test C)
+project(gemm_planning_test C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
-message(STATUS "Building GEMM test suite")
+message(STATUS "Building GEMM Planning Test (minimal)")
 
-# ---- GEMM library ----
-set(GEMM_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm.c
+#===============================================================================
+# Source Directory
+#===============================================================================
+
+set(GEMM_SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm_2)
+
+#===============================================================================
+# Minimal Library - Planning Module Only
+#===============================================================================
+
+set(PLANNING_SOURCES
+    ${GEMM_SRC_DIR}/gemm_planning.c
+    ${GEMM_SRC_DIR}/gemm_static.c
+  
 )
 
-set(GEMM_HEADERS
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm_helper.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm_simd_ops.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm/gemm_kernels_avx2.h
+set(PLANNING_HEADERS
+    ${GEMM_SRC_DIR}/gemm_planning.h
+    ${GEMM_SRC_DIR}/gemm_static.h
+    ${GEMM_SRC_DIR}/gemm_utils.h      # Header-only utils
+    ${GEMM_SRC_DIR}/gemm.h            # ADDED: For error codes
 )
 
-add_library(gemm_avx2 STATIC ${GEMM_SOURCES})
-
-target_include_directories(gemm_avx2 PUBLIC 
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm
+# Build minimal library (just planning + static pool)
+add_library(gemm_planning_lib STATIC 
+    ${PLANNING_SOURCES} 
+    ${PLANNING_HEADERS}
 )
 
-# AVX2/FMA optimization
+target_include_directories(gemm_planning_lib PUBLIC 
+    ${GEMM_SRC_DIR}
+)
+
+# AVX2 flags (needed for mask generation in planning)
 if (MSVC)
-    target_compile_options(gemm_avx2 PRIVATE /arch:AVX2 /fp:fast)
+    target_compile_options(gemm_planning_lib PRIVATE 
+        /arch:AVX2 
+        /W4
+    )
 else()
-    target_compile_options(gemm_avx2 PRIVATE 
-        -mavx2 -mfma -O3 -ffast-math
-        -Wall -Wextra -Wpedantic -Wno-unused-parameter
+    target_compile_options(gemm_planning_lib PRIVATE 
+        -mavx2 
+        -mfma 
+        -O2
+        -Wall 
+        -Wextra 
     )
 endif()
 
-# Feature flags
-target_compile_definitions(gemm_avx2 PRIVATE
-    LINALG_SIMD_ENABLE=1
+#===============================================================================
+# Test Executable - Planning Only
+#===============================================================================
+
+add_executable(test_planning 
+    test_planning.c
 )
 
-# ---- Test executable ----
-add_executable(test_gemm 
-    test_main.c 
-    test_kernels.c 
-    test_reference.c
-    test_benchmark.c
-)
+target_link_libraries(test_planning PRIVATE gemm_planning_lib)
 
-target_link_libraries(test_gemm PRIVATE gemm_avx2)
-
-# ⚠️ CRITICAL: test_kernels.c uses AVX2 intrinsics, so it needs AVX2 flags too!
+# Test needs AVX2 for mask verification
 if (MSVC)
-    target_compile_options(test_gemm PRIVATE /arch:AVX2)
+    target_compile_options(test_planning PRIVATE /arch:AVX2)
 else()
-    target_compile_options(test_gemm PRIVATE -mavx2 -mfma)
+    target_compile_options(test_planning PRIVATE -mavx2 -mfma)
 endif()
 
 # Link math library on Unix/MinGW
 if(UNIX OR MINGW)
-    target_link_libraries(test_gemm PRIVATE m)
+    target_link_libraries(test_planning PRIVATE m)
 endif()
 
-message(STATUS "GEMM targets: gemm_avx2, test_gemm")
+#===============================================================================
+# Summary
+#===============================================================================
+
+message(STATUS "====================================")
+message(STATUS "Minimal Planning Test Build")
+message(STATUS "  Sources:     gemm_planning.c, gemm_static.c")
+message(STATUS "  Test:        test_planning")
+message(STATUS "  Source dir:  ${GEMM_SRC_DIR}")
+message(STATUS "====================================")

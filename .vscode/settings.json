@@ -8,6 +8,7 @@
         "qr_avx2_kernels.h": "c",
         "cstdlib": "c",
         "string.h": "c",
-        "cmath": "c"
+        "cmath": "c",
+        "stdlib.h": "c"
     }
 }
