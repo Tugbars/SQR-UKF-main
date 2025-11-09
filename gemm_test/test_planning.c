@@ -592,8 +592,21 @@ static int test_mask_generation_edge_cases(void)
 {
     printf("  Testing: gemm_build_mask_avx2 edge cases\n");
 
+    // FIXED: Explicitly align stack locals
+#if defined(__GNUC__) || defined(__clang__)
+    __m256i mask0 __attribute__((aligned(32)));
+    __m256i mask8 __attribute__((aligned(32)));
+    __m256i mask_clamp __attribute__((aligned(32)));
+#elif defined(_MSC_VER)
+    __declspec(align(32)) __m256i mask0;
+    __declspec(align(32)) __m256i mask8;
+    __declspec(align(32)) __m256i mask_clamp;
+#else
+    #error "Unsupported compiler - cannot guarantee __m256i alignment"
+#endif
+
     // Test n=0 (should return all zeros)
-    __m256i mask0 = gemm_build_mask_avx2(0);
+    gemm_build_mask_avx2(0, &mask0);
     if (!verify_mask(&mask0, 0))
     {
         printf("    FAIL: n=0 mask incorrect\n");
@@ -601,7 +614,7 @@ static int test_mask_generation_edge_cases(void)
     }
 
     // Test n=8 (full mask)
-    __m256i mask8 = gemm_build_mask_avx2(8);
+    gemm_build_mask_avx2(8, &mask8);
     if (!verify_mask(&mask8, 8))
     {
         printf("    FAIL: n=8 mask should be all -1\n");
@@ -609,7 +622,7 @@ static int test_mask_generation_edge_cases(void)
     }
 
     // Test n>8 (should clamp to 8)
-    __m256i mask_clamp = gemm_build_mask_avx2(15);
+    gemm_build_mask_avx2(15, &mask_clamp);
     if (!verify_mask(&mask_clamp, 8))
     {
         printf("    FAIL: n>8 should clamp to 8\n");

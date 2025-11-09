@@ -9,6 +9,7 @@
         "cstdlib": "c",
         "string.h": "c",
         "cmath": "c",
-        "stdlib.h": "c"
+        "stdlib.h": "c",
+        "gemm_static.h": "c"
     }
 }

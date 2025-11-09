@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <immintrin.h>
+#include <assert.h>
 #include "gemm_static.h"
 
 //==============================================================================
@@ -61,18 +62,15 @@ typedef struct {
  * CRITICAL: Aligned to 32 bytes for __m256i members
  */
 typedef struct {
-    size_t j_start;
-    size_t j_width;
-    __m256i mask_lo;    // Requires 32-byte alignment
-    __m256i mask_hi;    // Requires 32-byte alignment
-    int needs_mask;
-} panel_info_t
-#if defined(__GNUC__) || defined(__clang__)
-    __attribute__((aligned(32)))
-#elif defined(_MSC_VER)
-    __declspec(align(32))
-#endif
-;
+    size_t j_start;              // 8 bytes
+    size_t j_width;              // 8 bytes
+    __m256i mask_lo;             // 32 bytes (offset 32)
+    __m256i mask_hi;             // 32 bytes (offset 64)
+    int needs_mask;              // 4 bytes (offset 96)
+    char _pad[28];               // 28 bytes → total 128
+} panel_info_t __attribute__((aligned(32)));
+
+static_assert(sizeof(panel_info_t) == 128, "panel_info_t must be 128 bytes");
 
 //==============================================================================
 // MEMORY MODES
@@ -189,11 +187,30 @@ size_t gemm_workspace_query(size_t M, size_t K, size_t N);
 //==============================================================================
 
 /**
- * @brief Build AVX2 mask for partial vector width
- * @param n Number of active lanes (1-8)
- * @return Mask with n lanes set to -1, rest to 0
+ * @brief Build AVX2 mask for partial vector (0-8 lanes)
+ * 
+ * Builds mask directly into output pointer to avoid stack alignment issues.
+ * Safe for both AVX2 and non-AVX2 systems via memcpy-based stores.
+ * 
+ * @param n Number of active lanes (0-8), clamped internally
+ * @param out Output pointer (must be 32-byte aligned) to store mask
+ * 
+ * @note Output pointer must point to 32-byte aligned memory (struct member
+ *       or aligned allocation). Stack locals must use alignment attributes.
  */
-__m256i gemm_build_mask_avx2(size_t n);
+void gemm_build_mask_avx2(size_t n, __m256i *out);
+
+/**
+ * @brief Build mask pair for 16-wide panels
+ * 
+ * Generates two masks for 16-wide kernels (lo = lanes 0-7, hi = lanes 8-15).
+ * Handles all cases: full width, partial low only, partial both.
+ * 
+ * @param w Panel width (0-16)
+ * @param lo Output pointer for low 8-lane mask (32-byte aligned)
+ * @param hi Output pointer for high 8-lane mask (32-byte aligned)
+ */
+void gemm_build_mask_pair16(size_t w, __m256i *lo, __m256i *hi);
 
 /**
  * @brief Select optimal blocking parameters based on matrix shape

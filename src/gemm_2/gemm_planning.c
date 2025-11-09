@@ -26,25 +26,20 @@
 //==============================================================================
 
 /**
- * @brief Build AVX2 mask for partial vector (1-8 lanes)
- *
- * Uses lookup table for zero-cost mask generation
- *
- * @param n Number of active lanes (0-8)
- * @return Mask with n lanes set to -1 (all bits 1), rest set to 0
- */
-/**
  * @brief Build AVX2 mask for partial vector (0-8 lanes)
  * 
- * Safe for both AVX2 and non-AVX2 systems.
- * Uses memcpy to avoid strict aliasing issues.
+ * CRITICAL: Builds mask directly into output pointer to avoid stack alignment issues.
+ * Output pointer must be 32-byte aligned (struct member or aligned allocation).
+ *
+ * @param n Number of active lanes (0-8)
+ * @param out Output pointer (32-byte aligned) to store mask
  */
-inline __m256i gemm_build_mask_avx2(size_t n)
+inline void gemm_build_mask_avx2(size_t n, __m256i *out)
 {
     if (n > 8) n = 8;
 
 #if defined(__AVX2__)
-    // Fast path: aligned LUT + AVX2 load
+    // Fast path: aligned LUT + AVX2 load via memcpy
     static const union { 
         __m256i v; 
         int32_t i[8]; 
@@ -60,49 +55,48 @@ inline __m256i gemm_build_mask_avx2(size_t n)
         { .i = { -1, -1, -1, -1, -1, -1, -1, -1 } }   // 8
     };
     
-    return _mm256_loadu_si256(&lut[n].v);
+    // Safe unaligned-aware copy from LUT to output
+    memcpy(out, &lut[n].v, sizeof(__m256i));
 #else
     // Scalar fallback: no AVX executed
     int32_t tmp[8];
     for (size_t k = 0; k < 8; ++k) {
         tmp[k] = (k < n) ? -1 : 0;
     }
-    
-    __m256i out;
-    memcpy(&out, tmp, sizeof(out));  // Safe, compiler optimizes away
-    return out;
+    memcpy(out, tmp, sizeof(__m256i));
 #endif
 }
 
 /**
- * @brief Build masks for a 16-wide panel tail.
- * For width <= 8: lo=mask(width), hi=zero
- * For 8 < width < 16: lo=full, hi=mask(width-8)
- * For width >= 16: lo=full, hi=full
+ * @brief Build mask pair for 16-wide panels with tail handling
+ * 
+ * For 16-wide panels (NR=16), we need two masks:
+ * - mask_lo: controls lanes 0-7
+ * - mask_hi: controls lanes 8-15
+ * 
+ * This function builds both masks directly into output pointers,
+ * avoiding any intermediate stack-allocated __m256i variables.
+ *
+ * @param w Panel width (0-16)
+ * @param lo Output pointer for low 8-lane mask
+ * @param hi Output pointer for high 8-lane mask
  */
 inline void gemm_build_mask_pair16(size_t w, __m256i *lo, __m256i *hi)
 {
-#if defined(__AVX2__)
-    const __m256i full = _mm256_set1_epi32(-1);
-    const __m256i zero = _mm256_setzero_si256();
-#else
-    const __m256i full = gemm_build_mask_avx2(8);
-    const __m256i zero = gemm_build_mask_avx2(0);
-#endif
-    if (w >= 16)
-    {
-        *lo = full;
-        *hi = full;
+    if (w >= 16) {
+        // Full 16 lanes active
+        gemm_build_mask_avx2(8, lo);  // lo = 0xFFFFFFFF
+        gemm_build_mask_avx2(8, hi);  // hi = 0xFFFFFFFF
     }
-    else if (w > 8)
-    {
-        *lo = full;
-        *hi = gemm_build_mask_avx2(w - 8);
+    else if (w > 8) {
+        // Low 8 lanes full, high lanes partial (w-8)
+        gemm_build_mask_avx2(8, lo);      // lo = full
+        gemm_build_mask_avx2(w - 8, hi);  // hi = partial
     }
-    else
-    {
-        *lo = gemm_build_mask_avx2(w);
-        *hi = zero;
+    else {
+        // Only low lanes partial, high lanes zero
+        gemm_build_mask_avx2(w, lo);      // lo = partial
+        gemm_build_mask_avx2(0, hi);      // hi = zero
     }
 }
 
@@ -144,7 +138,7 @@ void gemm_select_blocking(
     {
         // Large matrices - full three-level blocking
         *MC = GEMM_BLOCK_MC; // 128
-        *KC = GEMM_BLOCK_KC; // 256
+        *KC = (K < GEMM_BLOCK_KC) ? K : GEMM_BLOCK_KC;
         *NC = GEMM_BLOCK_NC; // 256
     }
 
@@ -268,106 +262,237 @@ void gemm_select_kernels(
 //==============================================================================
 
 /**
- * @brief Pre-compute all masks for N-panels
+ * @brief Pre-compute all masks for N-dimension panels
  *
- * Masks are needed when panel width < NR (partial panels).
- * For 16-wide panels with j_width ∈ (8, 16), we need BOTH masks:
- * - mask_lo: full mask (all 1s)
- * - mask_hi: partial mask
- *
- * @return 0 on success, -1 on allocation failure
+ * This function performs three critical tasks in the GEMM planning phase:
+ * 
+ * 1. **Phase 1 - Mask Counting**: Determines how many AVX2 masks are needed
+ *    for all partial-width panels. Full-width panels (j_width == NR) require
+ *    no masking. For 8-wide kernels, one mask per partial panel. For 16-wide
+ *    kernels, one mask if j_width ≤ 8, two masks if 8 < j_width < 16.
+ * 
+ * 2. **Phase 2 - Storage Allocation**: Allocates contiguous, 32-byte aligned
+ *    storage for all masks. Contiguous storage improves cache locality and
+ *    eliminates pointer chasing during kernel execution.
+ * 
+ * 3. **Phase 3 - Mask Generation**: Builds AVX2 masks for each partial panel
+ *    and stores them in the contiguous array. Each panel descriptor stores
+ *    mask values directly for fast kernel dispatch.
+ * 
+ * **Masking Strategy:**
+ * - 8-wide panels (NR ≤ 8): One mask controls lanes [0:7]
+ * - 16-wide panels (NR = 16):
+ *   - j_width ≤ 8: mask_lo partial, mask_hi zero (1 mask stored)
+ *   - 8 < j_width < 16: mask_lo full, mask_hi partial (2 masks stored)
+ *   - j_width = 16: No masking needed (0 masks stored)
+ * 
+ * **Alignment Requirements:**
+ * - panel_info_t struct must be 32-byte aligned
+ * - npanels array must be allocated with gemm_aligned_alloc(32, ...)
+ * - mask_storage must be 32-byte aligned (gemm_aligned_alloc guarantees this)
+ * 
+ * @param[in,out] plan GEMM execution plan with allocated panel descriptor array
+ *                      and populated N, NR dimensions. On success, npanels[],
+ *                      mask_storage, and n_masks fields are populated.
+ * 
+ * @return 0 on success, -1 on failure
+ * 
+ * @retval 0  Success - all masks computed and stored
+ * @retval -1 Failure - mask allocation failed OR mask count mismatch
+ * 
+ * @pre plan != NULL
+ * @pre plan->npanels != NULL (allocated with gemm_aligned_alloc)
+ * @pre plan->N and plan->NR are valid and non-zero
+ * 
+ * @post plan->mask_storage allocated and populated (if n_masks > 0)
+ * @post plan->n_masks set to number of masks stored
+ * @post All panels have j_start, j_width, needs_mask, mask_lo, mask_hi set
+ * 
+ * @note This function is called during gemm_plan_create() after panel
+ *       descriptor array allocation but before workspace setup.
+ * 
+ * @note For AVX2 safety, mask generation uses memcpy-based stores to
+ *       handle any potential alignment issues gracefully.
+ * 
+ * @see gemm_build_mask_avx2() for single mask generation
+ * @see gemm_build_mask_pair16() for dual mask generation (16-wide panels)
+ * 
+ * @author TUGBARS
+ * @date 2025
  */
 static int precompute_panel_masks(gemm_plan_t *plan)
 {
     const size_t n_panels = (plan->N + plan->NR - 1) / plan->NR;
     
     //==========================================================================
-    // Phase 1: Count masks needed
+    // Phase 1: Count masks needed for all panels
     //==========================================================================
+    // Iterate through all panels to determine total mask storage requirement.
+    // This two-pass approach (count then allocate) enables single contiguous
+    // allocation rather than per-panel allocations, improving cache behavior.
+    //
+    // Mask counting rules:
+    // - Full-width panels (j_width == NR): 0 masks (no masking needed)
+    // - 8-wide partial (NR ≤ 8, j_width < NR): 1 mask
+    // - 16-wide partial (NR = 16, j_width ≤ 8): 1 mask (lo only)
+    // - 16-wide partial (NR = 16, 8 < j_width < 16): 2 masks (lo + hi)
+    
     size_t n_masks_needed = 0;
+    
     for (size_t p = 0; p < n_panels; ++p) {
+        // Calculate this panel's starting column and actual width
         const size_t j_start = p * plan->NR;
         const size_t j_width = (j_start + plan->NR <= plan->N)
-                                 ? plan->NR
-                                 : (plan->N - j_start);
+                                 ? plan->NR                    // Full panel
+                                 : (plan->N - j_start);        // Tail panel
+        
+        // Only partial-width panels require masking
         if (j_width < plan->NR) {
             if (plan->NR <= 8) {
+                // 8-wide or narrower: single mask
                 n_masks_needed += 1;
             } else if (plan->NR == 16) {
+                // 16-wide: one or two masks depending on width
+                // j_width ∈ [1, 8]:  mask_lo partial, mask_hi zero → 1 mask
+                // j_width ∈ [9, 15]: mask_lo full, mask_hi partial → 2 masks
                 n_masks_needed += (j_width <= 8) ? 1 : 2;
             }
         }
     }
     
     //==========================================================================
-    // Phase 2: Allocate storage
+    // Phase 2: Allocate contiguous mask storage
     //==========================================================================
+    // Allocate 32-byte aligned storage for all masks in one contiguous block.
+    // This improves:
+    // - Cache locality (masks stored sequentially)
+    // - Memory efficiency (single allocation vs per-panel allocations)
+    // - Access pattern (predictable stride for prefetchers)
+    //
+    // If no masks are needed (all full-width panels), skip allocation entirely.
+    
     plan->n_masks = n_masks_needed;
     plan->mask_storage = NULL;
     
     if (n_masks_needed > 0) {
         plan->mask_storage = (__m256i*)gemm_aligned_alloc(
-            32, n_masks_needed * sizeof(__m256i));
+            32,                              // Alignment: 32 bytes (AVX2 requirement)
+            n_masks_needed * sizeof(__m256i) // Size: total masks needed
+        );
+        
         if (!plan->mask_storage) {
-            return -1;
+            return -1;  // Allocation failed - critical error
         }
     }
     
     //==========================================================================
-    // Phase 3: Fill panels and store masks
+    // Phase 3: Populate panel descriptors and store masks
     //==========================================================================
-    size_t mask_idx = 0;
+    // For each panel, compute:
+    // 1. Starting column (j_start) and actual width (j_width)
+    // 2. Whether masking is needed (needs_mask flag)
+    // 3. Mask values (mask_lo, mask_hi) for partial panels
+    // 4. Store masks in contiguous array for cache-friendly access
+    //
+    // The mask_idx counter tracks current position in mask_storage array.
+    // At function end, mask_idx must equal n_masks_needed (sanity check).
     
-    for (size_t p = 0; p < n_panels; ++p) {
+    size_t mask_idx = 0;  // Current position in mask_storage array
+    
+    for (size_t p = 0; p < n_panels; p++) {
         panel_info_t *panel = &plan->npanels[p];
         
+        //----------------------------------------------------------------------
+        // Step 3.1: Calculate panel dimensions
+        //----------------------------------------------------------------------
         panel->j_start = p * plan->NR;
         panel->j_width = (panel->j_start + plan->NR <= plan->N)
-                           ? plan->NR
-                           : (plan->N - panel->j_start);
+                           ? plan->NR                    // Full panel
+                           : (plan->N - panel->j_start); // Tail panel
         
+        //----------------------------------------------------------------------
+        // Step 3.2: Check if masking is required
+        //----------------------------------------------------------------------
         if (panel->j_width == plan->NR) {
-            //------------------------------------------------------------------
-            // Full width - no masking needed
-            //------------------------------------------------------------------
+            // Full-width panel - no masking needed
+            // Kernels will use unmasked stores/loads (fastest path)
             panel->needs_mask = 0;
-            // mask_lo/mask_hi are undefined (never read when needs_mask=0)
+            
+            // mask_lo and mask_hi remain uninitialized (never accessed when
+            // needs_mask == 0). This avoids unnecessary AVX2 instructions on
+            // systems without AVX2 support.
             continue;
         }
         
         //----------------------------------------------------------------------
-        // Partial width - build masks
+        // Step 3.3: Partial-width panel - build and store masks
         //----------------------------------------------------------------------
         panel->needs_mask = 1;
         
         if (plan->NR <= 8) {
-            // 8-wide or narrower: single mask
-            panel->mask_lo = gemm_build_mask_avx2(panel->j_width);
-            panel->mask_hi = gemm_build_mask_avx2(0);  // Zero via helper
+            //------------------------------------------------------------------
+            // 8-wide or narrower panels
+            //------------------------------------------------------------------
+            // Only one mask needed for lanes [0:7]. The mask_hi field is set
+            // to zero but never used (8-wide kernels only read mask_lo).
             
-            // Store mask (works in both AVX2 and scalar fallback)
-            plan->mask_storage[mask_idx++] = panel->mask_lo;
+            gemm_build_mask_avx2(panel->j_width, &panel->mask_lo);  // Build partial mask
+            gemm_build_mask_avx2(0, &panel->mask_hi);                // Build zero mask (unused)
+            
+            // Store mask in contiguous array for cache locality
+            // memcpy is safe for any alignment (source and dest are both aligned)
+            memcpy(&plan->mask_storage[mask_idx++], &panel->mask_lo, sizeof(__m256i));
         }
         else if (plan->NR == 16) {
-            // 16-wide: use pair builder
+            //------------------------------------------------------------------
+            // 16-wide panels
+            //------------------------------------------------------------------
+            // Need dual masks: mask_lo controls lanes [0:7], mask_hi controls
+            // lanes [8:15]. The gemm_build_mask_pair16() helper builds both
+            // masks simultaneously based on panel width.
+            
             gemm_build_mask_pair16(panel->j_width, &panel->mask_lo, &panel->mask_hi);
             
-            // Store appropriate masks
             if (panel->j_width <= 8) {
-                // Only lo mask needed (hi is zero)
-                plan->mask_storage[mask_idx++] = panel->mask_lo;
+                //--------------------------------------------------------------
+                // Width 1-8: Only low lanes active, high lanes zero
+                //--------------------------------------------------------------
+                // Store only mask_lo (mask_hi is all zeros, not stored)
+                memcpy(&plan->mask_storage[mask_idx++], &panel->mask_lo, sizeof(__m256i));
             } else {
-                // Both masks needed
-                plan->mask_storage[mask_idx++] = panel->mask_lo;
-                plan->mask_storage[mask_idx++] = panel->mask_hi;
+                //--------------------------------------------------------------
+                // Width 9-15: Low lanes full, high lanes partial
+                //--------------------------------------------------------------
+                // Store both masks:
+                // - mask_lo is full (all 8 lanes active)
+                // - mask_hi is partial (width-8 lanes active)
+                memcpy(&plan->mask_storage[mask_idx++], &panel->mask_lo, sizeof(__m256i));
+                memcpy(&plan->mask_storage[mask_idx++], &panel->mask_hi, sizeof(__m256i));
             }
         }
     }
     
     //==========================================================================
-    // Sanity check: used exactly the masks we allocated
+    // Sanity check: Verify mask count consistency
     //==========================================================================
-    return (mask_idx == n_masks_needed) ? 0 : -1;
+    // This catches logic errors between Phase 1 (counting) and Phase 3 (storing).
+    // If mask_idx != n_masks_needed, there's a bug in the counting logic.
+    //
+    // Common failure modes:
+    // - Incorrect width threshold in Phase 1 vs Phase 3
+    // - Missing mask store in Phase 3
+    // - Extra mask store in Phase 3
+    //
+    // This check has zero runtime cost in production (always true if code is
+    // correct) but catches critical bugs during development.
+    
+    if (mask_idx != n_masks_needed) {
+        // INTERNAL ERROR: Mask count mismatch
+        // This should never happen if logic is correct
+        return -1;
+    }
+    
+    return 0;  // Success - all masks computed and stored
 }
 
 //==============================================================================
