@@ -20,39 +20,11 @@
 
 #include "gemm_planning.h"
 #include "gemm_static.h"
+#include "test_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
-
-//==============================================================================
-// TEST UTILITIES
-//==============================================================================
-
-#define TEST_PASS "\033[0;32m[PASS]\033[0m"
-#define TEST_FAIL "\033[0;31m[FAIL]\033[0m"
-#define TEST_INFO "\033[0;34m[INFO]\033[0m"
-
-static int test_count = 0;
-static int test_passed = 0;
-static int test_failed = 0;
-
-#define RUN_TEST(test_func)                                  \
-    do                                                       \
-    {                                                        \
-        printf("\n" TEST_INFO " Running: %s\n", #test_func); \
-        test_count++;                                        \
-        if (test_func())                                     \
-        {                                                    \
-            test_passed++;                                   \
-            printf(TEST_PASS " %s\n", #test_func);           \
-        }                                                    \
-        else                                                 \
-        {                                                    \
-            test_failed++;                                   \
-            printf(TEST_FAIL " %s\n", #test_func);           \
-        }                                                    \
-    } while (0)
 
 //==============================================================================
 // HELPER: Verify mask correctness
@@ -782,11 +754,21 @@ static int test_workspace_alignment(void)
 }
 
 //==============================================================================
-// MAIN TEST RUNNER
+// TEST SUITE RUNNER
 //==============================================================================
 
-int main(void)
+/**
+ * @brief Run all planning module tests
+ * @param results Output: test results structure
+ * @return 0 if all tests passed, 1 if any failed
+ */
+int run_gemm_planning_tests(test_results_t *results)
 {
+    // Initialize results
+    results->total = 0;
+    results->passed = 0;
+    results->failed = 0;
+
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════╗\n");
     printf("║  GEMM Planning Module - Comprehensive Test Suite         ║\n");
@@ -799,67 +781,68 @@ int main(void)
 
     // Group 1: Plan Creation/Destruction
     printf("\n═══ Test Group 1: Plan Creation/Destruction ═══\n");
-    RUN_TEST(test_plan_create_destroy_basic);
-    RUN_TEST(test_plan_create_destroy_large);
-    RUN_TEST(test_plan_explicit_static_too_large);
+    RUN_TEST(results, test_plan_create_destroy_basic);
+    RUN_TEST(results, test_plan_create_destroy_large);
+    RUN_TEST(results, test_plan_explicit_static_too_large);
 
     // Group 2: Blocking Parameters
     printf("\n═══ Test Group 2: Blocking Parameters ═══\n");
-    RUN_TEST(test_blocking_small_matrix);
-    RUN_TEST(test_blocking_rectangular);
-    RUN_TEST(test_blocking_narrow);
+    RUN_TEST(results, test_blocking_small_matrix);
+    RUN_TEST(results, test_blocking_rectangular);
+    RUN_TEST(results, test_blocking_narrow);
 
     // Group 3: Tile Descriptors
     printf("\n═══ Test Group 3: Tile Descriptors ═══\n");
-    RUN_TEST(test_mtiles_regular);
-    RUN_TEST(test_mtiles_tail);
+    RUN_TEST(results, test_mtiles_regular);
+    RUN_TEST(results, test_mtiles_tail);
 
     // Group 4: Panel Descriptors and Masks
     printf("\n═══ Test Group 4: Panel Descriptors and Masks ═══\n");
-    RUN_TEST(test_npanels_full_width);
-    RUN_TEST(test_npanels_partial_8wide);
-    RUN_TEST(test_npanels_partial_16wide);
-    RUN_TEST(test_npanels_dual_mask_16wide);
+    RUN_TEST(results, test_npanels_full_width);
+    RUN_TEST(results, test_npanels_partial_8wide);
+    RUN_TEST(results, test_npanels_partial_16wide);
+    RUN_TEST(results, test_npanels_dual_mask_16wide);
 
     // Group 5: Workspace
     printf("\n═══ Test Group 5: Workspace ═══\n");
-    RUN_TEST(test_workspace_query);
+    RUN_TEST(results, test_workspace_query);
 
     // Group 6: Edge Cases
     printf("\n═══ Test Group 6: Edge Cases ═══\n");
-    RUN_TEST(test_edge_single_tile);
-    RUN_TEST(test_edge_very_rectangular);
+    RUN_TEST(results, test_edge_single_tile);
+    RUN_TEST(results, test_edge_very_rectangular);
 
     // Group 7: Edge Cases & Robustness
     printf("\n═══ Test Group 7: Edge Cases & Robustness ═══\n");
-    RUN_TEST(test_mask_generation_edge_cases);
-    RUN_TEST(test_exact_divisibility);
-    RUN_TEST(test_zero_dimension);
-    RUN_TEST(test_static_max_boundary);
+    RUN_TEST(results, test_mask_generation_edge_cases);
+    RUN_TEST(results, test_exact_divisibility);
+    RUN_TEST(results, test_zero_dimension);
+    RUN_TEST(results, test_static_max_boundary);
 
     // Group 8: Performance Invariants
     printf("\n═══ Test Group 8: Performance Invariants ═══\n");
-    RUN_TEST(test_static_pool_reuse);
-    RUN_TEST(test_workspace_alignment);
+    RUN_TEST(results, test_static_pool_reuse);
+    RUN_TEST(results, test_workspace_alignment);
 
-    // Final Report
-    printf("\n");
-    printf("╔═══════════════════════════════════════════════════════════╗\n");
-    printf("║  Test Results                                             ║\n");
-    printf("╠═══════════════════════════════════════════════════════════╣\n");
-    printf("║  Total:  %3d                                               ║\n", test_count);
-    printf("║  Passed: %3d                                               ║\n", test_passed);
-    printf("║  Failed: %3d                                               ║\n", test_failed);
-    printf("╚═══════════════════════════════════════════════════════════╝\n");
+    // Print results
+    print_test_results("GEMM Planning Module - Results", results);
 
-    if (test_failed == 0)
-    {
-        printf("\n🎉 " TEST_PASS " All tests passed!\n\n");
-        return 0;
-    }
-    else
-    {
-        printf("\n❌ " TEST_FAIL " %d test(s) failed\n\n", test_failed);
-        return 1;
-    }
+ 
+   return (results->failed == 0) ? 0 : 1;
 }
+// Optional: Standalone mode
+#ifdef STANDALONE
+int main(void)
+{
+    test_results_t results;
+    int ret = run_gemm_planning_tests(&results);
+    
+    if (ret == 0) {
+        printf("\n🎉 " TEST_PASS " All tests passed!\n\n");
+    } else {
+        printf("\n❌ " TEST_FAIL " %d test(s) failed\n\n", results.failed);
+    }
+    
+    return ret;
+}
+#endif

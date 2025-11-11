@@ -17,40 +17,13 @@
  */
 
 #include "gemm_small.h"
+#include "test_common.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <assert.h>
 
-//==============================================================================
-// TEST UTILITIES
-//==============================================================================
-
-#define TEST_PASS "\033[0;32m[PASS]\033[0m"
-#define TEST_FAIL "\033[0;31m[FAIL]\033[0m"
-#define TEST_INFO "\033[0;34m[INFO]\033[0m"
-
-static int test_count = 0;
-static int test_passed = 0;
-static int test_failed = 0;
-
-#define RUN_TEST(test_func)                                  \
-    do                                                       \
-    {                                                        \
-        printf("\n" TEST_INFO " Running: %s\n", #test_func); \
-        test_count++;                                        \
-        if (test_func())                                     \
-        {                                                    \
-            test_passed++;                                   \
-            printf(TEST_PASS " %s\n", #test_func);           \
-        }                                                    \
-        else                                                 \
-        {                                                    \
-            test_failed++;                                   \
-            printf(TEST_FAIL " %s\n", #test_func);           \
-        }                                                    \
-    } while (0)
 
 //==============================================================================
 // REFERENCE IMPLEMENTATION - Naive Triple Loop
@@ -648,11 +621,21 @@ static int test_dispatcher_rejects_high_ops(void)
 }
 
 //==============================================================================
-// MAIN TEST RUNNER
+// TEST SUITE RUNNER
 //==============================================================================
 
-int main(void)
+/**
+ * @brief Run all Tier 1 (small kernel) tests
+ * @param results Output: test results structure
+ * @return 0 if all tests passed, 1 if any failed
+ */
+int run_gemm_small_tests(test_results_t *results)
 {
+    // Initialize results
+    results->total = 0;
+    results->passed = 0;
+    results->failed = 0;
+
     printf("\n");
     printf("╔═══════════════════════════════════════════════════════════╗\n");
     printf("║  GEMM Small Kernels (Tier 1) - Test Suite               ║\n");
@@ -660,52 +643,53 @@ int main(void)
 
     // Group 1: 4×4 Kernel
     printf("\n═══ Test Group 1: 4×4 Kernel ═══\n");
-    RUN_TEST(test_4x4_identity);
-    RUN_TEST(test_4x4_zeros);
-    RUN_TEST(test_4x4_ones);
-    RUN_TEST(test_4x4_sequential);
-    RUN_TEST(test_4x4_alpha_beta_exhaustive);
+    RUN_TEST(results, test_4x4_identity);
+    RUN_TEST(results, test_4x4_zeros);
+    RUN_TEST(results, test_4x4_ones);
+    RUN_TEST(results, test_4x4_sequential);
+    RUN_TEST(results, test_4x4_alpha_beta_exhaustive);
 
     // Group 2: 6×6 Kernel (LDC Handling)
     printf("\n═══ Test Group 2: 6×6 Kernel (LDC Critical) ═══\n");
-    RUN_TEST(test_6x6_identity);
-    RUN_TEST(test_6x6_ldc_contiguous);
-    RUN_TEST(test_6x6_ldc_noncontiguous);
-    RUN_TEST(test_6x6_alpha_beta_cases);
+    RUN_TEST(results, test_6x6_identity);
+    RUN_TEST(results, test_6x6_ldc_contiguous);
+    RUN_TEST(results, test_6x6_ldc_noncontiguous);
+    RUN_TEST(results, test_6x6_alpha_beta_cases);
 
     // Group 3: 8×8 Kernel (Gold Standard)
     printf("\n═══ Test Group 3: 8×8 Kernel (Gold Standard) ═══\n");
-    RUN_TEST(test_8x8_identity);
-    RUN_TEST(test_8x8_ldc_variations);
-    RUN_TEST(test_8x8_alpha_beta_exhaustive);
+    RUN_TEST(results, test_8x8_identity);
+    RUN_TEST(results, test_8x8_ldc_variations);
+    RUN_TEST(results, test_8x8_alpha_beta_exhaustive);
 
     // Group 4: Dispatcher Logic
     printf("\n═══ Test Group 4: Dispatcher Logic ═══\n");
-    RUN_TEST(test_dispatcher_routes_4x4);
-    RUN_TEST(test_dispatcher_rejects_4x4_noncontiguous);
-    RUN_TEST(test_dispatcher_routes_6x6);
-    RUN_TEST(test_dispatcher_routes_8x8);
-    RUN_TEST(test_dispatcher_rejects_large);
-    RUN_TEST(test_dispatcher_rejects_high_ops);
+    RUN_TEST(results, test_dispatcher_routes_4x4);
+    RUN_TEST(results, test_dispatcher_rejects_4x4_noncontiguous);
+    RUN_TEST(results, test_dispatcher_routes_6x6);
+    RUN_TEST(results, test_dispatcher_routes_8x8);
+    RUN_TEST(results, test_dispatcher_rejects_large);
+    RUN_TEST(results, test_dispatcher_rejects_high_ops);
 
-    // Final Report
-    printf("\n");
-    printf("╔═══════════════════════════════════════════════════════════╗\n");
-    printf("║  Test Results                                             ║\n");
-    printf("╠═══════════════════════════════════════════════════════════╣\n");
-    printf("║  Total:  %3d                                               ║\n", test_count);
-    printf("║  Passed: %3d                                               ║\n", test_passed);
-    printf("║  Failed: %3d                                               ║\n", test_failed);
-    printf("╚═══════════════════════════════════════════════════════════╝\n");
+    // Print results
+    print_test_results("GEMM Small Kernels - Results", results);
 
-    if (test_failed == 0)
-    {
-        printf("\n🎉 " TEST_PASS " All tests passed!\n\n");
-        return 0;
-    }
-    else
-    {
-        printf("\n❌ " TEST_FAIL " %d test(s) failed\n\n", test_failed);
-        return 1;
-    }
+    return (results->failed == 0) ? 0 : 1;
 }
+
+// Optional: Standalone mode (compile with -DSTANDALONE)
+#ifdef STANDALONE
+int main(void)
+{
+    test_results_t results;
+    int ret = run_gemm_small_tests(&results);
+    
+    if (ret == 0) {
+        printf("\n🎉 " TEST_PASS " All tests passed!\n\n");
+    } else {
+        printf("\n❌ " TEST_FAIL " %d test(s) failed\n\n", results.failed);
+    }
+    
+    return ret;
+}
+#endif
