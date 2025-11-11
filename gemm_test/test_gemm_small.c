@@ -532,7 +532,7 @@ static int test_dispatcher_rejects_4x4_noncontiguous(void)
 {
     printf("  Testing: Dispatcher rejects 4×4 with ldc=8\n");
 
-    float A[16], B[16], C[64];
+    float A[16] = {0}, B[16] = {0}, C[64] = {0};  // ✅ Zero-initialize
 
     int result = gemm_small_dispatch(C, A, B, 4, 4, 4, 8, 1.0f, 0.0f);
 
@@ -545,7 +545,6 @@ static int test_dispatcher_rejects_4x4_noncontiguous(void)
     printf("    Correctly rejected (returned %d)\n", result);
     return 1;
 }
-
 static int test_dispatcher_routes_6x6(void)
 {
     printf("  Testing: Dispatcher routes 6×6 (any ldc)\n");
@@ -592,11 +591,12 @@ static int test_dispatcher_routes_8x8(void)
     return matrices_equal(C, C_ref, 8, 8, 8, 1e-5f);
 }
 
+
 static int test_dispatcher_rejects_large(void)
 {
     printf("  Testing: Dispatcher rejects 9×9\n");
 
-    float A[81], B[81], C[81];
+    float A[81] = {0}, B[81] = {0}, C[81] = {0};  // ✅ Zero-initialize
 
     int result = gemm_small_dispatch(C, A, B, 9, 9, 9, 9, 1.0f, 0.0f);
 
@@ -614,7 +614,7 @@ static int test_dispatcher_rejects_high_ops(void)
 {
     printf("  Testing: Dispatcher rejects 4×4×100 (too many ops)\n");
 
-    float A[400], B[400], C[16];
+    float A[400] = {0}, B[400] = {0}, C[16] = {0};  // ✅ Zero-initialize
 
     int result = gemm_small_dispatch(C, A, B, 4, 100, 4, 4, 1.0f, 0.0f);
 
@@ -627,6 +627,7 @@ static int test_dispatcher_rejects_high_ops(void)
     printf("    Correctly rejected (returned %d)\n", result);
     return 1;
 }
+
 
 
 //==============================================================================
