@@ -98,6 +98,38 @@ void gemm_4x8_inline(
     float alpha,
     float beta);
 
+/**
+ * @brief 8×6 GEMM - 8-state × 6-DOF interaction
+ * 
+ * Computes C (8×6) = alpha * A (8×K) * B (K×6) + beta * C
+ * 
+ * Use case: Kalman gain for 8-state filter with 6-DOF measurement
+ */
+void gemm_8x6_inline(
+    float * restrict C,
+    const float * restrict A,
+    const float * restrict B,
+    size_t K,
+    size_t ldc,
+    float alpha,
+    float beta);
+
+/**
+ * @brief 6×8 GEMM - 6-DOF × 8-state interaction
+ * 
+ * Computes C (6×8) = alpha * A (6×K) * B (K×8) + beta * C
+ * 
+ * Use case: Transpose operations in Kalman filters
+ */
+void gemm_6x8_inline(
+    float * restrict C,
+    const float * restrict A,
+    const float * restrict B,
+    size_t K,
+    size_t ldc,
+    float alpha,
+    float beta);
+
 //==============================================================================
 // DISPATCHER
 //==============================================================================

@@ -373,6 +373,156 @@ void gemm_4x8_inline(
 }
 
 //==============================================================================
+// 8×6 GEMM - AVX2 Implementation with Masking
+//==============================================================================
+
+/**
+ * @brief 8×6 GEMM kernel
+ * 
+ * Architecture:
+ * - 8 row accumulators (__m256 × 8 = 8 YMM registers)
+ * - Streams B rows (K×6, loaded with padding)
+ * - Uses masked stores for 6-wide output
+ * - Total: ~10 YMM registers
+ * 
+ * Performance:
+ * - ~2*8*6*K FLOPs = 96K FLOPs
+ * - Excellent for 8-state × 6-DOF Kalman operations
+ */
+void gemm_8x6_inline(
+    float * restrict C,
+    const float * restrict A,
+    const float * restrict B,
+    size_t K,
+    size_t ldc,
+    float alpha,
+    float beta)
+{
+    __m256 c_rows[8];
+    __m256i mask6 = _mm256_setr_epi32(-1, -1, -1, -1, -1, -1, 0, 0);
+    
+    //==========================================================================
+    // Step 1: Initialize accumulators with beta*C
+    //==========================================================================
+    if (beta == 0.0f) {
+        for (int row = 0; row < 8; row++) {
+            c_rows[row] = _mm256_setzero_ps();
+        }
+    } else if (beta == 1.0f) {
+        for (int row = 0; row < 8; row++) {
+            c_rows[row] = _mm256_maskload_ps(C + row * ldc, mask6);
+        }
+    } else {
+        __m256 vbeta = _mm256_set1_ps(beta);
+        for (int row = 0; row < 8; row++) {
+            __m256 c_old = _mm256_maskload_ps(C + row * ldc, mask6);
+            c_rows[row] = _mm256_mul_ps(vbeta, c_old);
+        }
+    }
+    
+    //==========================================================================
+    // Step 2: Compute C += alpha * A * B (K-outer loop)
+    //==========================================================================
+    __m256 valpha = _mm256_set1_ps(alpha);
+    
+    for (size_t k = 0; k < K; k++) {
+        // Load row k of B (6 floats, padded to 8)
+        __m256 b_row = _mm256_setr_ps(
+            B[k*6 + 0], B[k*6 + 1], B[k*6 + 2],
+            B[k*6 + 3], B[k*6 + 4], B[k*6 + 5], 0.0f, 0.0f);
+        __m256 bk = _mm256_mul_ps(b_row, valpha);
+        
+        // Update all 8 output rows
+        c_rows[0] = _mm256_fmadd_ps(_mm256_set1_ps(A[0*K + k]), bk, c_rows[0]);
+        c_rows[1] = _mm256_fmadd_ps(_mm256_set1_ps(A[1*K + k]), bk, c_rows[1]);
+        c_rows[2] = _mm256_fmadd_ps(_mm256_set1_ps(A[2*K + k]), bk, c_rows[2]);
+        c_rows[3] = _mm256_fmadd_ps(_mm256_set1_ps(A[3*K + k]), bk, c_rows[3]);
+        c_rows[4] = _mm256_fmadd_ps(_mm256_set1_ps(A[4*K + k]), bk, c_rows[4]);
+        c_rows[5] = _mm256_fmadd_ps(_mm256_set1_ps(A[5*K + k]), bk, c_rows[5]);
+        c_rows[6] = _mm256_fmadd_ps(_mm256_set1_ps(A[6*K + k]), bk, c_rows[6]);
+        c_rows[7] = _mm256_fmadd_ps(_mm256_set1_ps(A[7*K + k]), bk, c_rows[7]);
+    }
+    
+    //==========================================================================
+    // Step 3: Store results with masking
+    //==========================================================================
+    for (int row = 0; row < 8; row++) {
+        _mm256_maskstore_ps(C + row * ldc, mask6, c_rows[row]);
+    }
+}
+
+//==============================================================================
+// 6×8 GEMM - AVX2 Implementation
+//==============================================================================
+
+/**
+ * @brief 6×8 GEMM kernel
+ * 
+ * Architecture:
+ * - 6 row accumulators (__m256 × 6 = 6 YMM registers)
+ * - Streams B rows (K×8, full width)
+ * - Total: ~8 YMM registers
+ * 
+ * Performance:
+ * - ~2*6*8*K FLOPs = 96K FLOPs
+ */
+void gemm_6x8_inline(
+    float * restrict C,
+    const float * restrict A,
+    const float * restrict B,
+    size_t K,
+    size_t ldc,
+    float alpha,
+    float beta)
+{
+    __m256 c_rows[6];
+    
+    //==========================================================================
+    // Step 1: Initialize accumulators with beta*C
+    //==========================================================================
+    if (beta == 0.0f) {
+        for (int row = 0; row < 6; row++) {
+            c_rows[row] = _mm256_setzero_ps();
+        }
+    } else if (beta == 1.0f) {
+        for (int row = 0; row < 6; row++) {
+            c_rows[row] = _mm256_loadu_ps(C + row * ldc);
+        }
+    } else {
+        __m256 vbeta = _mm256_set1_ps(beta);
+        for (int row = 0; row < 6; row++) {
+            c_rows[row] = _mm256_mul_ps(vbeta, _mm256_loadu_ps(C + row * ldc));
+        }
+    }
+    
+    //==========================================================================
+    // Step 2: Compute C += alpha * A * B (K-outer loop)
+    //==========================================================================
+    __m256 valpha = _mm256_set1_ps(alpha);
+    
+    for (size_t k = 0; k < K; k++) {
+        // Load row k of B (8 floats)
+        __m256 b_row = _mm256_loadu_ps(B + k * 8);
+        __m256 bk = _mm256_mul_ps(b_row, valpha);
+        
+        // Update all 6 output rows
+        c_rows[0] = _mm256_fmadd_ps(_mm256_set1_ps(A[0*K + k]), bk, c_rows[0]);
+        c_rows[1] = _mm256_fmadd_ps(_mm256_set1_ps(A[1*K + k]), bk, c_rows[1]);
+        c_rows[2] = _mm256_fmadd_ps(_mm256_set1_ps(A[2*K + k]), bk, c_rows[2]);
+        c_rows[3] = _mm256_fmadd_ps(_mm256_set1_ps(A[3*K + k]), bk, c_rows[3]);
+        c_rows[4] = _mm256_fmadd_ps(_mm256_set1_ps(A[4*K + k]), bk, c_rows[4]);
+        c_rows[5] = _mm256_fmadd_ps(_mm256_set1_ps(A[5*K + k]), bk, c_rows[5]);
+    }
+    
+    //==========================================================================
+    // Step 3: Store results
+    //==========================================================================
+    for (int row = 0; row < 6; row++) {
+        _mm256_storeu_ps(C + row * ldc, c_rows[row]);
+    }
+}
+
+//==============================================================================
 // DISPATCHER
 //==============================================================================
 
@@ -396,7 +546,7 @@ int gemm_small_dispatch(
     }
     
     //--------------------------------------------------------------------------
-    // Square kernels (existing)
+    // Square kernels
     //--------------------------------------------------------------------------
     if (M == 4 && K == 4 && N == 4 && ldc == 4) {
         gemm_4x4_inline(C, A, B, alpha, beta);
@@ -414,7 +564,7 @@ int gemm_small_dispatch(
     }
     
     //--------------------------------------------------------------------------
-    // NEW: Rectangular kernels (high-priority)
+    // Rectangular kernels (8×4, 4×8, 8×6, 6×8)
     //--------------------------------------------------------------------------
     if (M == 8 && N == 4) {
         gemm_8x4_inline(C, A, B, K, ldc, alpha, beta);
@@ -423,6 +573,16 @@ int gemm_small_dispatch(
     
     if (M == 4 && N == 8) {
         gemm_4x8_inline(C, A, B, K, ldc, alpha, beta);
+        return 0;
+    }
+    
+    if (M == 8 && N == 6) {
+        gemm_8x6_inline(C, A, B, K, ldc, alpha, beta);
+        return 0;
+    }
+    
+    if (M == 6 && N == 8) {
+        gemm_6x8_inline(C, A, B, K, ldc, alpha, beta);
         return 0;
     }
     

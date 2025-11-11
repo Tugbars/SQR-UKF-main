@@ -628,7 +628,136 @@ static int test_dispatcher_rejects_high_ops(void)
     return 1;
 }
 
+//==============================================================================
+// TEST: 8×6 Rectangular Kernel
+//==============================================================================
 
+static int test_8x6_basic(void)
+{
+    printf("  Testing: 8×6 basic correctness\n");
+
+    float A[8*8], B[8*6], C[8*6], C_ref[8*6];
+
+    matrix_set_sequential(A, 8, 8, 8);
+    matrix_set_sequential(B, 8, 6, 6);
+    matrix_set_zeros(C, 8, 6, 6);
+    matrix_set_zeros(C_ref, 8, 6, 6);
+
+    gemm_8x6_inline(C, A, B, 8, 6, 1.0f, 0.0f);
+    gemm_naive(C_ref, A, B, 8, 8, 6, 6, 1.0f, 0.0f);
+
+    return matrices_equal(C, C_ref, 8, 6, 6, 1e-5f);
+}
+
+static int test_8x6_alpha_beta(void)
+{
+    printf("  Testing: 8×6 alpha/beta combinations\n");
+
+    float A[8*8], B[8*6];
+    matrix_set_sequential(A, 8, 8, 8);
+    matrix_set_sequential(B, 8, 6, 6);
+
+    int all_passed = 1;
+
+    for (size_t i = 0; i < n_alpha_beta_cases; i++)
+    {
+        float C[8*6], C_ref[8*6];
+        matrix_set_value(C, 8, 6, 6, 2.0f);
+        matrix_set_value(C_ref, 8, 6, 6, 2.0f);
+
+        float alpha = alpha_beta_cases[i].alpha;
+        float beta = alpha_beta_cases[i].beta;
+
+        gemm_8x6_inline(C, A, B, 8, 6, alpha, beta);
+        gemm_naive(C_ref, A, B, 8, 8, 6, 6, alpha, beta);
+
+        if (!matrices_equal(C, C_ref, 8, 6, 6, 1e-5f))
+        {
+            printf("    FAILED: %s\n", alpha_beta_cases[i].description);
+            all_passed = 0;
+        }
+        else
+        {
+            printf("    ✓ %s\n", alpha_beta_cases[i].description);
+        }
+    }
+
+    return all_passed;
+}
+
+static int test_8x6_arbitrary_K(void)
+{
+    printf("  Testing: 8×6 with K=10\n");
+
+    float A[8*10], B[10*6], C[8*6], C_ref[8*6];
+
+    matrix_set_sequential(A, 8, 10, 10);
+    matrix_set_sequential(B, 10, 6, 6);
+    matrix_set_zeros(C, 8, 6, 6);
+    matrix_set_zeros(C_ref, 8, 6, 6);
+
+    gemm_8x6_inline(C, A, B, 10, 6, 1.0f, 0.0f);
+    gemm_naive(C_ref, A, B, 8, 10, 6, 6, 1.0f, 0.0f);
+
+    return matrices_equal(C, C_ref, 8, 6, 6, 1e-5f);
+}
+
+//==============================================================================
+// TEST: 6×8 Rectangular Kernel
+//==============================================================================
+
+static int test_6x8_basic(void)
+{
+    printf("  Testing: 6×8 basic correctness\n");
+
+    float A[6*8], B[8*8], C[6*8], C_ref[6*8];
+
+    matrix_set_sequential(A, 6, 8, 8);
+    matrix_set_sequential(B, 8, 8, 8);
+    matrix_set_zeros(C, 6, 8, 8);
+    matrix_set_zeros(C_ref, 6, 8, 8);
+
+    gemm_6x8_inline(C, A, B, 8, 8, 1.0f, 0.0f);
+    gemm_naive(C_ref, A, B, 6, 8, 8, 8, 1.0f, 0.0f);
+
+    return matrices_equal(C, C_ref, 6, 8, 8, 1e-5f);
+}
+
+static int test_6x8_alpha_beta(void)
+{
+    printf("  Testing: 6×8 alpha/beta combinations\n");
+
+    float A[6*8], B[8*8];
+    matrix_set_sequential(A, 6, 8, 8);
+    matrix_set_sequential(B, 8, 8, 8);
+
+    int all_passed = 1;
+
+    for (size_t i = 0; i < n_alpha_beta_cases; i++)
+    {
+        float C[6*8], C_ref[6*8];
+        matrix_set_value(C, 6, 8, 8, 2.0f);
+        matrix_set_value(C_ref, 6, 8, 8, 2.0f);
+
+        float alpha = alpha_beta_cases[i].alpha;
+        float beta = alpha_beta_cases[i].beta;
+
+        gemm_6x8_inline(C, A, B, 8, 8, alpha, beta);
+        gemm_naive(C_ref, A, B, 6, 8, 8, 8, alpha, beta);
+
+        if (!matrices_equal(C, C_ref, 6, 8, 8, 1e-5f))
+        {
+            printf("    FAILED: %s\n", alpha_beta_cases[i].description);
+            all_passed = 0;
+        }
+        else
+        {
+            printf("    ✓ %s\n", alpha_beta_cases[i].description);
+        }
+    }
+
+    return all_passed;
+}
 
 //==============================================================================
 // TEST: 8×4 Rectangular Kernel
@@ -788,6 +917,11 @@ int run_gemm_small_tests(test_results_t *results)
     RUN_TEST(results, test_8x4_alpha_beta_cases);
     RUN_TEST(results, test_8x4_arbitrary_K);
     RUN_TEST(results, test_4x8_basic);
+    RUN_TEST(results, test_8x6_basic);
+    RUN_TEST(results, test_8x6_alpha_beta);
+    RUN_TEST(results, test_8x6_arbitrary_K);
+    RUN_TEST(results, test_6x8_basic);
+    RUN_TEST(results, test_6x8_alpha_beta);
 
     // Print results
     print_test_results("GEMM Small Kernels - Results", results);
