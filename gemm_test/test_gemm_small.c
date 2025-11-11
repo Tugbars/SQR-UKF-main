@@ -24,6 +24,17 @@
 #include <math.h>
 #include <assert.h>
 
+#include <inttypes.h>
+
+// Portable size_t format for old MinGW
+#ifdef _WIN32
+    #define SIZE_FMT "%llu"
+    #define SIZE_CAST(x) ((unsigned long long)(x))
+#else
+    #define SIZE_FMT "%zu"
+    #define SIZE_CAST(x) (x)
+#endif
+
 
 //==============================================================================
 // REFERENCE IMPLEMENTATION - Naive Triple Loop
@@ -109,8 +120,7 @@ static int matrices_equal(
             {
                 if (diff > rel_tol)
                 {
-                    printf("    MISMATCH at (%zu,%zu): %.6e vs %.6e (abs_diff=%.6e)\n",
-                           i, j, a, b, diff);
+
                     all_match = 0;
                 }
             }
@@ -122,8 +132,6 @@ static int matrices_equal(
                 
                 if (rel_err > rel_tol)
                 {
-                    printf("    MISMATCH at (%zu,%zu): %.6e vs %.6e (rel_err=%.6e)\n",
-                           i, j, a, b, rel_err);
                     all_match = 0;
                 }
             }

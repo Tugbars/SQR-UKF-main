@@ -13,70 +13,8 @@
  */
 
 #include "gemm_small.h"
-#include "gemm_simd_ops.h"
 #include <string.h>
 
-//==============================================================================
-// 8×8 GEMM - Full Implementation (UNCHANGED - THIS ONE IS PERFECT)
-//==============================================================================
-
-static inline void __attribute__((always_inline))
-gemm_8x8_inline(
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
-    size_t ldc,
-    float alpha,
-    float beta)
-{
-    __m256 c_row0, c_row1, c_row2, c_row3;
-    __m256 c_row4, c_row5, c_row6, c_row7;
-    
-    // Load all of B into registers (8x8 = 64 floats = 8 YMM)
-    __m256 b0 = _mm256_loadu_ps(B + 0 * 8);
-    __m256 b1 = _mm256_loadu_ps(B + 1 * 8);
-    __m256 b2 = _mm256_loadu_ps(B + 2 * 8);
-    __m256 b3 = _mm256_loadu_ps(B + 3 * 8);
-    __m256 b4 = _mm256_loadu_ps(B + 4 * 8);
-    __m256 b5 = _mm256_loadu_ps(B + 5 * 8);
-    __m256 b6 = _mm256_loadu_ps(B + 6 * 8);
-    __m256 b7 = _mm256_loadu_ps(B + 7 * 8);
-    
-    // Transpose B for column access (8x8 transpose)
-    __m256 b_cols[8] = {b0, b1, b2, b3, b4, b5, b6, b7};
-    gemm_transpose_8x8_avx2(b_cols);
-    
-    __m256 valpha = _mm256_set1_ps(alpha);
-    __m256 vbeta = _mm256_set1_ps(beta);
-    
-    // Process each row of A
-    #define PROCESS_ROW(row)                                                 \
-        do {                                                                 \
-            if (beta == 0.0f) {                                              \
-                c_row##row = _mm256_setzero_ps();                            \
-            } else if (beta == 1.0f) {                                       \
-                c_row##row = _mm256_loadu_ps(C + row * ldc);                 \
-            } else {                                                         \
-                c_row##row = _mm256_mul_ps(vbeta, _mm256_loadu_ps(C + row * ldc)); \
-            }                                                                \
-            for (int k = 0; k < 8; k++) {                                    \
-                __m256 a_ik = _mm256_set1_ps(A[row * 8 + k]);                \
-                c_row##row = _mm256_fmadd_ps(_mm256_mul_ps(valpha, a_ik), b_cols[k], c_row##row); \
-            }                                                                \
-            _mm256_storeu_ps(C + row * ldc, c_row##row);                     \
-        } while (0)
-    
-    PROCESS_ROW(0);
-    PROCESS_ROW(1);
-    PROCESS_ROW(2);
-    PROCESS_ROW(3);
-    PROCESS_ROW(4);
-    PROCESS_ROW(5);
-    PROCESS_ROW(6);
-    PROCESS_ROW(7);
-    
-    #undef PROCESS_ROW
-}
 
 //==============================================================================
 // TIER 1 DISPATCHER (CORRECTED VERSION)

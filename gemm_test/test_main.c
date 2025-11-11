@@ -10,6 +10,7 @@
 
 #include "test_common.h"
 #include <stdio.h>
+#include <string.h>
 
 // Test suite runners (declared in respective test files)
 extern int run_gemm_small_tests(test_results_t *results);
@@ -83,9 +84,7 @@ int main(int argc, char **argv)
     //==========================================================================
 
     printf("\n");
-    printf("╔═══════════════════════════════════════════════════════════╗\n");
-    printf("║                    FINAL SUMMARY                          ║\n");
-    printf("╠═══════════════════════════════════════════════════════════╣\n");
+
     
     if (run_small) {
         printf("║  Small Kernels:  %3d/%3d passed                            ║\n",
@@ -96,10 +95,9 @@ int main(int argc, char **argv)
                planning_results.passed, planning_results.total);
     }
     
-    printf("╠═══════════════════════════════════════════════════════════╣\n");
+
     printf("║  TOTAL:          %3d/%3d passed                            ║\n",
            total_results.passed, total_results.total);
-    printf("╚═══════════════════════════════════════════════════════════╝\n");
 
     if (total_results.failed == 0) {
         printf("\n🎉 " TEST_PASS " ALL TESTS PASSED!\n\n");
