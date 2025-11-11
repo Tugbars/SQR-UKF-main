@@ -628,6 +628,109 @@ static int test_dispatcher_rejects_high_ops(void)
     return 1;
 }
 
+
+//==============================================================================
+// TEST: 8×4 Rectangular Kernel
+//==============================================================================
+
+static int test_8x4_identity(void)
+{
+    printf("  Testing: 8×4 with identity-like data\n");
+
+    float A[8*8], B[8*4], C[8*4], C_ref[8*4];
+
+    // A = I (8×8 identity, but we only use first 8 columns for 8×K)
+    matrix_set_identity(A, 8, 8);
+    
+    // B = Sequential (8×4)
+    matrix_set_sequential(B, 8, 4, 4);
+    
+    // C = zeros
+    matrix_set_zeros(C, 8, 4, 4);
+    matrix_set_zeros(C_ref, 8, 4, 4);
+
+    // K=8, so A is 8×8, B is 8×4
+    gemm_8x4_inline(C, A, B, 8, 4, 1.0f, 0.0f);
+    gemm_naive(C_ref, A, B, 8, 8, 4, 4, 1.0f, 0.0f);
+
+    return matrices_equal(C, C_ref, 8, 4, 4, 1e-5f);
+}
+
+static int test_8x4_alpha_beta_cases(void)
+{
+    printf("  Testing: 8×4 alpha/beta combinations\n");
+
+    float A[8*8], B[8*4];
+    matrix_set_sequential(A, 8, 8, 8);
+    matrix_set_sequential(B, 8, 4, 4);
+
+    int all_passed = 1;
+
+    for (size_t i = 0; i < n_alpha_beta_cases; i++)
+    {
+        float C[8*4], C_ref[8*4];
+        matrix_set_value(C, 8, 4, 4, 2.0f);
+        matrix_set_value(C_ref, 8, 4, 4, 2.0f);
+
+        float alpha = alpha_beta_cases[i].alpha;
+        float beta = alpha_beta_cases[i].beta;
+
+        gemm_8x4_inline(C, A, B, 8, 4, alpha, beta);
+        gemm_naive(C_ref, A, B, 8, 8, 4, 4, alpha, beta);
+
+        if (!matrices_equal(C, C_ref, 8, 4, 4, 1e-5f))
+        {
+            printf("    FAILED: %s\n", alpha_beta_cases[i].description);
+            all_passed = 0;
+        }
+        else
+        {
+            printf("    ✓ %s\n", alpha_beta_cases[i].description);
+        }
+    }
+
+    return all_passed;
+}
+
+
+static int test_8x4_arbitrary_K(void)
+{
+    printf("  Testing: 8×4 with K=12 (arbitrary inner dimension)\n");
+
+    float A[8*12], B[12*4], C[8*4], C_ref[8*4];
+
+    matrix_set_sequential(A, 8, 12, 12);
+    matrix_set_sequential(B, 12, 4, 4);
+    matrix_set_zeros(C, 8, 4, 4);
+    matrix_set_zeros(C_ref, 8, 4, 4);
+
+    gemm_8x4_inline(C, A, B, 12, 4, 1.0f, 0.0f);
+    gemm_naive(C_ref, A, B, 8, 12, 4, 4, 1.0f, 0.0f);
+
+    return matrices_equal(C, C_ref, 8, 4, 4, 1e-5f);
+}
+
+//==============================================================================
+// TEST: 4×8 Rectangular Kernel
+//==============================================================================
+
+static int test_4x8_basic(void)
+{
+    printf("  Testing: 4×8 basic correctness\n");
+
+    float A[4*8], B[8*8], C[4*8], C_ref[4*8];
+
+    matrix_set_sequential(A, 4, 8, 8);
+    matrix_set_sequential(B, 8, 8, 8);
+    matrix_set_zeros(C, 4, 8, 8);
+    matrix_set_zeros(C_ref, 4, 8, 8);
+
+    gemm_4x8_inline(C, A, B, 8, 8, 1.0f, 0.0f);
+    gemm_naive(C_ref, A, B, 4, 8, 8, 8, 1.0f, 0.0f);
+
+    return matrices_equal(C, C_ref, 4, 8, 8, 1e-5f);
+}
+
 //==============================================================================
 // TEST SUITE RUNNER
 //==============================================================================
@@ -678,6 +781,12 @@ int run_gemm_small_tests(test_results_t *results)
     RUN_TEST(results, test_dispatcher_routes_8x8);
     RUN_TEST(results, test_dispatcher_rejects_large);
     RUN_TEST(results, test_dispatcher_rejects_high_ops);
+
+    printf("\n═══ Test Group 5: Rectangular Kernels (8×4, 4×8) ═══\n");
+    RUN_TEST(results, test_8x4_identity);
+    RUN_TEST(results, test_8x4_alpha_beta_cases);
+    RUN_TEST(results, test_8x4_arbitrary_K);
+    RUN_TEST(results, test_4x8_basic);
 
     // Print results
     print_test_results("GEMM Small Kernels - Results", results);
