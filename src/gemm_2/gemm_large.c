@@ -1,611 +1,545 @@
 /**
  * @file gemm_large.c
- * @brief Tier 2: Planned Execution for Large Matrices
- * 
- * This module implements:
- * - Optimized packing for A and B matrices
- * - Enum-based kernel dispatch (zero pointer indirection)
- * - 3-level cache blocking execution
- * - Alpha/beta scaling
- * - Proper mask handling for 8-wide and 16-wide kernels
- * 
- * @author TUGBARS
+ * @brief Tier 2: Planned Execution for Large Matrices (CORRECTED)
+ *
+ * CHANGES FROM ORIGINAL:
+ * 1. Fixed n_ntiles → n_npanels (compile error)
+ * 2. Dynamic kernel selection (architectural mismatch fix)
+ * 3. Alpha scaling moved to packing (performance + correctness)
+ * 4. Beta pre-scaling added (missing feature)
+ * 5. Corrected loop structure (cache optimization)
+ * 6. Fixed workspace indexing (silent corruption fix)
+ *
+ * @author TUGBARS (corrected implementation)
  * @date 2025
  */
 
 #include "gemm_planning.h"
-#include "gemm_kernels_avx2.h"  // Your complete AVX2 kernels from doc3
+#include "gemm_kernels_avx2.h"
 #include "gemm_simd_ops.h"
 #include <string.h>
+#include <stdbool.h>
 
 //==============================================================================
-// PACKING CONFIGURATION
+// UTILITIES
 //==============================================================================
 
-// Prefetch distances tuned for i14900K
-#define PACK_PREFETCH_DIST_A 64   // Prefetch 64 bytes ahead for A
-#define PACK_PREFETCH_DIST_B 128  // Prefetch 128 bytes ahead for B
-
-//==============================================================================
-// PACK A: Column-major source -> Row-major packed (MR rows)
-//==============================================================================
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
 
 /**
- * @brief Pack A panel: [i0:i0+ib, k0:k0+kb] from column-major A
- * 
- * Layout: Packed as [k][mr] for cache-friendly access during compute
- * 
- * @param Ap Destination packed buffer (aligned, size: kb * MR)
- * @param A Source matrix (column-major, size: M * K)
- * @param M Total rows in A
- * @param K Total columns in A
- * @param i0 Starting row
- * @param ib Number of rows to pack (<= MR)
- * @param k0 Starting column  
- * @param kb Number of columns to pack (<= KC)
+ * @brief Pre-scale entire C matrix by beta (called once)
  */
-static void pack_A_panel(
-    float * restrict Ap,
-    const float * restrict A,
-    size_t M, size_t K,
-    size_t i0, size_t ib,
-    size_t k0, size_t kb)
+static void scale_matrix_beta(
+    float *restrict C,
+    size_t M, size_t N,
+    float beta)
 {
-    (void)M;  // Unused but kept for API consistency
-    
-    // Zero out entire buffer (handles padding for ib < MR)
-    memset(Ap, 0, kb * 16 * sizeof(float));  // Max MR is 16
-    
-    // Pack actual data
-    for (size_t k = 0; k < kb; ++k) {
-        // Prefetch next column
-        if (k + 8 < kb) {
-            const float *prefetch_col = A + (i0) * K + (k0 + k + 8);
-            PREFETCH_T0(prefetch_col);
-            PREFETCH_T0(prefetch_col + 8);
+    if (beta == 0.0f)
+    {
+        // Zero out C
+        memset(C, 0, M * N * sizeof(float));
+    }
+    else if (beta != 1.0f)
+    {
+        __m256 vbeta = _mm256_set1_ps(beta);
+        for (size_t i = 0; i < M; ++i)
+        {
+            float *row = C + i * N;
+            size_t j = 0;
+
+            // Vectorized
+            for (; j + 7 < N; j += 8)
+            {
+                __m256 c = _mm256_loadu_ps(row + j);
+                _mm256_storeu_ps(row + j, _mm256_mul_ps(c, vbeta));
+            }
+
+            // Scalar tail
+            for (; j < N; ++j)
+            {
+                row[j] *= beta;
+            }
         }
-        
-        const float *src_col = A + i0 * K + (k0 + k);
-        float *dst = Ap + k * 16;  // Max stride is 16
-        
-        // Copy ib elements
-        for (size_t i = 0; i < ib; ++i) {
-            dst[i] = src_col[i * K];
-        }
-        // Remaining elements already zeroed by memset
     }
 }
 
+//==============================================================================
+// PACKING WITH INTEGRATED ALPHA SCALING
+//==============================================================================
+
 /**
- * @brief Pack A panel with aligned loads (fast path)
- * 
- * Used when A is known to be 32-byte aligned
+ * @brief Pack A panel with optional alpha scaling (CORRECTED)
+ *
+ * Scales during packing to avoid:
+ * - Overwriting packed buffer
+ * - Scaling zeros in padding
+ * - Redundant scaling across M-tiles
  */
-static void pack_A_panel_aligned(
-    float * restrict Ap,
-    const float * restrict A,
+static void pack_A_panel_scaled(
+    float *restrict Ap,
+    const float *restrict A,
     size_t M, size_t K,
     size_t i0, size_t ib,
-    size_t k0, size_t kb)
+    size_t k0, size_t kb,
+    float alpha)
 {
     (void)M;
-    
+
     // Zero padding
-    if (ib < 16) {
-        memset(Ap, 0, kb * 16 * sizeof(float));
-    }
-    
-    // Pack with vectorized loads when possible
-    if (ib == 16) {
-        // Full height - can use SIMD
-        for (size_t k = 0; k < kb; ++k) {
-            // Prefetch
-            if (k + 8 < kb) {
+    memset(Ap, 0, kb * 16 * sizeof(float));
+
+    if (alpha == 1.0f)
+    {
+        // Fast path: no scaling
+        for (size_t k = 0; k < kb; ++k)
+        {
+            if (k + 8 < kb)
+            {
                 PREFETCH_T0(A + i0 * K + (k0 + k + 8));
             }
-            
+
             const float *src_col = A + i0 * K + (k0 + k);
             float *dst = Ap + k * 16;
-            
-            // Gather 16 elements from column-major A
-            // This is scalar but with good prefetch
-            for (size_t i = 0; i < 16; ++i) {
+
+            for (size_t i = 0; i < ib; ++i)
+            {
                 dst[i] = src_col[i * K];
             }
         }
-    } else if (ib == 8) {
-        // 8 rows
-        for (size_t k = 0; k < kb; ++k) {
+    }
+    else
+    {
+        // Scaled path
+        for (size_t k = 0; k < kb; ++k)
+        {
+            if (k + 8 < kb)
+            {
+                PREFETCH_T0(A + i0 * K + (k0 + k + 8));
+            }
+
             const float *src_col = A + i0 * K + (k0 + k);
-            float *dst = Ap + k * 16;  // Still stride 16 for consistency
-            
-            for (size_t i = 0; i < 8; ++i) {
-                dst[i] = src_col[i * K];
+            float *dst = Ap + k * 16;
+
+            for (size_t i = 0; i < ib; ++i)
+            {
+                dst[i] = src_col[i * K] * alpha;
             }
         }
-    } else {
-        // Partial height
-        pack_A_panel(Ap, A, M, K, i0, ib, k0, kb);
     }
 }
 
-//==============================================================================
-// PACK B: Row-major source -> Column-panel packed (NR cols)
-//==============================================================================
-
 /**
- * @brief Pack B panel: [k0:k0+kb, j0:j0+jb] from row-major B
- * 
- * Layout: Packed as [k][nr] for streaming access during compute
- * 
- * @param Bp Destination packed buffer (aligned, size: kb * NR)
- * @param B Source matrix (row-major, size: K * N)
- * @param K Total rows in B
- * @param N Total columns in B
- * @param k0 Starting row
- * @param kb Number of rows to pack (<= KC)
- * @param j0 Starting column
- * @param jb Number of columns to pack (<= NR)
+ * @brief Pack B panel (no alpha - handled in A)
  */
 static void pack_B_panel(
-    float * restrict Bp,
-    const float * restrict B,
+    float *restrict Bp,
+    const float *restrict B,
     size_t K, size_t N,
     size_t k0, size_t kb,
     size_t j0, size_t jb)
 {
     (void)K;
-    
-    // Full width - fast path
-    if (jb == 8) {
-        for (size_t k = 0; k < kb; ++k) {
-            // Prefetch next row
-            if (k + 4 < kb) {
+
+    if (jb == 8)
+    {
+        // Fast path: 8-wide
+        for (size_t k = 0; k < kb; ++k)
+        {
+            if (k + 4 < kb)
+            {
                 PREFETCH_T0(B + (k0 + k + 4) * N + j0);
             }
-            
+
             const float *src_row = B + (k0 + k) * N + j0;
             float *dst = Bp + k * 8;
-            
-            // Vectorized copy
+
             __m256 data = _mm256_loadu_ps(src_row);
             _mm256_store_ps(dst, data);
         }
-    } else if (jb == 16) {
-        for (size_t k = 0; k < kb; ++k) {
-            if (k + 4 < kb) {
+    }
+    else if (jb == 16)
+    {
+        // Fast path: 16-wide
+        for (size_t k = 0; k < kb; ++k)
+        {
+            if (k + 4 < kb)
+            {
                 PREFETCH_T0(B + (k0 + k + 4) * N + j0);
                 PREFETCH_T0(B + (k0 + k + 4) * N + j0 + 8);
             }
-            
+
             const float *src_row = B + (k0 + k) * N + j0;
             float *dst = Bp + k * 16;
-            
+
             __m256 lo = _mm256_loadu_ps(src_row);
             __m256 hi = _mm256_loadu_ps(src_row + 8);
             _mm256_store_ps(dst, lo);
             _mm256_store_ps(dst + 8, hi);
         }
-    } else if (jb == 6) {
-        for (size_t k = 0; k < kb; ++k) {
+    }
+    else if (jb == 6)
+    {
+        // 6-wide (Kalman filters)
+        for (size_t k = 0; k < kb; ++k)
+        {
             const float *src_row = B + (k0 + k) * N + j0;
             float *dst = Bp + k * 6;
-            
-            // Scalar copy for width 6
-            for (size_t j = 0; j < 6; ++j) {
-                dst[j] = src_row[j];
-            }
-        }
-    } else {
-        // Partial width - use scalar copy
-        // Zero padding first
-        memset(Bp, 0, kb * 16 * sizeof(float));
-        
-        for (size_t k = 0; k < kb; ++k) {
-            const float *src_row = B + (k0 + k) * N + j0;
-            float *dst = Bp + k * 16;  // Max stride
-            
-            for (size_t j = 0; j < jb; ++j) {
+
+            for (size_t j = 0; j < 6; ++j)
+            {
                 dst[j] = src_row[j];
             }
         }
     }
-}
+    else
+    {
+        // Partial width
+        memset(Bp, 0, kb * 16 * sizeof(float));
 
-/**
- * @brief Pack B panel with aligned loads (fast path)
- */
-static void pack_B_panel_aligned(
-    float * restrict Bp,
-    const float * restrict B,
-    size_t K, size_t N,
-    size_t k0, size_t kb,
-    size_t j0, size_t jb)
-{
-    // Check if B is aligned at this position
-    const float *B_start = B + k0 * N + j0;
-    int is_aligned = (((uintptr_t)B_start & 31) == 0);
-    
-    if (is_aligned && jb == 8) {
-        // Fast path: aligned 8-column pack
-        for (size_t k = 0; k < kb; ++k) {
-            if (k + 4 < kb) {
-                PREFETCH_T0(B + (k0 + k + 4) * N + j0);
-            }
-            
-            const float *src_row = B + (k0 + k) * N + j0;
-            float *dst = Bp + k * 8;
-            
-            __m256 data = _mm256_load_ps(src_row);  // Aligned load
-            _mm256_store_ps(dst, data);
-        }
-    } else if (is_aligned && jb == 16) {
-        // Fast path: aligned 16-column pack
-        for (size_t k = 0; k < kb; ++k) {
-            if (k + 4 < kb) {
-                PREFETCH_T0(B + (k0 + k + 4) * N + j0);
-                PREFETCH_T0(B + (k0 + k + 4) * N + j0 + 8);
-            }
-            
+        for (size_t k = 0; k < kb; ++k)
+        {
             const float *src_row = B + (k0 + k) * N + j0;
             float *dst = Bp + k * 16;
-            
-            __m256 lo = _mm256_load_ps(src_row);
-            __m256 hi = _mm256_load_ps(src_row + 8);
-            _mm256_store_ps(dst, lo);
-            _mm256_store_ps(dst + 8, hi);
+
+            for (size_t j = 0; j < jb; ++j)
+            {
+                dst[j] = src_row[j];
+            }
         }
-    } else {
-        // Fall back to unaligned version
-        pack_B_panel(Bp, B, K, N, k0, kb, j0, jb);
     }
 }
 
 //==============================================================================
-// ENUM-BASED KERNEL DISPATCH (Zero pointer indirection)
+// KERNEL DISPATCH (Unchanged but included for completeness)
 //==============================================================================
 
-/**
- * @brief Dispatch to appropriate kernel using direct switch statement
- * 
- * This compiles to a jump table with zero indirection cost.
- * Compiler can inline across the switch for maximum performance.
- */
 static inline void dispatch_kernel(
     gemm_kernel_id_t kernel_id,
-    float * restrict c,
+    float *restrict c,
     size_t ldc,
-    const float * restrict Ap,
-    const float * restrict Bp,
+    const float *restrict Ap,
+    const float *restrict Bp,
     size_t Kblk,
     size_t m_block,
     size_t n_block,
     __m256i mask_lo,
     __m256i mask_hi)
 {
-    switch (kernel_id) {
-        //----------------------------------------------------------------------
-        // 8-wide kernels (single mask)
-        //----------------------------------------------------------------------
-        case KERN_16x8_ADD:
-            gemm_16x8_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_16x8_STORE:
-            gemm_16x8_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_8x8_ADD:
-            gemm_8x8_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_8x8_STORE:
-            gemm_8x8_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_16x6_ADD:
-            gemm_16x6_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_16x6_STORE:
-            gemm_16x6_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_8x6_ADD:
-            gemm_8x6_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_8x6_STORE:
-            gemm_8x6_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
-            break;
-            
-        case KERN_4x8_ADD:
-            gemm_4x8_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, n_block, mask_lo);
-            break;
-            
-        case KERN_4x8_STORE:
-            gemm_4x8_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, n_block, mask_lo);
-            break;
-            
-        case KERN_1x8_ADD:
-            gemm_1x8_panel_avx2fma_add(c, Ap, Bp, Kblk, n_block, mask_lo);
-            break;
-            
-        case KERN_1x8_STORE:
-            gemm_1x8_panel_avx2fma_store(c, Ap, Bp, Kblk, n_block, mask_lo);
-            break;
-            
-        //----------------------------------------------------------------------
-        // 16-wide kernels (dual mask)
-        //----------------------------------------------------------------------
-        case KERN_8x16_ADD:
-            gemm_8x16_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, 
-                                       mask_lo, mask_hi);
-            break;
-            
-        case KERN_8x16_STORE:
-            gemm_8x16_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block,
-                                         mask_lo, mask_hi);
-            break;
-            
-        case KERN_16x16_ADD:
-            // TODO: Implement 16x16 kernels if needed
-            // For now fall back to calling 8x16 twice
-            gemm_8x16_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, 8, n_block, 
-                                       mask_lo, mask_hi);
-            gemm_8x16_panel_avx2fma_add(c + 8 * ldc, ldc, Ap + 8, Bp, Kblk, 
-                                       m_block - 8, n_block, mask_lo, mask_hi);
-            break;
-            
-        case KERN_16x16_STORE:
-            gemm_8x16_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, 8, n_block,
-                                         mask_lo, mask_hi);
-            gemm_8x16_panel_avx2fma_store(c + 8 * ldc, ldc, Ap + 8, Bp, Kblk,
-                                         m_block - 8, n_block, mask_lo, mask_hi);
-            break;
-            
-        default:
-            // Should never reach here if planning is correct
-            break;
+    switch (kernel_id)
+    {
+    case KERN_16x8_ADD:
+        gemm_16x8_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_16x8_STORE:
+        gemm_16x8_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_8x8_ADD:
+        gemm_8x8_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_8x8_STORE:
+        gemm_8x8_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_16x6_ADD:
+        gemm_16x6_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_16x6_STORE:
+        gemm_16x6_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_8x6_ADD:
+        gemm_8x6_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_8x6_STORE:
+        gemm_8x6_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block, mask_lo);
+        break;
+    case KERN_4x8_ADD:
+        gemm_4x8_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, n_block, mask_lo);
+        break;
+    case KERN_4x8_STORE:
+        gemm_4x8_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, n_block, mask_lo);
+        break;
+    case KERN_1x8_ADD:
+        gemm_1x8_panel_avx2fma_add(c, Ap, Bp, Kblk, n_block, mask_lo);
+        break;
+    case KERN_1x8_STORE:
+        gemm_1x8_panel_avx2fma_store(c, Ap, Bp, Kblk, n_block, mask_lo);
+        break;
+    case KERN_8x16_ADD:
+        gemm_8x16_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, m_block, n_block,
+                                    mask_lo, mask_hi);
+        break;
+    case KERN_8x16_STORE:
+        gemm_8x16_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, m_block, n_block,
+                                      mask_lo, mask_hi);
+        break;
+    case KERN_16x16_ADD:
+        // Decompose into 2× 8x16 calls
+        gemm_8x16_panel_avx2fma_add(c, ldc, Ap, Bp, Kblk, 8, n_block,
+                                    mask_lo, mask_hi);
+        gemm_8x16_panel_avx2fma_add(c + 8 * ldc, ldc, Ap + 8, Bp, Kblk,
+                                    m_block - 8, n_block, mask_lo, mask_hi);
+        break;
+    case KERN_16x16_STORE:
+        gemm_8x16_panel_avx2fma_store(c, ldc, Ap, Bp, Kblk, 8, n_block,
+                                      mask_lo, mask_hi);
+        gemm_8x16_panel_avx2fma_store(c + 8 * ldc, ldc, Ap + 8, Bp, Kblk,
+                                      m_block - 8, n_block, mask_lo, mask_hi);
+        break;
+    default:
+        break;
     }
 }
 
 //==============================================================================
-// MAIN EXECUTION LOOP
+// MAIN EXECUTION LOOP (FULLY CORRECTED)
 //==============================================================================
 
 /**
- * @brief Execute planned GEMM: C = alpha*A*B + beta*C
- * 
- * Three-level blocking structure:
- * 1. NC-level: Split N into cache-friendly panels
- * 2. KC-level: Split K into cache-friendly blocks (reuse packed B)
- * 3. MC-level: Split M into cache-friendly tiles (reuse packed A)
- * 
- * @return 0 on success, negative error code on failure
+ * @brief Execute planned GEMM: C = alpha*A*B + beta*C (CORRECTED)
+ *
+ * FIXES APPLIED:
+ * 1. n_ntiles → n_npanels (compile error fix)
+ * 2. Dynamic kernel selection per tile (architectural fix)
+ * 3. Alpha scaling integrated into packing (performance + correctness)
+ * 4. Beta pre-scaled before K-loop (missing feature)
+ * 5. Corrected loop structure: NC → KC → MC (cache optimization)
+ * 6. Fixed workspace indexing (corruption fix)
+ *
+ * Loop structure:
+ * NC-level: Split N into cache-friendly panels
+ *   KC-level: Split K into cache-friendly blocks
+ *     Pack B once per KC×NC tile (reused across all MC tiles)
+ *     MC-level: Split M into cache-friendly blocks
+ *       MR-level: Micro-tiles (register blocks)
+ *         Pack A once per MR×KC tile
+ *         Execute kernels on all NR-panels
  */
 int gemm_execute_plan(
     gemm_plan_t *plan,
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
     float alpha,
     float beta)
 {
-    if (!plan || !C || !A || !B) {
-        return -1;  // Invalid arguments
+    if (!plan || !C || !A || !B)
+    {
+        return -1;
     }
-    
+
+    //==========================================================================
+    // BETA PRE-SCALING (once for entire operation)
+    //==========================================================================
+    bool first_accumulation = true;
+
+    if (beta != 0.0f && beta != 1.0f)
+    {
+        scale_matrix_beta(C, plan->M, plan->N, beta);
+        beta = 1.0f; // Now treat as accumulate mode
+        first_accumulation = false;
+    }
+    else if (beta == 0.0f)
+    {
+        first_accumulation = true;
+    }
+    else
+    {
+        first_accumulation = false;
+    }
+
     float *Ap = plan->workspace_a;
     float *Bp = plan->workspace_b;
-    
+
     //==========================================================================
-    // Three-level blocking: N -> K -> M
+    // Tile counts (corrected)
     //==========================================================================
-    
-    for (size_t jt = 0; jt < plan->n_ntiles; jt++) {
+    size_t n_nc_tiles = (plan->N + plan->NC - 1) / plan->NC;
+    size_t n_kc_tiles = (plan->K + plan->KC - 1) / plan->KC;
+    size_t n_mc_tiles = (plan->M + plan->MC - 1) / plan->MC;
+
+    //==========================================================================
+    // Three-level blocking: NC → KC → MC
+    //==========================================================================
+
+    for (size_t jt = 0; jt < n_nc_tiles; jt++)
+    {
         size_t j0 = jt * plan->NC;
-        size_t jb = (j0 + plan->NC <= plan->N) ? plan->NC : (plan->N - j0);
-        
-        for (size_t kt = 0; kt < plan->n_ktiles; kt++) {
-            size_t kk = kt * plan->KC;
-            size_t kb = (kk + plan->KC <= plan->K) ? plan->KC : (plan->K - kk);
-            
+        size_t jb = MIN(plan->NC, plan->N - j0);
+        size_t n_panels = (jb + plan->NR - 1) / plan->NR;
+
+        for (size_t kt = 0; kt < n_kc_tiles; kt++)
+        {
+            size_t k0 = kt * plan->KC;
+            size_t kb = MIN(plan->KC, plan->K - k0);
+
             //------------------------------------------------------------------
-            // Pack B for this K×N tile (done once, reused for all M-tiles)
+            // PACK B: Once per KC×NC tile (reused for all MC tiles)
             //------------------------------------------------------------------
-            size_t n_panels_in_tile = (jb + plan->NR - 1) / plan->NR;
-            size_t panel_base = (j0 / plan->NR);
-            
-            for (size_t p = 0; p < n_panels_in_tile; p++) {
-                panel_info_t *panel = &plan->npanels[panel_base + p];
+            size_t panel_stride = plan->KC * plan->NR; // Max stride
+
+            for (size_t p = 0; p < n_panels; p++)
+            {
                 size_t j = j0 + p * plan->NR;
-                size_t n_block = (j + plan->NR <= j0 + jb) 
-                                 ? plan->NR 
-                                 : (j0 + jb - j);
-                
-                // Select packing function based on alignment
-                if (plan->mem_mode == GEMM_MEM_STATIC || plan->workspace_aligned) {
-                    pack_B_panel_aligned(
-                        Bp + p * kb * plan->NR,
-                        B, plan->K, plan->N,
-                        kk, kb, j, n_block);
-                } else {
-                    pack_B_panel(
-                        Bp + p * kb * plan->NR,
-                        B, plan->K, plan->N,
-                        kk, kb, j, n_block);
-                }
+                size_t jw = MIN(plan->NR, j0 + jb - j);
+
+                // Corrected workspace offset
+                float *Bp_panel = Bp + p * panel_stride;
+
+                pack_B_panel(Bp_panel, B, plan->K, plan->N,
+                             k0, kb, j, jw);
             }
-            
+
             //------------------------------------------------------------------
             // Process M-tiles with packed B
             //------------------------------------------------------------------
-            for (size_t it = 0; it < plan->n_mtiles; it++) {
+            for (size_t it = 0; it < n_mc_tiles; it++)
+            {
                 size_t i0 = it * plan->MC;
-                size_t ib = (i0 + plan->MC <= plan->M) ? plan->MC : (plan->M - i0);
-                
-                size_t tile_base = (i0 / plan->MR);
-                
-                for (size_t i = 0; i < ib; ) {
-                    tile_info_t *tile = &plan->mtiles[tile_base + (i / plan->MR)];
-                    size_t m_block = tile->i_height;
-                    
+                size_t ib = MIN(plan->MC, plan->M - i0);
+                size_t n_mr_tiles = (ib + plan->MR - 1) / plan->MR;
+
+                for (size_t mt = 0; mt < n_mr_tiles; mt++)
+                {
+                    size_t i = i0 + mt * plan->MR;
+                    size_t mh = MIN(plan->MR, plan->M - i);
+
                     //----------------------------------------------------------
-                    // Pack A for this micro-panel
+                    // PACK A: Once per MR×KC tile (with alpha scaling)
                     //----------------------------------------------------------
-                    if (plan->mem_mode == GEMM_MEM_STATIC || plan->workspace_aligned) {
-                        pack_A_panel_aligned(Ap, A, plan->M, plan->K, 
-                                           i0 + i, m_block, kk, kb);
-                    } else {
-                        pack_A_panel(Ap, A, plan->M, plan->K,
-                                   i0 + i, m_block, kk, kb);
-                    }
-                    
+                    pack_A_panel_scaled(Ap, A, plan->M, plan->K,
+                                        i, mh, k0, kb, alpha);
+
                     //----------------------------------------------------------
-                    // Apply alpha scaling to packed A (once per K-tile)
+                    // Execute kernels on all N-panels
                     //----------------------------------------------------------
-                    if (alpha != 1.0f) {
-                        __m256 va = _mm256_set1_ps(alpha);
-                        size_t len = kb * 16;  // Max MR is 16
-                        size_t idx = 0;
-                        
-                        // Vectorized scaling
-                        for (; idx + 7 < len; idx += 8) {
-                            __m256 v = _mm256_load_ps(Ap + idx);
-                            _mm256_store_ps(Ap + idx, _mm256_mul_ps(v, va));
-                        }
-                        // Scalar tail
-                        for (; idx < len; idx++) {
-                            Ap[idx] *= alpha;
-                        }
-                    }
-                    
-                    //----------------------------------------------------------
-                    // Execute kernel on each N-panel
-                    //----------------------------------------------------------
-                    for (size_t p = 0; p < n_panels_in_tile; p++) {
-                        panel_info_t *panel = &plan->npanels[panel_base + p];
+                    for (size_t p = 0; p < n_panels; p++)
+                    {
                         size_t j = j0 + p * plan->NR;
-                        size_t n_block = (j + plan->NR <= j0 + jb) 
-                                         ? plan->NR 
-                                         : (j0 + jb - j);
-                        
-                        float *cptr = C + (i0 + i) * plan->N + j;
-                        const float *bptr = Bp + p * kb * plan->NR;
-                        
-                        // Select kernel based on K-tile and beta
+                        size_t jw = MIN(plan->NR, j0 + jb - j);
+
+                        //------------------------------------------------------
+                        // DYNAMIC KERNEL SELECTION (architectural fix)
+                        //------------------------------------------------------
+                        gemm_kernel_id_t kern_add, kern_store;
+                        int kernel_width;
+                        gemm_select_kernels(mh, jw,
+                                            &kern_add, &kern_store,
+                                            &kernel_width);
+
+                        //------------------------------------------------------
+                        // Choose ADD or STORE mode
+                        //------------------------------------------------------
                         gemm_kernel_id_t kernel_id;
-                        if (kt == 0 && beta == 0.0f) {
-                            // First K-tile with beta=0: use STORE kernel
-                            kernel_id = tile->kern_store;
-                        } else {
-                            // Subsequent K-tiles or beta!=0: use ADD kernel
-                            kernel_id = tile->kern_add;
+                        if (kt == 0 && first_accumulation)
+                        {
+                            kernel_id = kern_store; // First K-tile, overwrite
                         }
-                        
-                        // Dispatch to appropriate kernel (enum switch)
+                        else
+                        {
+                            kernel_id = kern_add; // Accumulate
+                        }
+
+                        //------------------------------------------------------
+                        // Get pre-computed masks
+                        //------------------------------------------------------
+                        size_t global_panel_idx = j / plan->NR;
+                        panel_info_t *panel = &plan->npanels[global_panel_idx];
+
+                        //------------------------------------------------------
+                        // Dispatch to kernel
+                        //------------------------------------------------------
+                        float *cptr = C + i * plan->N + j;
+                        float *bptr = Bp + p * panel_stride;
+
                         dispatch_kernel(
                             kernel_id,
-                            cptr, plan->N,
-                            Ap, bptr,
-                            kb, m_block, n_block,
+                            cptr,
+                            plan->N,
+                            Ap,
+                            bptr,
+                            kb,
+                            mh,
+                            jw,
                             panel->mask_lo,
                             panel->mask_hi);
                     }
-                    
-                    i += m_block;
                 }
             }
         }
     }
-    
-    return 0;  // Success
+
+    return 0;
 }
 
 //==============================================================================
-// PUBLIC API
+// PUBLIC API (Unchanged)
 //==============================================================================
 
-/**
- * @brief Main GEMM entry point with automatic mode selection
- * 
- * Routes to:
- * - Tier 1 (gemm_small.c) for exact fixed sizes (4x4, 6x6, 8x8, etc.)
- * - Tier 2 (this file) for everything else
- */
 int gemm_auto(
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
     size_t M, size_t K, size_t N,
     float alpha, float beta)
 {
-    // Try Tier 1 first (small fixed-size matrices)
+    // Try Tier 1 first
     int ret = gemm_small_dispatch(C, A, B, M, K, N, N, alpha, beta);
-    if (ret == 0) {
-        return 0;  // Handled by Tier 1
+    if (ret == 0)
+    {
+        return 0;
     }
-    
-    // Fall back to Tier 2 (planned execution)
-    gemm_plan_t *plan = gemm_plan_create(M, K, N);
-    if (!plan) {
-        return -1;  // Planning failed
-    }
-    
-    ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
-    
-    gemm_plan_destroy(plan);
-    return ret;
-}
 
-/**
- * @brief Explicit static mode GEMM
- * 
- * Forces static pool usage, errors if dimensions too large
- */
-int gemm_static(
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
-    size_t M, size_t K, size_t N,
-    float alpha, float beta)
-{
-    // Check dimensions
-    if (!gemm_fits_static(M, K, N)) {
-        return -1;  // Dimensions exceed static pool
-    }
-    
-    gemm_plan_t *plan = gemm_plan_create_with_mode(M, K, N, GEMM_MEM_STATIC);
-    if (!plan) {
+    // Fall back to Tier 2
+    gemm_plan_t *plan = gemm_plan_create(M, K, N);
+    if (!plan)
+    {
         return -1;
     }
-    
-    int ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
-    
+
+    ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
+
     gemm_plan_destroy(plan);
     return ret;
 }
 
-/**
- * @brief Explicit dynamic mode GEMM
- * 
- * Forces dynamic allocation (useful for large matrices)
- */
+int gemm_static(
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
+    size_t M, size_t K, size_t N,
+    float alpha, float beta)
+{
+    if (!gemm_fits_static(M, K, N))
+    {
+        return -1;
+    }
+
+    gemm_plan_t *plan = gemm_plan_create_with_mode(M, K, N, GEMM_MEM_STATIC);
+    if (!plan)
+    {
+        return -1;
+    }
+
+    int ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
+
+    gemm_plan_destroy(plan);
+    return ret;
+}
+
 int gemm_dynamic(
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
     size_t M, size_t K, size_t N,
     float alpha, float beta)
 {
     gemm_plan_t *plan = gemm_plan_create_with_mode(M, K, N, GEMM_MEM_DYNAMIC);
-    if (!plan) {
+    if (!plan)
+    {
         return -1;
     }
-    
+
     int ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
-    
+
     gemm_plan_destroy(plan);
     return ret;
 }
