@@ -784,7 +784,8 @@ gemm_plan_t *gemm_plan_create_with_mode(
 
         // Calculate EXACT sizes for each buffer (not divided by 3!)
         size_t a_size = plan->MC * plan->KC * sizeof(float);
-        size_t b_size = plan->KC * plan->NC * sizeof(float);
+        size_t max_n_panels = (plan->NC + plan->NR - 1) / plan->NR;
+        size_t b_size = max_n_panels * plan->KC * 16 * sizeof(float);
         size_t temp_size = plan->MC * plan->NC * sizeof(float);
 
         // Round each to 64-byte boundaries for cache line alignment
