@@ -17,6 +17,7 @@
 #include "gemm_utils.h"
 #include "gemm.h"
 #include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -111,59 +112,119 @@ inline void gemm_build_mask_pair16(size_t w, __m256i *lo, __m256i *hi)
 //==============================================================================
 
 /**
- * @brief Select optimal cache blocking based on matrix shape
+ * @brief Cache-aware adaptive blocking with overflow protection
  *
- * Tuned for Intel 14900K cache hierarchy:
- * - L1D: 48KB per P-core (32KB per E-core)
- * - L2:  2MB per P-core (4MB per E-core cluster)
+ * Tuned for Intel 14900K:
+ * - L1D: 48KB per P-core, 32KB per E-core
+ * - L2:  2MB per P-core, 4MB per E-core cluster
  * - L3:  36MB shared
  *
- * Strategy:
- * - Small matrices (< 64³): No blocking, direct execution
- * - Medium matrices (< 512³): Single-level L2 blocking
- * - Large matrices: Full three-level blocking (L1/L2/L3)
- */
-/**
- * @brief Select optimal cache blocking based on matrix shape
+ * Optimization targets:
+ * - Tall (M>>N): Maximize A reuse → larger MC
+ * - Wide (N>>M): Maximize B reuse → larger NC
+ * - Deep (K>>M,N): Amortize packing → larger KC
+ * - Balanced: Use cache-tuned defaults
  *
- * FIXED: Removed tiny matrix special case (Tier 1 handles that)
+ * @param M,K,N Matrix dimensions
+ * @param MC,KC,NC Output: Cache block sizes
+ * @param MR,NR Output: Register block sizes
  */
+// Define constants with correct type
+static const size_t ADAPTIVE_MC_TALL = 256;
+static const size_t ADAPTIVE_MC_SMALL = 64;
+static const size_t ADAPTIVE_KC_TALL = 128;
+static const size_t ADAPTIVE_KC_DEEP = 512;
+static const size_t ADAPTIVE_NC_WIDE = 512;
+static const size_t ADAPTIVE_NC_SMALL = 128;
+static const size_t ADAPTIVE_KC_MIN = 32;
+
 void gemm_select_blocking(
     size_t M, size_t K, size_t N,
     size_t *MC, size_t *KC, size_t *NC,
     size_t *MR, size_t *NR)
 {
-    // Small matrices - minimal blocking
-    if (M <= 512 && N <= 512 && K <= 512)
-    {
-        *MC = (M < 128) ? M : 128; // Fit in L2
-        *KC = (K < 256) ? K : 256; // Balance L1/register pressure
-        *NC = (N < 256) ? N : 256; // Good for L2 TLB
+    double aspect_mn = (double)M / (double)N;
+    double aspect_kn = (double)K / (double)N;
+    
+    if (aspect_mn > 3.0) {
+        //----------------------------------------------------------------------
+        // TALL matrices
+        //----------------------------------------------------------------------
+        *MC = ADAPTIVE_MC_TALL;              // ✅ No warnings
+        *KC = ADAPTIVE_KC_TALL;
+        *NC = MIN(N, ADAPTIVE_NC_SMALL);     // ✅ No warnings
+        
+        *MR = 16;
+        *NR = (N >= 16) ? 16 : ((N >= 8) ? 8 : 6);
     }
-    else
-    {
-        // Large matrices - full three-level blocking
-        *MC = GEMM_BLOCK_MC; // 128
-        *KC = (K < GEMM_BLOCK_KC) ? K : GEMM_BLOCK_KC;
-        *NC = GEMM_BLOCK_NC; // 256
+    else if (aspect_mn < 0.33) {
+        //----------------------------------------------------------------------
+        // WIDE matrices
+        //----------------------------------------------------------------------
+        *MC = MIN(M, ADAPTIVE_MC_SMALL);     // ✅ No warnings
+        *KC = ADAPTIVE_KC_TALL;
+        *NC = ADAPTIVE_NC_WIDE;
+        
+        *MR = (M >= 16) ? 16 : ((M >= 8) ? 8 : 4);
+        *NR = 16;
     }
-
-    // Register blocking - prefer wider panels for better amortization
-    if (N >= 16 && M >= 8)
-    {
-        *NR = 16; // Wide panel (enables 8x16, 16x16 kernels)
-        *MR = (M >= 16) ? 16 : 8;
+    else if (aspect_kn > 4.0) {
+        //----------------------------------------------------------------------
+        // DEEP matrices
+        //----------------------------------------------------------------------
+        *MC = MIN(M, ADAPTIVE_MC_SMALL);     // ✅ No warnings
+        *KC = ADAPTIVE_KC_DEEP;
+        *NC = MIN(N, ADAPTIVE_NC_SMALL);     // ✅ No warnings
+        
+        *MR = (M >= 8) ? 8 : 4;
+        *NR = (N >= 8) ? 8 : 6;
     }
-    else if (N >= 8)
-    {
-        *NR = 8; // Standard panel (enables 8x8, 16x8 kernels)
-        *MR = (M >= 16) ? 16 : 8;
+    else {
+        //----------------------------------------------------------------------
+        // BALANCED matrices
+        //----------------------------------------------------------------------
+        *MC = GEMM_BLOCK_MC;
+        *KC = GEMM_BLOCK_KC;
+        *NC = GEMM_BLOCK_NC;
+        
+        if (N >= 16 && M >= 8) {
+            *NR = 16;
+            *MR = (M >= 16) ? 16 : 8;
+        } else if (N >= 8) {
+            *NR = 8;
+            *MR = (M >= 16) ? 16 : 8;
+        } else {
+            *NR = (N >= 6) ? 6 : N;
+            *MR = (M >= 8) ? 8 : M;
+        }
+        
+        goto apply_safety_clamps;
     }
-    else
-    {
-        // Narrow matrices - use 6-column kernels if possible
-        *NR = (N >= 6) ? 6 : N;
-        *MR = (M >= 8) ? 8 : M;
+    
+apply_safety_clamps:
+    *MC = MIN(*MC, M);
+    *KC = MIN(*KC, K);
+    *NC = MIN(*NC, N);
+    
+    const size_t L2_TARGET = 1800 * 1024;
+    size_t workspace_bytes = (*MC * *KC + *KC * *NC) * sizeof(float);
+    
+    if (workspace_bytes > L2_TARGET) {
+        double scale = sqrt((double)L2_TARGET / (double)workspace_bytes);
+        
+        *MC = ((*MC * scale) / *MR) * *MR;
+        *KC = ((*KC * scale) / 8) * 8;
+        *NC = ((*NC * scale) / *NR) * *NR;
+        
+        *MC = MAX(*MC, *MR);
+        *KC = MAX(*KC, ADAPTIVE_KC_MIN);     // ✅ No warnings
+        *NC = MAX(*NC, *NR);
+    }
+    
+    if (*MC < *MR || *NC < *NR || *KC < 8) {
+        *MC = *MR;
+        *KC = ADAPTIVE_KC_MIN;
+        *NC = *NR;
     }
 }
 

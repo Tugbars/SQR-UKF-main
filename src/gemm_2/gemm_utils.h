@@ -14,8 +14,66 @@ extern "C" {
 #endif
 
 //==============================================================================
+// TYPE-SAFE MACROS (GNU C / Clang)
+//==============================================================================
+
+#if defined(__GNUC__) || defined(__clang__)
+
+/**
+ * @brief Type-safe MIN/MAX using GNU C statement expressions
+ * 
+ * Advantages:
+ * - No double evaluation (safe for side effects)
+ * - Type preservation
+ * - Compile-time type checking
+ * 
+ * Usage: MIN(a++, b) is safe (a is only incremented once)
+ */
+#define MIN(a, b) ({ \
+    __typeof__(a) _a = (a); \
+    __typeof__(b) _b = (b); \
+    _a < _b ? _a : _b; \
+})
+
+#define MAX(a, b) ({ \
+    __typeof__(a) _a = (a); \
+    __typeof__(b) _b = (b); \
+    _a > _b ? _a : _b; \
+})
+
+/**
+ * @brief Three-way clamp
+ */
+#define CLAMP(x, lo, hi) ({ \
+    __typeof__(x) _x = (x); \
+    __typeof__(lo) _lo = (lo); \
+    __typeof__(hi) _hi = (hi); \
+    _x < _lo ? _lo : (_x > _hi ? _hi : _x); \
+})
+
+#else
+
+//==============================================================================
+// PORTABLE MACROS (Fallback for MSVC, etc.)
+//==============================================================================
+
+/**
+ * @brief Portable MIN/MAX (careful with side effects!)
+ * 
+ * WARNING: Arguments evaluated twice - do NOT use with side effects
+ * BAD:  MIN(a++, b)  // a is incremented twice!
+ * GOOD: MIN(a, b)    // No side effects
+ */
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define CLAMP(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
+
+#endif
+
+//==============================================================================
 // ALIGNED MEMORY ALLOCATION
 //==============================================================================
+
 
 static inline void* gemm_aligned_alloc(size_t alignment, size_t size) 
 {
