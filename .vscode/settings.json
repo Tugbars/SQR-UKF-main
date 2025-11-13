@@ -11,6 +11,7 @@
         "cmath": "c",
         "stdlib.h": "c",
         "gemm_static.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "typeinfo": "c"
     }
 }

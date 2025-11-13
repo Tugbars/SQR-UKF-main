@@ -7,6 +7,7 @@
 #define GEMM_KERNELS_AVX2_COMPLETE_H
 
 #include "gemm_simd_ops.h"
+#include "gemm_planning.h"
 #include <stdalign.h>
 #include <stdint.h>
 #include <string.h>
@@ -90,113 +91,11 @@
 #define GEMM_MASKLOAD_PS(ptr, mask)         _mm256_maskload_ps(ptr, mask)
 #define GEMM_MASKSTORE_PS(ptr, mask, val)   _mm256_maskstore_ps(ptr, mask, val)
 
-//==============================================================================
-// PREFETCH HELPERS (Always Inline)
-//==============================================================================
-
-/**
- * @brief Build AVX2 mask for partial vector loads/stores
- * @param n Number of valid elements (0-8)
- * @return Mask with -1 for valid elements, 0 for invalid
- */
-static inline __m256i gemm_build_mask_avx2(size_t n)
-{
-    // Create mask for n elements (n must be 0-8)
-    // Each lane needs 0xFFFFFFFF for valid, 0x00000000 for invalid
-    
-    if (n >= 8) {
-        return _mm256_set1_epi32(-1);  // All lanes valid
-    }
-    
-    // Static lookup table approach (fastest)
-    static const int32_t mask_values[9][8] = {
-        {0, 0, 0, 0, 0, 0, 0, 0},          // n=0
-        {-1, 0, 0, 0, 0, 0, 0, 0},         // n=1
-        {-1, -1, 0, 0, 0, 0, 0, 0},        // n=2
-        {-1, -1, -1, 0, 0, 0, 0, 0},       // n=3
-        {-1, -1, -1, -1, 0, 0, 0, 0},      // n=4
-        {-1, -1, -1, -1, -1, 0, 0, 0},     // n=5
-        {-1, -1, -1, -1, -1, -1, 0, 0},    // n=6
-        {-1, -1, -1, -1, -1, -1, -1, 0},   // n=7
-        {-1, -1, -1, -1, -1, -1, -1, -1},  // n=8
-    };
-    
-    return _mm256_setr_epi32(
-        mask_values[n][0], mask_values[n][1], 
-        mask_values[n][2], mask_values[n][3],
-        mask_values[n][4], mask_values[n][5], 
-        mask_values[n][6], mask_values[n][7]
-    );
-}
-
-/**
- * @brief Alternative implementation using comparison (no lookup table)
- */
-static inline __m256i gemm_build_mask_avx2_alt(size_t n)
-{
-    if (n >= 8) {
-        return _mm256_set1_epi32(-1);
-    }
-    
-    // Create index vector [0, 1, 2, 3, 4, 5, 6, 7]
-    __m256i indices = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-    
-    // Create broadcast of n
-    __m256i limit = _mm256_set1_epi32((int32_t)n);
-    
-    // Compare: indices < n gives -1 for true, 0 for false
-    return _mm256_cmpgt_epi32(limit, indices);
-}
-
-/**
- * @brief Compact implementation using shift
- */
-static inline __m256i gemm_build_mask_avx2_compact(size_t n)
-{
-    // For n valid elements, we want n ones followed by (8-n) zeros
-    // This creates a mask: 0xFFFFFFFF for the first n elements
-    
-    if (n >= 8) return _mm256_set1_epi32(-1);
-    if (n == 0) return _mm256_setzero_si256();
-    
-    // Create bitmask with n bits set
-    uint32_t bitmask = (1U << n) - 1;
-    
-    // Expand each bit to a full 32-bit lane
-    int32_t mask[8];
-    for (int i = 0; i < 8; i++) {
-        mask[i] = (bitmask & (1U << i)) ? -1 : 0;
-    }
-    
-    return _mm256_setr_epi32(
-        mask[0], mask[1], mask[2], mask[3],
-        mask[4], mask[5], mask[6], mask[7]
-    );
-}
-
-// Use the first version (lookup table) as the main implementation
-#define gemm_build_mask_avx2 gemm_build_mask_avx2
 
 //==============================================================================
 // HELPER: Build mask for any width (handles > 8)
 //==============================================================================
 
-/**
- * @brief Build mask for any width (used in panel setup)
- * @param n Number of valid elements
- * @param max_width Maximum width (8 or 16)
- * @return Appropriate mask
- */
-static inline __m256i gemm_build_mask_any(size_t n, size_t max_width)
-{
-    if (max_width <= 8) {
-        return gemm_build_mask_avx2(n);
-    } else {
-        // For 16-wide, this would be called twice (once for each half)
-        // The caller handles splitting into lo/hi masks
-        return gemm_build_mask_avx2(n > 8 ? n - 8 : n);
-    }
-}
 
 /**
  * @brief Prefetch output rows for upcoming writes
@@ -1157,8 +1056,8 @@ static inline void gemm_16x6_panel_avx2fma_add(
         gemm_transpose_8x8_avx2(cols_lo);
         gemm_transpose_8x8_avx2(cols_hi);
 
-        // Masked ADD: Load old, add, store back
-        __m256i mask6 = gemm_build_mask_avx2(6);
+        __m256i mask6;
+        gemm_build_mask_avx2(6, &mask6);  // ✅ NEW signature
 
         for (size_t r = 0; r < 8; ++r)
         {
@@ -1263,8 +1162,8 @@ static inline void gemm_16x6_panel_avx2fma_store(
         gemm_transpose_8x8_avx2(cols_lo);
         gemm_transpose_8x8_avx2(cols_hi);
 
-        // Masked STORE: Only write 6 elements
-        __m256i mask6 = gemm_build_mask_avx2(6);
+        __m256i mask6;
+        gemm_build_mask_avx2(6, &mask6);  
 
         for (size_t r = 0; r < 8; ++r)
         {
@@ -1368,8 +1267,8 @@ static inline void gemm_8x6_panel_avx2fma_add(
 
         gemm_transpose_8x8_avx2(cols);
 
-        // Masked ADD
-        __m256i mask6 = gemm_build_mask_avx2(6);
+        __m256i mask6;
+        gemm_build_mask_avx2(6, &mask6);  // ✅ NEW
 
         for (size_t r = 0; r < 8; ++r)
         {
@@ -1470,8 +1369,8 @@ static inline void gemm_8x6_panel_avx2fma_store(
 
         gemm_transpose_8x8_avx2(cols);
 
-        // Masked STORE
-        __m256i mask6 = gemm_build_mask_avx2(6);
+        __m256i mask6;
+        gemm_build_mask_avx2(6, &mask6); 
 
         for (size_t r = 0; r < 8; ++r)
         {

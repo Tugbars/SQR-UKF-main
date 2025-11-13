@@ -99,34 +99,26 @@
  * @param n Number of valid elements (0-8)
  * @return Mask with -1 for valid elements, 0 for invalid
  */
-static inline __m256i gemm_build_mask_avx2(size_t n)
+static inline __m256i gemm_build_mask_avx2_return(size_t n)  // ← Renamed
 {
-    // Create mask for n elements (n must be 0-8)
-    // Each lane needs 0xFFFFFFFF for valid, 0x00000000 for invalid
+    if (n > 8) n = 8;
     
-    if (n >= 8) {
-        return _mm256_set1_epi32(-1);  // All lanes valid
-    }
-    
-    // Static lookup table approach (fastest)
-    static const int32_t mask_values[9][8] = {
-        {0, 0, 0, 0, 0, 0, 0, 0},          // n=0
-        {-1, 0, 0, 0, 0, 0, 0, 0},         // n=1
-        {-1, -1, 0, 0, 0, 0, 0, 0},        // n=2
-        {-1, -1, -1, 0, 0, 0, 0, 0},       // n=3
-        {-1, -1, -1, -1, 0, 0, 0, 0},      // n=4
-        {-1, -1, -1, -1, -1, 0, 0, 0},     // n=5
-        {-1, -1, -1, -1, -1, -1, 0, 0},    // n=6
-        {-1, -1, -1, -1, -1, -1, -1, 0},   // n=7
-        {-1, -1, -1, -1, -1, -1, -1, -1},  // n=8
+    static const union {
+        __m256i v;
+        int32_t i[8];
+    } lut[9] __attribute__((aligned(32))) = {
+        {.i = {0, 0, 0, 0, 0, 0, 0, 0}},
+        {.i = {-1, 0, 0, 0, 0, 0, 0, 0}},
+        {.i = {-1, -1, 0, 0, 0, 0, 0, 0}},
+        {.i = {-1, -1, -1, 0, 0, 0, 0, 0}},
+        {.i = {-1, -1, -1, -1, 0, 0, 0, 0}},
+        {.i = {-1, -1, -1, -1, -1, 0, 0, 0}},
+        {.i = {-1, -1, -1, -1, -1, -1, 0, 0}},
+        {.i = {-1, -1, -1, -1, -1, -1, -1, 0}},
+        {.i = {-1, -1, -1, -1, -1, -1, -1, -1}}
     };
     
-    return _mm256_setr_epi32(
-        mask_values[n][0], mask_values[n][1], 
-        mask_values[n][2], mask_values[n][3],
-        mask_values[n][4], mask_values[n][5], 
-        mask_values[n][6], mask_values[n][7]
-    );
+    return lut[n].v;  // Return by value (may cause alignment issues)
 }
 
 /**

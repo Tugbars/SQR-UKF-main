@@ -14,9 +14,9 @@
  * @date 2025
  */
 
-#include "gemm_planning.h"
 #include "gemm_kernels_avx2.h"
 #include "gemm_simd_ops.h"
+#include "gemm_small.h"
 #include <string.h>
 #include <stdbool.h>
 

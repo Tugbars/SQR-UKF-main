@@ -40,8 +40,8 @@ set(GEMM_CORE_SOURCES
     # Tier 1: Small kernels
     ${GEMM_SRC_DIR}/gemm_small.c
     
-    # Tier 2: Large matrix execution (optional, comment out if not ready)
-    # ${GEMM_SRC_DIR}/gemm_large.c
+    # Tier 2: Large matrix execution (NOW INCLUDED)
+    ${GEMM_SRC_DIR}/gemm_large.c
 )
 
 set(GEMM_CORE_HEADERS
@@ -57,9 +57,8 @@ set(GEMM_CORE_HEADERS
     ${GEMM_SRC_DIR}/gemm_utils.h
     ${GEMM_SRC_DIR}/gemm_simd_ops.h
     
-    # Tier 2 headers (optional)
-    # ${GEMM_SRC_DIR}/gemm_large.h
-    # ${GEMM_SRC_DIR}/gemm_kernels_avx2.h
+    # Tier 2 headers (NOW INCLUDED)
+    ${GEMM_SRC_DIR}/gemm_kernels_avx2.h
 )
 
 #===============================================================================
@@ -115,6 +114,20 @@ if(UNIX OR MINGW)
     target_link_libraries(test_gemm_planning PRIVATE m)
 endif()
 
+# Test 3: Large Matrices (Tier 2) - NEW
+add_executable(test_gemm_large 
+    ${TEST_DIR}/test_gemm_large.c
+    ${TEST_COMMON_HEADER}
+)
+
+target_link_libraries(test_gemm_large PRIVATE gemm_lib)
+target_compile_definitions(test_gemm_large PRIVATE STANDALONE)
+target_compile_options(test_gemm_large PRIVATE ${GEMM_COMPILE_FLAGS})
+
+if(UNIX OR MINGW)
+    target_link_libraries(test_gemm_large PRIVATE m)
+endif()
+
 #===============================================================================
 # Unified Test Runner
 #===============================================================================
@@ -123,6 +136,7 @@ add_executable(test_all
     ${TEST_DIR}/test_main.c
     ${TEST_DIR}/test_gemm_small.c
     ${TEST_DIR}/test_planning.c
+    ${TEST_DIR}/test_gemm_large.c  # NEW
     ${TEST_COMMON_HEADER}
 )
 
@@ -134,19 +148,21 @@ if(UNIX OR MINGW)
 endif()
 
 #===============================================================================
-# CTest Integration (Optional)
+# CTest Integration
 #===============================================================================
 
 enable_testing()
 
 add_test(NAME SmallKernels COMMAND test_gemm_small)
 add_test(NAME Planning COMMAND test_gemm_planning)
+add_test(NAME LargeMatrices COMMAND test_gemm_large)  # NEW
 add_test(NAME AllTests COMMAND test_all)
 
 # Set test properties
 set_tests_properties(SmallKernels PROPERTIES TIMEOUT 60)
 set_tests_properties(Planning PROPERTIES TIMEOUT 60)
-set_tests_properties(AllTests PROPERTIES TIMEOUT 120)
+set_tests_properties(LargeMatrices PROPERTIES TIMEOUT 120)  # NEW - longer timeout for large tests
+set_tests_properties(AllTests PROPERTIES TIMEOUT 180)  # UPDATED - longer timeout
 
 #===============================================================================
 # Custom Targets for Convenience
@@ -155,7 +171,7 @@ set_tests_properties(AllTests PROPERTIES TIMEOUT 120)
 # Run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_all test_gemm_small test_gemm_planning
+    DEPENDS test_all test_gemm_small test_gemm_planning test_gemm_large  # UPDATED
     COMMENT "Running all GEMM tests..."
 )
 
@@ -172,11 +188,38 @@ add_custom_target(run_planning
     COMMENT "Running planning module tests..."
 )
 
+add_custom_target(run_large  # NEW
+    COMMAND test_gemm_large
+    DEPENDS test_gemm_large
+    COMMENT "Running large matrix tests (Tier 2)..."
+)
+
 add_custom_target(run_unified
     COMMAND test_all
     DEPENDS test_all
     COMMENT "Running unified test suite..."
 )
+
+#===============================================================================
+# Performance Benchmark Target (Optional)
+#===============================================================================
+
+#add_executable(benchmark_gemm
+   # ${TEST_DIR}/benchmark_gemm.c
+#)
+
+#target_link_libraries(benchmark_gemm PRIVATE gemm_lib)
+#target_compile_options(benchmark_gemm PRIVATE ${GEMM_COMPILE_FLAGS})
+
+#if(UNIX OR MINGW)
+#    target_link_libraries(benchmark_gemm PRIVATE m)
+#endif()
+
+#add_custom_target(run_benchmark
+#    COMMAND benchmark_gemm
+#    DEPENDS benchmark_gemm
+#    COMMENT "Running GEMM performance benchmarks..."
+#)
 
 #===============================================================================
 # Installation (Optional)
@@ -205,15 +248,17 @@ message(STATUS "Build targets:")
 message(STATUS "  gemm_lib            - Core GEMM library")
 message(STATUS "  test_gemm_small     - Small kernels test (standalone)")
 message(STATUS "  test_gemm_planning  - Planning module test (standalone)")
+message(STATUS "  test_gemm_large     - Large matrices test (standalone)")
 message(STATUS "  test_all            - Unified test runner")
+message(STATUS "  benchmark_gemm      - Performance benchmark")
 message(STATUS "")
 message(STATUS "Custom targets:")
 message(STATUS "  make run_tests      - Run all tests via CTest")
 message(STATUS "  make run_small      - Run small kernel tests")
 message(STATUS "  make run_planning   - Run planning tests")
+message(STATUS "  make run_large      - Run large matrix tests")
 message(STATUS "  make run_unified    - Run unified test suite")
+message(STATUS "  make run_benchmark  - Run performance benchmarks")
 message(STATUS "")
 message(STATUS "Compiler flags: ${GEMM_COMPILE_FLAGS}")
 message(STATUS "====================================")
-
-
