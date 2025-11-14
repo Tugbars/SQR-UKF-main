@@ -1449,7 +1449,7 @@ static inline void gemm_8x6_panel_avx2fma_store(
 // 8×16 KERNEL (ADD): C += A*B
 //==============================================================================
 
-void gemm_8x16_panel_avx2fma_add(
+static inline void gemm_8x16_panel_avx2fma_add(
     float *RESTRICT c,
     size_t ldc,
     const float *RESTRICT Ap, size_t a_k_stride, // ← ADDED
@@ -1653,7 +1653,7 @@ void gemm_8x16_panel_avx2fma_add(
  * @brief FULLY OPTIMIZED 8x16 kernel with dual mask support - STORE variant
  * Overwrites C = A * B (no accumulation)
  */
-void gemm_8x16_panel_avx2fma_store(
+static inline void gemm_8x16_panel_avx2fma_store(
     float *RESTRICT c,
     size_t ldc,
     const float *RESTRICT Ap, size_t a_k_stride, // ← ADDED

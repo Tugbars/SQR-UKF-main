@@ -180,6 +180,7 @@ add_executable(test_all
     ${TEST_DIR}/test_gemm_small.c
     ${TEST_DIR}/test_planning.c
     ${TEST_DIR}/test_gemm_large.c
+    ${TEST_DIR}/test_gemm_validated.c
     ${TEST_COMMON_HEADER}
 )
 

@@ -21,16 +21,6 @@
 // VALIDATION-AWARE ALLOCATION WRAPPER
 //==============================================================================
 
-/**
- * @brief Allocate aligned memory with optional canary protection
- * 
- * In debug builds (GEMM_VALIDATION_LEVEL >= 2):
- *   - Uses GEMM_ALLOC with canary guards
- *   - Verifies alignment
- * 
- * In release builds:
- *   - Uses gemm_aligned_alloc directly
- */
 static void* test_alloc_validated(size_t alignment, size_t size, const char *name)
 {
     void *ptr;
@@ -38,11 +28,9 @@ static void* test_alloc_validated(size_t alignment, size_t size, const char *nam
 #if GEMM_VALIDATION_LEVEL >= 2
     GEMM_ALLOC(ptr, size);
     
-    // Verify alignment (canary allocation might not preserve alignment)
     if (((uintptr_t)ptr & (alignment - 1)) != 0) {
-        printf("    WARNING: %s not %zu-byte aligned: %p\n", 
-               name, alignment, ptr);
-        // Re-allocate with proper alignment
+        printf("    WARNING: %s not " FMT_ZU "-byte aligned: %p\n", 
+               name, CAST_ZU(alignment), ptr);
         GEMM_FREE(ptr);
         ptr = gemm_aligned_alloc(alignment, size);
         if (!ptr) {
@@ -55,21 +43,17 @@ static void* test_alloc_validated(size_t alignment, size_t size, const char *nam
 #endif
     
     if (!ptr) {
-        printf("    ERROR: Allocation failed for %s (%zu bytes)\n", name, size);
+        printf("    ERROR: Allocation failed for %s (" FMT_ZU " bytes)\n", 
+               name, CAST_ZU(size));
         return NULL;
     }
     
     return ptr;
 }
 
-/**
- * @brief Free memory allocated with test_alloc_validated
- */
 static void test_free_validated(void *ptr)
 {
 #if GEMM_VALIDATION_LEVEL >= 2
-    // Check if this is a canary-protected allocation
-    // If ptr is aligned to 32 bytes, it's likely a direct allocation
     if (((uintptr_t)ptr & 31) == 0) {
         gemm_aligned_free(ptr);
     } else {
@@ -84,9 +68,6 @@ static void test_free_validated(void *ptr)
 // VALIDATED PACKING FUNCTIONS
 //==============================================================================
 
-/**
- * @brief Pack A with full bounds checking and validation
- */
 static void pack_A_validated(float *Ap, const float *A, size_t M, size_t K, size_t mr)
 {
     PACK_VALIDATE_PTR(Ap);
@@ -104,14 +85,13 @@ static void pack_A_validated(float *Ap, const float *A, size_t M, size_t K, size
             size_t src_idx = i * K + k;
             
 #if GEMM_VALIDATION_LEVEL >= 2
-            // Bounds check
             if (dst_idx >= K * mr) {
-                VALIDATION_ERROR("pack_A: dst write OOB [%zu] >= %zu",
-                                 dst_idx, K * mr);
+                VALIDATION_ERROR("pack_A: dst write OOB [" FMT_ZU "] >= " FMT_ZU,
+                                 CAST_ZU(dst_idx), CAST_ZU(K * mr));
             }
             if (src_idx >= M * K) {
-                VALIDATION_ERROR("pack_A: src read OOB [%zu] >= %zu",
-                                 src_idx, M * K);
+                VALIDATION_ERROR("pack_A: src read OOB [" FMT_ZU "] >= " FMT_ZU,
+                                 CAST_ZU(src_idx), CAST_ZU(M * K));
             }
 #endif
             
@@ -120,18 +100,14 @@ static void pack_A_validated(float *Ap, const float *A, size_t M, size_t K, size
     }
     
 #if GEMM_VALIDATION_LEVEL >= 2
-    // Check for NaN/Inf
     for (size_t i = 0; i < K * mr; i++) {
         if (isnan(Ap[i]) || isinf(Ap[i])) {
-            VALIDATION_ERROR("pack_A: NaN/Inf at [%zu]", i);
+            VALIDATION_ERROR("pack_A: NaN/Inf at [" FMT_ZU "]", CAST_ZU(i));
         }
     }
 #endif
 }
 
-/**
- * @brief Pack B with full bounds checking and validation
- */
 static void pack_B_validated(float *Bp, const float *B, size_t K, size_t N)
 {
     PACK_VALIDATE_PTR(Bp);
@@ -150,12 +126,12 @@ static void pack_B_validated(float *Bp, const float *B, size_t K, size_t N)
             
 #if GEMM_VALIDATION_LEVEL >= 2
             if (dst_idx >= K * NR) {
-                VALIDATION_ERROR("pack_B: dst write OOB [%zu] >= %zu",
-                                 dst_idx, K * NR);
+                VALIDATION_ERROR("pack_B: dst write OOB [" FMT_ZU "] >= " FMT_ZU,
+                                 CAST_ZU(dst_idx), CAST_ZU(K * NR));
             }
             if (src_idx >= K * N) {
-                VALIDATION_ERROR("pack_B: src read OOB [%zu] >= %zu",
-                                 src_idx, K * N);
+                VALIDATION_ERROR("pack_B: src read OOB [" FMT_ZU "] >= " FMT_ZU,
+                                 CAST_ZU(src_idx), CAST_ZU(K * N));
             }
 #endif
             
@@ -164,10 +140,9 @@ static void pack_B_validated(float *Bp, const float *B, size_t K, size_t N)
     }
     
 #if GEMM_VALIDATION_LEVEL >= 2
-    // Check for NaN/Inf
     for (size_t i = 0; i < K * NR; i++) {
         if (isnan(Bp[i]) || isinf(Bp[i])) {
-            VALIDATION_ERROR("pack_B: NaN/Inf at [%zu]", i);
+            VALIDATION_ERROR("pack_B: NaN/Inf at [" FMT_ZU "]", CAST_ZU(i));
         }
     }
 #endif
@@ -195,8 +170,8 @@ static int check_no_sentinels(const float *ptr, size_t count, const char *name)
 #if GEMM_VALIDATION_LEVEL >= 2
     for (size_t i = 0; i < count; i++) {
         if (ptr[i] == SENTINEL_VALUE) {
-            printf("  ERROR: %s has uninitialized output at [%zu] (sentinel still present)\n",
-                   name, i);
+            printf("  ERROR: %s has uninitialized output at [" FMT_ZU "] (sentinel still present)\n",
+                   name, CAST_ZU(i));
             return 0;
         }
     }
@@ -206,7 +181,7 @@ static int check_no_sentinels(const float *ptr, size_t count, const char *name)
 }
 
 //==============================================================================
-// MASK GENERATION (unchanged from original)
+// MASK GENERATION
 //==============================================================================
 
 inline void gemm_test_build_mask_avx2(size_t n, __m256i *out)
@@ -252,7 +227,7 @@ inline void gemm_test_build_mask_pair16(size_t w, __m256i *lo, __m256i *hi)
 }
 
 //==============================================================================
-// REFERENCE IMPLEMENTATION & COMPARISON (unchanged)
+// REFERENCE IMPLEMENTATION & COMPARISON
 //==============================================================================
 
 static void ref_gemm_simple(
@@ -305,27 +280,17 @@ static int compare_matrices_verbose(
             if (err > tol) {
                 errors++;
                 if (errors <= 5) {
-#ifdef _WIN32
-                    printf("  ERROR at [%llu,%llu]: test=%.6f, ref=%.6f, diff=%.6f\n",
-                           (unsigned long long)i, (unsigned long long)j, t, r, err);
-#else
-                    printf("  ERROR at [%zu,%zu]: test=%.6f, ref=%.6f, diff=%.6f\n",
-                           i, j, t, r, err);
-#endif
+                    printf("  ERROR at [" FMT_ZU "," FMT_ZU "]: test=%.6f, ref=%.6f, diff=%.6f\n",
+                           CAST_ZU(i), CAST_ZU(j), t, r, err);
                 }
             }
         }
     }
 
     if (errors > 0) {
-#ifdef _WIN32
-        printf("  %s FAILED: %d errors, max error %.6f at [%llu,%llu]\n",
+        printf("  %s FAILED: %d errors, max error %.6f at [" FMT_ZU "," FMT_ZU "]\n",
                test_name, errors, max_error,
-               (unsigned long long)error_i, (unsigned long long)error_j);
-#else
-        printf("  %s FAILED: %d errors, max error %.6f at [%zu,%zu]\n",
-               test_name, errors, max_error, error_i, error_j);
-#endif
+               CAST_ZU(error_i), CAST_ZU(error_j));
         return 0;
     }
 
@@ -348,7 +313,6 @@ static int test_kernel_8x8_validated(void)
 
     printf("  Allocating buffers...\n");
     
-    // Allocate with validation
     float *A = test_alloc_validated(32, M * K * sizeof(float), "A");
     float *B = test_alloc_validated(32, K * N * sizeof(float), "B");
     float *C_test = test_alloc_validated(32, M * N * sizeof(float), "C_test");
@@ -367,7 +331,7 @@ static int test_kernel_8x8_validated(void)
     for (size_t i = 0; i < K * N; i++)
         B[i] = (i % 5) * 0.1f;
 
-    printf("  Packing A (MR=%zu)...\n", MR);
+    printf("  Packing A (MR=" FMT_ZU ")...\n", CAST_ZU(MR));
     pack_A_validated(Ap, A, M, K, MR);
     
 #if GEMM_VALIDATION_LEVEL >= 2
@@ -383,7 +347,6 @@ static int test_kernel_8x8_validated(void)
     GEMM_VALIDATE(Bp, K * 16 * sizeof(float));
 #endif
 
-    // Test STORE variant
     printf("  Testing STORE variant...\n");
     fill_sentinel(C_test, M * N);
     memset(C_ref, 0, M * N * sizeof(float));
@@ -420,7 +383,6 @@ static int test_kernel_8x8_validated(void)
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
     int passed = compare_matrices_verbose(C_test, C_ref, M, N, ldc, 1e-5f, "8x8 STORE");
 
-    // Test ADD variant
     printf("  Testing ADD variant...\n");
     for (size_t i = 0; i < M * N; i++) {
         C_test[i] = 1.0f;
@@ -508,7 +470,6 @@ static int test_kernel_16x8_validated(void)
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
     int passed = compare_matrices_verbose(C_test, C_ref, M, N, ldc, 5e-5f, "16x8 STORE");
 
-    // Test ADD
     for (size_t i = 0; i < M * N; i++) {
         C_test[i] = 0.5f;
         C_ref[i] = 0.5f;
@@ -529,10 +490,10 @@ static int test_kernel_16x8_validated(void)
 }
 
 //==============================================================================
-// MAIN TEST RUNNER
+// TEST RUNNER (callable from test_main.c)
 //==============================================================================
 
-int main(void)
+int run_gemm_validated_tests(test_results_t *results)
 {
     printf("=================================================\n");
     printf("    VALIDATED GEMM KERNEL UNIT TESTS\n");
@@ -556,17 +517,35 @@ int main(void)
         passed++;
     }
 
-    // Add more tests here...
+    // Populate results structure
+    if (results) {
+        results->total = total;
+        results->passed = passed;
+        results->failed = total - passed;
+    }
 
     printf("\n=================================================\n");
     printf("Results: %d/%d tests passed\n", passed, total);
     
     if (passed == total) {
-        printf("✓ All tests PASSED!\n");
+        printf("✓ All validated tests PASSED!\n");
     } else {
-        printf("✗ %d tests FAILED\n", total - passed);
+        printf("✗ %d validated test(s) FAILED\n", total - passed);
     }
     printf("=================================================\n");
 
-    return (passed == total) ? 0 : 1;
+    return (passed == total) ? 1 : 0;
 }
+
+//==============================================================================
+// STANDALONE MAIN (only when compiled as standalone executable)
+//==============================================================================
+
+#ifdef STANDALONE
+int main(void)
+{
+    test_results_t results = {0};
+    int success = run_gemm_validated_tests(&results);
+    return success ? 0 : 1;
+}
+#endif

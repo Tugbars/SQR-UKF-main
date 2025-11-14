@@ -155,14 +155,14 @@
 
 #if GEMM_VALIDATION_LEVEL >= 2
 
-#define PACK_CHECK_BOUNDS(ptr, offset, size)                                \
-    do                                                                      \
-    {                                                                       \
-        if ((offset) > (size))                                              \
-        {                                                                   \
-            VALIDATION_ERROR("Pack bounds violation: " FMT_ZU " > " FMT_ZU, \
-                             CAST_ZU(offset), CAST_ZU(size));               \
-        }                                                                   \
+#define PACK_CHECK_BOUNDS(ptr, offset, size)                                 \
+    do                                                                       \
+    {                                                                        \
+        if ((offset) >= (size))                                              \
+        {                                                                    \
+            VALIDATION_ERROR("Pack bounds violation: " FMT_ZU " >= " FMT_ZU, \
+                             CAST_ZU(offset), CAST_ZU(size));                \
+        }                                                                    \
     } while (0)
 
 #else
@@ -179,11 +179,15 @@
 #define GEMM_CANARY_SIZE 8 // 8 bytes prefix + 8 bytes suffix
 
 /**
- * @brief Allocate memory with canary guards
+ * @brief Allocate aligned memory with canary guards
+ * @param size User data size
+ * @param alignment Required alignment (must be power of 2, >= 32)
  */
-static inline void *gemm_validate_alloc(size_t size, const char *file, int line)
+static inline void *gemm_validate_alloc_aligned(size_t size, size_t alignment,
+                                                const char *file, int line)
 {
-    size_t total = size + 2 * GEMM_CANARY_SIZE;
+    // Round up to include canaries while maintaining alignment
+    size_t total = size + 2 * GEMM_CANARY_SIZE + alignment;
     void *raw = malloc(total);
 
     if (!raw)
@@ -193,20 +197,25 @@ static inline void *gemm_validate_alloc(size_t size, const char *file, int line)
         abort();
     }
 
-    uint8_t *base = (uint8_t *)raw;
+    // Find aligned position after prefix canary
+    uintptr_t raw_addr = (uintptr_t)raw;
+    uintptr_t user_addr = (raw_addr + GEMM_CANARY_SIZE + alignment - 1) & ~(alignment - 1);
+    uint8_t *user = (uint8_t *)user_addr;
+    uint8_t *base = user - GEMM_CANARY_SIZE;
 
     // Write prefix canary
     *(uint32_t *)base = GEMM_CANARY_VALUE;
     *(uint32_t *)(base + 4) = GEMM_CANARY_VALUE;
 
     // Write suffix canary
-    *(uint32_t *)(base + GEMM_CANARY_SIZE + size) = GEMM_CANARY_VALUE;
-    *(uint32_t *)(base + GEMM_CANARY_SIZE + size + 4) = GEMM_CANARY_VALUE;
+    *(uint32_t *)(user + size) = GEMM_CANARY_VALUE;
+    *(uint32_t *)(user + size + 4) = GEMM_CANARY_VALUE;
 
-    void *user = base + GEMM_CANARY_SIZE;
+    // Store raw pointer before canary for free()
+    *((void **)(base - sizeof(void *))) = raw;
 
-    VALIDATION_LOG("Allocated " FMT_ZU " bytes at %p (with canaries)",
-                   CAST_ZU(size), user);
+    VALIDATION_LOG("Allocated " FMT_ZU " bytes at %p (with canaries, aligned to " FMT_ZU ")",
+                   CAST_ZU(size), user, CAST_ZU(alignment));
 
     return user;
 }
@@ -261,13 +270,16 @@ static inline void gemm_validate_free(void *ptr, const char *file, int line)
     uint8_t *user = (uint8_t *)ptr;
     uint8_t *base = user - GEMM_CANARY_SIZE;
 
+    // Retrieve original malloc pointer
+    void *raw = *((void **)(base - sizeof(void *)));
+
     VALIDATION_LOG("Freeing %p", ptr);
 
-    free(base);
+    free(raw);
 }
 
 #define GEMM_ALLOC(ptr, size) \
-    (ptr) = gemm_validate_alloc((size), __FILE__, __LINE__)
+    (ptr) = gemm_validate_alloc_aligned((size), 32, __FILE__, __LINE__)
 
 #define GEMM_VALIDATE(ptr, size) \
     gemm_validate_bounds((ptr), (size), __FILE__, __LINE__)
