@@ -683,10 +683,13 @@ static inline void gemm_8x8_panel_avx2fma_add(
  */
 static inline void gemm_8x8_panel_avx2fma_store(
     float *RESTRICT c, size_t ldc,
-    const float *RESTRICT Ap,
-    const float *RESTRICT Bp,
+    const float *RESTRICT Ap, size_t a_k_stride,  // ← ADD THIS
+    const float *RESTRICT Bp, size_t b_k_stride,  // ← ADD THIS
     size_t Kblk, size_t m, size_t n, __m256i mask)
 {
+    assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
+    assert(b_k_stride == 16 && "All kernels require B stride=16");
+
     LINALG_ASSUME_ALIGNED(c, 32);
     LINALG_ASSUME_ALIGNED(Ap, 32);
     LINALG_ASSUME_ALIGNED(Bp, 32);
@@ -701,61 +704,42 @@ static inline void gemm_8x8_panel_avx2fma_store(
 
     if (Kblk)
     {
-        // --- Prime ---
         size_t k = 0;
-        __m256 a = _mm256_load_ps(Ap + 0 * 8);
-        const float *brow = Bp + 0 * 8;
+        __m256 a      = _mm256_load_ps(Ap + 0 * a_k_stride);  // ← USE STRIDE
+        const float *brow = Bp + 0 * b_k_stride;              // ← USE STRIDE
 
-        // --- Steady state: 1-step pipeline ---
         for (; k + 1 < Kblk; ++k)
         {
-            if (do_pf)
-                PREFETCH_T0(Bp + (k + 8) * 8);
+            if (do_pf) PREFETCH_T0(Bp + (k + 8) * b_k_stride);  // ← USE STRIDE
 
-            __m256 a_next = _mm256_load_ps(Ap + (k + 1) * 8);
-            const float *b_next = Bp + (k + 1) * 8;
+            __m256 a_next        = _mm256_load_ps(Ap + (k + 1) * a_k_stride);  // ← USE STRIDE
+            const float *b_next  = Bp + (k + 1) * b_k_stride;                  // ← USE STRIDE
 
             __m256 b;
-            b = _mm256_broadcast_ss(brow + 0);
-            acc0 = _mm256_fmadd_ps(a, b, acc0);
-            b = _mm256_broadcast_ss(brow + 1);
-            acc1 = _mm256_fmadd_ps(a, b, acc1);
-            b = _mm256_broadcast_ss(brow + 2);
-            acc2 = _mm256_fmadd_ps(a, b, acc2);
-            b = _mm256_broadcast_ss(brow + 3);
-            acc3 = _mm256_fmadd_ps(a, b, acc3);
-            b = _mm256_broadcast_ss(brow + 4);
-            acc4 = _mm256_fmadd_ps(a, b, acc4);
-            b = _mm256_broadcast_ss(brow + 5);
-            acc5 = _mm256_fmadd_ps(a, b, acc5);
-            b = _mm256_broadcast_ss(brow + 6);
-            acc6 = _mm256_fmadd_ps(a, b, acc6);
-            b = _mm256_broadcast_ss(brow + 7);
-            acc7 = _mm256_fmadd_ps(a, b, acc7);
+            b = _mm256_broadcast_ss(brow + 0); acc0 = _mm256_fmadd_ps(a, b, acc0);
+            b = _mm256_broadcast_ss(brow + 1); acc1 = _mm256_fmadd_ps(a, b, acc1);
+            b = _mm256_broadcast_ss(brow + 2); acc2 = _mm256_fmadd_ps(a, b, acc2);
+            b = _mm256_broadcast_ss(brow + 3); acc3 = _mm256_fmadd_ps(a, b, acc3);
+            b = _mm256_broadcast_ss(brow + 4); acc4 = _mm256_fmadd_ps(a, b, acc4);
+            b = _mm256_broadcast_ss(brow + 5); acc5 = _mm256_fmadd_ps(a, b, acc5);
+            b = _mm256_broadcast_ss(brow + 6); acc6 = _mm256_fmadd_ps(a, b, acc6);
+            b = _mm256_broadcast_ss(brow + 7); acc7 = _mm256_fmadd_ps(a, b, acc7);
 
-            a = a_next;
-            brow = b_next;
+            a     = a_next;
+            brow  = b_next;
         }
 
-        // --- Epilogue ---
+        // Epilogue
         {
             __m256 b;
-            b = _mm256_broadcast_ss(brow + 0);
-            acc0 = _mm256_fmadd_ps(a, b, acc0);
-            b = _mm256_broadcast_ss(brow + 1);
-            acc1 = _mm256_fmadd_ps(a, b, acc1);
-            b = _mm256_broadcast_ss(brow + 2);
-            acc2 = _mm256_fmadd_ps(a, b, acc2);
-            b = _mm256_broadcast_ss(brow + 3);
-            acc3 = _mm256_fmadd_ps(a, b, acc3);
-            b = _mm256_broadcast_ss(brow + 4);
-            acc4 = _mm256_fmadd_ps(a, b, acc4);
-            b = _mm256_broadcast_ss(brow + 5);
-            acc5 = _mm256_fmadd_ps(a, b, acc5);
-            b = _mm256_broadcast_ss(brow + 6);
-            acc6 = _mm256_fmadd_ps(a, b, acc6);
-            b = _mm256_broadcast_ss(brow + 7);
-            acc7 = _mm256_fmadd_ps(a, b, acc7);
+            b = _mm256_broadcast_ss(brow + 0); acc0 = _mm256_fmadd_ps(a, b, acc0);
+            b = _mm256_broadcast_ss(brow + 1); acc1 = _mm256_fmadd_ps(a, b, acc1);
+            b = _mm256_broadcast_ss(brow + 2); acc2 = _mm256_fmadd_ps(a, b, acc2);
+            b = _mm256_broadcast_ss(brow + 3); acc3 = _mm256_fmadd_ps(a, b, acc3);
+            b = _mm256_broadcast_ss(brow + 4); acc4 = _mm256_fmadd_ps(a, b, acc4);
+            b = _mm256_broadcast_ss(brow + 5); acc5 = _mm256_fmadd_ps(a, b, acc5);
+            b = _mm256_broadcast_ss(brow + 6); acc6 = _mm256_fmadd_ps(a, b, acc6);
+            b = _mm256_broadcast_ss(brow + 7); acc7 = _mm256_fmadd_ps(a, b, acc7);
         }
     }
 
@@ -771,10 +755,8 @@ static inline void gemm_8x8_panel_avx2fma_store(
         for (size_t r = 0; r < 8; ++r)
         {
             float *cr = c + r * ldc;
-            if (use_nt)
-                GEMM_STREAM_PS(cr, cols[r]);
-            else
-                GEMM_STORE_PS(cr, cols[r]);
+            if (use_nt) GEMM_STREAM_PS(cr, cols[r]);
+            else        GEMM_STORE_PS(cr, cols[r]);
         }
     }
     else
