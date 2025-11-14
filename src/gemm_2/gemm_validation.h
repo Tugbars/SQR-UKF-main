@@ -1,384 +1,411 @@
 /**
  * @file gemm_validation.h
- * @brief UNIFIED runtime validation for GEMM kernels & packing (v2.2 - Enhanced)
+ * @brief Unified validation macros for GEMM operations (works everywhere)
  *
- * NEW IN v2.2:
- * - Packed buffer access validation
- * - Kernel pre/post validation hooks
- * - Buffer size tracking
- * - Enhanced debugging for intermittent crashes
+ * Validation levels:
+ *   0 = Disabled (release builds)
+ *   1 = Basic checks (NULL, alignment, dimensions)
+ *   2 = Full checks (+ canaries, bounds, NaN/Inf detection)
+ *
+ * Usage:
+ *   Debug:   -DGEMM_VALIDATION_LEVEL=2
+ *   Release: -DGEMM_VALIDATION_LEVEL=0 or -DNDEBUG
  */
 
 #ifndef GEMM_VALIDATION_H
 #define GEMM_VALIDATION_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#include <assert.h>
 
-// Platform-specific includes
-#if defined(__linux__)
-#include <unistd.h>
-#elif defined(_MSC_VER)
-#include <crtdbg.h>
+//==============================================================================
+// CROSS-PLATFORM FORMAT SPECIFIERS
+//==============================================================================
+
+#ifdef _WIN32
+// Windows: Use %llu for size_t
+#define FMT_ZU "%llu"
+#define CAST_ZU(x) ((unsigned long long)(x))
+#else
+// Linux/macOS: Use standard %zu
+#define FMT_ZU "%zu"
+#define CAST_ZU(x) ((size_t)(x))
 #endif
 
 //==============================================================================
-// UNIFIED DIAGNOSTIC MACROS
+// VALIDATION LEVEL
 //==============================================================================
 
-#define VALIDATION_ASSERT(cond, msg, ...)                              \
-    do                                                                 \
-    {                                                                  \
-        if (!(cond))                                                   \
-        {                                                              \
-            VALIDATION_ERROR("Assertion failed: " msg, ##__VA_ARGS__); \
-        }                                                              \
-    } while (0)
+#ifndef GEMM_VALIDATION_LEVEL
+#if defined(NDEBUG)
+#define GEMM_VALIDATION_LEVEL 0 // Release: no validation
+#else
+#define GEMM_VALIDATION_LEVEL 2 // Debug: full validation
+#endif
+#endif
 
-#if GEMM_VALIDATION_VERBOSE
-#define VALIDATION_LOG(msg, ...)                                  \
-    do                                                            \
-    {                                                             \
-        fprintf(stderr, "[VALIDATION] " msg "\n", ##__VA_ARGS__); \
-        fflush(stderr);                                           \
+//==============================================================================
+// ERROR REPORTING
+//==============================================================================
+
+#if GEMM_VALIDATION_LEVEL > 0
+#define VALIDATION_ERROR(fmt, ...)                                   \
+    do                                                               \
+    {                                                                \
+        fprintf(stderr, "\n❌ VALIDATION ERROR at %s:%d: " fmt "\n", \
+                __FILE__, __LINE__, ##__VA_ARGS__);                  \
+        fflush(stderr);                                              \
+        abort();                                                     \
     } while (0)
 #else
-#define VALIDATION_LOG(msg, ...) ((void)0)
+#define VALIDATION_ERROR(fmt, ...) ((void)0)
 #endif
 
 //==============================================================================
-// POINTER & ALIGNMENT VALIDATION (Level >= 1)
+// VERBOSE LOGGING (only if explicitly enabled)
+//==============================================================================
+
+#ifdef GEMM_VALIDATION_VERBOSE
+#define VALIDATION_LOG(fmt, ...) \
+    fprintf(stderr, "[VALIDATION] " fmt "\n", ##__VA_ARGS__)
+#else
+#define VALIDATION_LOG(fmt, ...) ((void)0)
+#endif
+
+//==============================================================================
+// BASIC VALIDATION MACROS (Level 1+)
 //==============================================================================
 
 #if GEMM_VALIDATION_LEVEL >= 1
 
-// Platform-specific heap validation
-#if defined(_MSC_VER) && defined(_DEBUG)
-#define VALIDATE_HEAP_PTR(ptr)                                    \
-    do                                                            \
-    {                                                             \
-        if (_CrtIsValidHeapPointer((const void *)(ptr)) == FALSE) \
-        {                                                         \
-            VALIDATION_ERROR("Invalid heap pointer: %p", (ptr));  \
-        }                                                         \
-    } while (0)
-#elif defined(__linux__)
-#define VALIDATE_HEAP_PTR(ptr)                                            \
-    do                                                                    \
-    {                                                                     \
-        const void *p = (const void *)(ptr);                              \
-        volatile char test_byte;                                          \
-        __asm__ __volatile__("" ::: "memory");                            \
-        test_byte = *(volatile const char *)p; /* Will SEGV if invalid */ \
-        (void)test_byte;                                                  \
-        __asm__ __volatile__("" ::: "memory");                            \
-    } while (0)
-#else
-#define VALIDATE_HEAP_PTR(ptr) ((void)0)
-#endif
-
+/**
+ * @brief Validate pointer is non-NULL
+ */
 #define VALIDATE_PTR(ptr)                               \
     do                                                  \
     {                                                   \
-        if ((ptr) == NULL)                              \
+        if (!(ptr))                                     \
         {                                               \
             VALIDATION_ERROR("NULL pointer: %s", #ptr); \
         }                                               \
-        VALIDATE_HEAP_PTR(ptr);                         \
     } while (0)
 
-// Kernel entry macro
-#define GEMM_KERNEL_ENTRY(C, ldc, A, a_stride, B, b_stride, K, M, N) \
-    do                                                               \
-    {                                                                \
-        VALIDATE_PTR(C);                                             \
-        VALIDATE_PTR(A);                                             \
-        VALIDATE_PTR(B);                                             \
-        VALIDATE_ALIGNED(C, GEMM_ALIGNMENT);                         \
-        VALIDATE_ALIGNED(A, GEMM_ALIGNMENT);                         \
-        VALIDATE_ALIGNED(B, GEMM_ALIGNMENT);                         \
-        VALIDATION_LOG("Kernel entry: M=%zu K=%zu N=%zu",            \
-                       (size_t)(M), (size_t)(K), (size_t)(N));       \
+/**
+ * @brief Validate 32-byte alignment
+ */
+#define VALIDATE_ALIGNED(ptr)                                                   \
+    do                                                                          \
+    {                                                                           \
+        if (((uintptr_t)(ptr) & 31) != 0)                                       \
+        {                                                                       \
+            VALIDATION_ERROR("Misaligned pointer %s: %p (not 32-byte aligned)", \
+                             #ptr, (void *)(ptr));                              \
+        }                                                                       \
     } while (0)
 
-// Packing entry macros
-#define PACK_VALIDATE_PTR(ptr) VALIDATE_PTR(ptr)
-#define PACK_VALIDATE_ALIGNED(ptr) VALIDATE_ALIGNED(ptr, GEMM_ALIGNMENT)
-
-#else
-#define VALIDATE_PTR(ptr) ((void)0)
-#define VALIDATE_ALIGNED(ptr, alignment) ((void)0)
-#define GEMM_KERNEL_ENTRY(C, ldc, A, a_stride, B, b_stride, K, M, N) ((void)0)
-#define PACK_VALIDATE_PTR(ptr) ((void)0)
-#define PACK_VALIDATE_ALIGNED(ptr) ((void)0)
-#endif
-
-//==============================================================================
-// DIMENSION VALIDATION (Level >= 1)
-//==============================================================================
-
-#if GEMM_VALIDATION_LEVEL >= 1
-
-#define VALIDATE_DIM(val, min, max, name)                                          \
-    do                                                                             \
-    {                                                                              \
-        if ((val) < (min) || (val) > (max))                                        \
-        {                                                                          \
-            VALIDATION_ERROR("Invalid %s dimension: %zu (expected [%zu, %zu])",    \
-                             (name), (size_t)(val), (size_t)(min), (size_t)(max)); \
-        }                                                                          \
-    } while (0)
-
-#define PACK_CHECK_MR(mr)                                         \
+/**
+ * @brief Validate leading dimension
+ */
+#define VALIDATE_LDC(ldc, n)                                      \
     do                                                            \
     {                                                             \
-        if ((mr) != 8 && (mr) != 16)                              \
+        if ((ldc) < (n))                                          \
         {                                                         \
-            VALIDATION_ERROR("Invalid MR: %zu (must be 8 or 16)", \
-                             (size_t)(mr));                       \
+            VALIDATION_ERROR("Invalid ldc: " FMT_ZU " < " FMT_ZU, \
+                             CAST_ZU(ldc), CAST_ZU(n));           \
         }                                                         \
     } while (0)
 
 #else
-#define VALIDATE_DIM(val, min, max, name) ((void)0)
+#define VALIDATE_PTR(ptr) ((void)0)
+#define VALIDATE_ALIGNED(ptr) ((void)0)
+#define VALIDATE_LDC(ldc, n) ((void)0)
+#endif
+
+//==============================================================================
+// PACKING VALIDATION (Level 1+)
+//==============================================================================
+
+#if GEMM_VALIDATION_LEVEL >= 1
+
+#define PACK_VALIDATE_PTR(ptr) VALIDATE_PTR(ptr)
+#define PACK_VALIDATE_ALIGNED(ptr) VALIDATE_ALIGNED(ptr)
+
+#define PACK_CHECK_MR(mr)                                                \
+    do                                                                   \
+    {                                                                    \
+        if ((mr) != 8 && (mr) != 16)                                     \
+        {                                                                \
+            VALIDATION_ERROR("Invalid MR: " FMT_ZU " (must be 8 or 16)", \
+                             CAST_ZU(mr));                               \
+        }                                                                \
+    } while (0)
+
+#else
+#define PACK_VALIDATE_PTR(ptr) ((void)0)
+#define PACK_VALIDATE_ALIGNED(ptr) ((void)0)
 #define PACK_CHECK_MR(mr) ((void)0)
 #endif
 
 //==============================================================================
-// BOUNDS CHECKING (Level >= 2)
+// BOUNDS CHECKING (Level 2 only)
+//==============================================================================
+
+#if GEMM_VALIDATION_LEVEL >= 2
+
+#define PACK_CHECK_BOUNDS(ptr, offset, size)                                \
+    do                                                                      \
+    {                                                                       \
+        if ((offset) > (size))                                              \
+        {                                                                   \
+            VALIDATION_ERROR("Pack bounds violation: " FMT_ZU " > " FMT_ZU, \
+                             CAST_ZU(offset), CAST_ZU(size));               \
+        }                                                                   \
+    } while (0)
+
+#else
+#define PACK_CHECK_BOUNDS(ptr, offset, size) ((void)0)
+#endif
+
+//==============================================================================
+// CANARY PROTECTION (Level 2 only)
 //==============================================================================
 
 #if GEMM_VALIDATION_LEVEL >= 2
 
 #define GEMM_CANARY_VALUE 0xCAFEBABE
-#define GEMM_CANARY_SIZE 8 // 2 x uint32_t at each end
+#define GEMM_CANARY_SIZE 8 // 8 bytes prefix + 8 bytes suffix
 
-static inline void *gemm_validate_alloc(size_t size)
+/**
+ * @brief Allocate memory with canary guards
+ */
+static inline void *gemm_validate_alloc(size_t size, const char *file, int line)
 {
     size_t total = size + 2 * GEMM_CANARY_SIZE;
-    char *base = (char *)malloc(total);
-    if (!base)
-        VALIDATION_ERROR("Allocation failed: %zu bytes", (size_t)total);
+    void *raw = malloc(total);
 
-    // Prefix & suffix canaries
+    if (!raw)
+    {
+        fprintf(stderr, "❌ ALLOCATION FAILED at %s:%d (size=" FMT_ZU ")\n",
+                file, line, CAST_ZU(size));
+        abort();
+    }
+
+    uint8_t *base = (uint8_t *)raw;
+
+    // Write prefix canary
     *(uint32_t *)base = GEMM_CANARY_VALUE;
     *(uint32_t *)(base + 4) = GEMM_CANARY_VALUE;
-    *(uint32_t *)(base + total - 8) = GEMM_CANARY_VALUE;
-    *(uint32_t *)(base + total - 4) = GEMM_CANARY_VALUE;
 
-    VALIDATION_LOG("Allocated %zu bytes at %p (user ptr: %p)",
-                   total, (void *)base, (void *)(base + GEMM_CANARY_SIZE));
+    // Write suffix canary
+    *(uint32_t *)(base + GEMM_CANARY_SIZE + size) = GEMM_CANARY_VALUE;
+    *(uint32_t *)(base + GEMM_CANARY_SIZE + size + 4) = GEMM_CANARY_VALUE;
 
-    return base + GEMM_CANARY_SIZE;
+    void *user = base + GEMM_CANARY_SIZE;
+
+    VALIDATION_LOG("Allocated " FMT_ZU " bytes at %p (with canaries)",
+                   CAST_ZU(size), user);
+
+    return user;
 }
 
-static inline void gemm_validate_bounds(const void *ptr, size_t size)
+/**
+ * @brief Check canary guards
+ */
+static inline void gemm_validate_bounds(const void *ptr, size_t size,
+                                        const char *file, int line)
 {
-    const char *base = (const char *)ptr - GEMM_CANARY_SIZE;
-    size_t total = size + 2 * GEMM_CANARY_SIZE;
+    const uint8_t *user = (const uint8_t *)ptr;
+    const uint8_t *base = user - GEMM_CANARY_SIZE;
 
-    VALIDATION_LOG("Validating bounds for ptr=%p, size=%zu", ptr, size);
+    // Check prefix canary
+    uint32_t prefix1 = *(const uint32_t *)base;
+    uint32_t prefix2 = *(const uint32_t *)(base + 4);
 
-    if (*(uint32_t *)base != GEMM_CANARY_VALUE ||
-        *(uint32_t *)(base + 4) != GEMM_CANARY_VALUE)
+    if (prefix1 != GEMM_CANARY_VALUE || prefix2 != GEMM_CANARY_VALUE)
     {
-        VALIDATION_ERROR("Buffer underflow at %p (prefix canary corrupted)", ptr);
+        fprintf(stderr,
+                "\n❌ BUFFER UNDERFLOW at %s:%d\n"
+                "   Pointer: %p\n"
+                "   Prefix canary corrupted: 0x%08X 0x%08X (expected 0x%08X)\n",
+                file, line, ptr, prefix1, prefix2, GEMM_CANARY_VALUE);
+        abort();
     }
-    if (*(uint32_t *)(base + total - 8) != GEMM_CANARY_VALUE ||
-        *(uint32_t *)(base + total - 4) != GEMM_CANARY_VALUE)
+
+    // Check suffix canary
+    uint32_t suffix1 = *(const uint32_t *)(user + size);
+    uint32_t suffix2 = *(const uint32_t *)(user + size + 4);
+
+    if (suffix1 != GEMM_CANARY_VALUE || suffix2 != GEMM_CANARY_VALUE)
     {
-        VALIDATION_ERROR("Buffer overflow at %p (suffix canary corrupted)", ptr);
+        fprintf(stderr,
+                "\n❌ BUFFER OVERFLOW at %s:%d\n"
+                "   Pointer: %p\n"
+                "   Size: " FMT_ZU " bytes\n"
+                "   Suffix canary corrupted: 0x%08X 0x%08X (expected 0x%08X)\n",
+                file, line, ptr, CAST_ZU(size), suffix1, suffix2, GEMM_CANARY_VALUE);
+        abort();
     }
 }
 
-#define PACK_CHECK_BOUNDS(ptr, offset_bytes, buffer_size_bytes)                              \
-    do                                                                                       \
-    {                                                                                        \
-        if ((offset_bytes) > (buffer_size_bytes))                                            \
-        {                                                                                    \
-            VALIDATION_ERROR("Buffer overflow: write at offset %zu exceeds buffer size %zu", \
-                             (size_t)(offset_bytes), (size_t)(buffer_size_bytes));           \
-        }                                                                                    \
-    } while (0)
+/**
+ * @brief Free canary-protected memory
+ */
+static inline void gemm_validate_free(void *ptr, const char *file, int line)
+{
+    if (!ptr)
+        return;
+
+    uint8_t *user = (uint8_t *)ptr;
+    uint8_t *base = user - GEMM_CANARY_SIZE;
+
+    VALIDATION_LOG("Freeing %p", ptr);
+
+    free(base);
+}
+
+#define GEMM_ALLOC(ptr, size) \
+    (ptr) = gemm_validate_alloc((size), __FILE__, __LINE__)
+
+#define GEMM_VALIDATE(ptr, size) \
+    gemm_validate_bounds((ptr), (size), __FILE__, __LINE__)
+
+#define GEMM_FREE(ptr) \
+    gemm_validate_free((ptr), __FILE__, __LINE__)
 
 #else
-#define GEMM_CANARY_VALUE 0
-#define GEMM_CANARY_SIZE 0
-#define gemm_validate_alloc malloc
-#define gemm_validate_bounds(ptr, size) ((void)0)
-#define PACK_CHECK_BOUNDS(ptr, offset, size) ((void)0)
+// Level 0/1: No canaries
+#define GEMM_ALLOC(ptr, size) (ptr) = malloc(size)
+#define GEMM_VALIDATE(ptr, size) ((void)0)
+#define GEMM_FREE(ptr) free(ptr)
 #endif
 
 //==============================================================================
-// PACKED BUFFER VALIDATION (Level >= 2)
+// KERNEL ENTRY VALIDATION (Level 2 only)
 //==============================================================================
 
 #if GEMM_VALIDATION_LEVEL >= 2
 
 /**
- * @brief Validate that a K-loop index won't cause out-of-bounds access in packed A
- *
- * Packed A layout: K rows × MR columns (column-major)
- * Access pattern: Ap[k * mr + row_offset]
- * Valid range: k ∈ [0, K), row_offset ∈ [0, MR)
+ * @brief Log kernel entry (optional, controlled by GEMM_VALIDATION_VERBOSE)
  */
-#define VALIDATE_PACKED_A_ACCESS(Ap, k, mr, K)                                    \
-    do                                                                            \
-    {                                                                             \
-        if ((k) >= (K))                                                           \
-        {                                                                         \
-            VALIDATION_ERROR("Packed A: k=%zu exceeds K=%zu",                     \
-                             (size_t)(k), (size_t)(K));                           \
-        }                                                                         \
-        /* Worst-case access: Ap[k*mr + (mr-1)] */                                \
-        size_t max_offset = (k) * (mr) + (mr);                                    \
-        size_t buffer_size = (K) * (mr);                                          \
-        if (max_offset > buffer_size)                                             \
-        {                                                                         \
-            VALIDATION_ERROR("Packed A: access at k=%zu, mr=%zu exceeds buffer "  \
-                             "(offset=%zu > size=%zu)",                           \
-                             (size_t)(k), (size_t)(mr), max_offset, buffer_size); \
-        }                                                                         \
+#define GEMM_KERNEL_ENTRY(name, M, K, N)                               \
+    VALIDATION_LOG("Entering %s: M=" FMT_ZU " K=" FMT_ZU " N=" FMT_ZU, \
+                   (name), CAST_ZU(M), CAST_ZU(K), CAST_ZU(N))
+
+/**
+ * @brief Comprehensive kernel parameter validation
+ */
+#define VALIDATE_KERNEL_PARAMS(C, ldc, Ap, a_stride, Bp, b_stride, K, M, N, mr)                   \
+    do                                                                                            \
+    {                                                                                             \
+        VALIDATION_LOG("Validating kernel: M=" FMT_ZU ", K=" FMT_ZU ", N=" FMT_ZU ", MR=" FMT_ZU, \
+                       CAST_ZU(M), CAST_ZU(K), CAST_ZU(N), CAST_ZU(mr));                          \
+        VALIDATE_PTR(C);                                                                          \
+        VALIDATE_PTR(Ap);                                                                         \
+        VALIDATE_PTR(Bp);                                                                         \
+        VALIDATE_ALIGNED(C);                                                                      \
+        VALIDATE_ALIGNED(Ap);                                                                     \
+        VALIDATE_ALIGNED(Bp);                                                                     \
+        if ((ldc) < (N))                                                                          \
+        {                                                                                         \
+            VALIDATION_ERROR("ldc " FMT_ZU " < N " FMT_ZU, CAST_ZU(ldc), CAST_ZU(N));             \
+        }                                                                                         \
+        if ((a_stride) != (mr))                                                                   \
+        {                                                                                         \
+            VALIDATION_ERROR("A stride mismatch: expected " FMT_ZU ", got " FMT_ZU,               \
+                             CAST_ZU(mr), CAST_ZU(a_stride));                                     \
+        }                                                                                         \
+        if ((b_stride) != 16)                                                                     \
+        {                                                                                         \
+            VALIDATION_ERROR("B stride must be 16, got " FMT_ZU, CAST_ZU(b_stride));              \
+        }                                                                                         \
+        if ((M) > (mr))                                                                           \
+        {                                                                                         \
+            VALIDATION_ERROR("M " FMT_ZU " > MR " FMT_ZU, CAST_ZU(M), CAST_ZU(mr));               \
+        }                                                                                         \
+        if ((N) > 16)                                                                             \
+        {                                                                                         \
+            VALIDATION_ERROR("N " FMT_ZU " > 16", CAST_ZU(N));                                    \
+        }                                                                                         \
     } while (0)
 
 /**
- * @brief Validate that a K-loop index won't cause out-of-bounds access in packed B
- *
- * Packed B layout: K rows × 16 columns (row-major)
- * Access pattern: Bp[k * 16 + col_offset]
- * Valid range: k ∈ [0, K), col_offset ∈ [0, 16)
+ * @brief Post-kernel validation
  */
-#define VALIDATE_PACKED_B_ACCESS(Bp, k, K)                               \
-    do                                                                   \
-    {                                                                    \
-        if ((k) >= (K))                                                  \
-        {                                                                \
-            VALIDATION_ERROR("Packed B: k=%zu exceeds K=%zu",            \
-                             (size_t)(k), (size_t)(K));                  \
-        }                                                                \
-        /* Worst-case access: Bp[k*16 + 15] */                           \
-        size_t max_offset = (k) * 16 + 16;                               \
-        size_t buffer_size = (K) * 16;                                   \
-        if (max_offset > buffer_size)                                    \
-        {                                                                \
-            VALIDATION_ERROR("Packed B: access at k=%zu exceeds buffer " \
-                             "(offset=%zu > size=%zu)",                  \
-                             (size_t)(k), max_offset, buffer_size);      \
-        }                                                                \
+#define VALIDATE_KERNEL_POST(Ap, Bp, K, mr)                                \
+    do                                                                     \
+    {                                                                      \
+        VALIDATION_LOG("Post-kernel validation: K=" FMT_ZU ", MR=" FMT_ZU, \
+                       CAST_ZU(K), CAST_ZU(mr));                           \
+        GEMM_VALIDATE(Ap, (K) * (mr) * sizeof(float));                     \
+        GEMM_VALIDATE(Bp, (K) * 16 * sizeof(float));                       \
     } while (0)
 
 /**
- * @brief Validate entire kernel invocation parameters
- *
- * This macro should be called at the START of each microkernel to catch
- * parameter errors before any memory access occurs.
+ * @brief Validate packed A access
  */
-#define VALIDATE_KERNEL_PARAMS(C, ldc, Ap, a_stride, Bp, b_stride, K, M, N, mr) \
-    do                                                                          \
-    {                                                                           \
-        VALIDATION_LOG("Validating kernel: M=%zu, K=%zu, N=%zu, MR=%zu",        \
-                       (size_t)(M), (size_t)(K), (size_t)(N), (size_t)(mr));    \
-        /* Validate pointers */                                                 \
-        VALIDATE_PTR(C);                                                        \
-        VALIDATE_PTR(Ap);                                                       \
-        VALIDATE_PTR(Bp);                                                       \
-        /* Validate alignment */                                                \
-        VALIDATE_ALIGNED(C, 32);                                                \
-        VALIDATE_ALIGNED(Ap, 32);                                               \
-        VALIDATE_ALIGNED(Bp, 32);                                               \
-        /* Validate dimensions */                                               \
-        if ((M) == 0 || (K) == 0 || (N) == 0)                                   \
-        {                                                                       \
-            VALIDATION_ERROR("Zero dimension: M=%zu, K=%zu, N=%zu",             \
-                             (size_t)(M), (size_t)(K), (size_t)(N));            \
-        }                                                                       \
-        if ((M) > (mr))                                                         \
-        {                                                                       \
-            VALIDATION_ERROR("M=%zu exceeds MR=%zu",                            \
-                             (size_t)(M), (size_t)(mr));                        \
-        }                                                                       \
-        if ((N) > 16)                                                           \
-        {                                                                       \
-            VALIDATION_ERROR("N=%zu exceeds NR=16", (size_t)(N));               \
-        }                                                                       \
-        /* Validate strides */                                                  \
-        if ((a_stride) != (mr))                                                 \
-        {                                                                       \
-            VALIDATION_ERROR("A stride mismatch: expected %zu, got %zu",        \
-                             (size_t)(mr), (size_t)(a_stride));                 \
-        }                                                                       \
-        if ((b_stride) != 16)                                                   \
-        {                                                                       \
-            VALIDATION_ERROR("B stride must be 16, got %zu",                    \
-                             (size_t)(b_stride));                               \
-        }                                                                       \
-        if ((ldc) < (N))                                                        \
-        {                                                                       \
-            VALIDATION_ERROR("ldc=%zu < N=%zu", (size_t)(ldc), (size_t)(N));    \
-        }                                                                       \
+#define VALIDATE_PACKED_A_ACCESS(Ap, k, mr, K)                      \
+    do                                                              \
+    {                                                               \
+        if ((k) >= (K))                                             \
+        {                                                           \
+            VALIDATION_ERROR("Packed A: k=" FMT_ZU " >= K=" FMT_ZU, \
+                             CAST_ZU(k), CAST_ZU(K));               \
+        }                                                           \
     } while (0)
 
 /**
- * @brief Validate kernel state after execution
- *
- * Call this AFTER each microkernel to verify buffer integrity.
+ * @brief Validate packed B access
  */
-#define VALIDATE_KERNEL_POST(Ap, Bp, K, mr)                     \
-    do                                                          \
-    {                                                           \
-        VALIDATION_LOG("Post-kernel validation: K=%zu, MR=%zu", \
-                       (size_t)(K), (size_t)(mr));              \
-        gemm_validate_bounds(Ap, (K) * (mr) * sizeof(float));   \
-        gemm_validate_bounds(Bp, (K) * 16 * sizeof(float));     \
+#define VALIDATE_PACKED_B_ACCESS(Bp, k, K)                          \
+    do                                                              \
+    {                                                               \
+        if ((k) >= (K))                                             \
+        {                                                           \
+            VALIDATION_ERROR("Packed B: k=" FMT_ZU " >= K=" FMT_ZU, \
+                             CAST_ZU(k), CAST_ZU(K));               \
+        }                                                           \
     } while (0)
 
 #else
-#define VALIDATE_PACKED_A_ACCESS(Ap, k, mr, K) ((void)0)
-#define VALIDATE_PACKED_B_ACCESS(Bp, k, K) ((void)0)
+#define GEMM_KERNEL_ENTRY(name, M, K, N) ((void)0)
 #define VALIDATE_KERNEL_PARAMS(C, ldc, Ap, a_stride, Bp, b_stride, K, M, N, mr) ((void)0)
 #define VALIDATE_KERNEL_POST(Ap, Bp, K, mr) ((void)0)
+#define VALIDATE_PACKED_A_ACCESS(Ap, k, mr, K) ((void)0)
+#define VALIDATE_PACKED_B_ACCESS(Bp, k, K) ((void)0)
 #endif
 
 //==============================================================================
-// BUFFER ALLOCATION WRAPPERS
+// CROSS-PLATFORM HEAP VALIDATION
 //==============================================================================
 
-#if GEMM_VALIDATION_LEVEL >= 2
-#define GEMM_ALLOC(ptr, size)                   \
-    do                                          \
-    {                                           \
-        void *_tmp = gemm_validate_alloc(size); \
-        (ptr) = _tmp;                           \
+#if GEMM_VALIDATION_LEVEL >= 1
+
+#ifdef _WIN32
+// Windows: Use _CrtIsValidHeapPointer (requires debug CRT)
+#ifdef _DEBUG
+#include <crtdbg.h>
+#define VALIDATE_HEAP_PTR(ptr)                                           \
+    do                                                                   \
+    {                                                                    \
+        if (!(ptr) || !_CrtIsValidHeapPointer(ptr))                      \
+        {                                                                \
+            VALIDATION_ERROR("Invalid heap pointer: %p", (void *)(ptr)); \
+        }                                                                \
     } while (0)
-#define GEMM_FREE(ptr)                              \
-    do                                              \
-    {                                               \
-        if (ptr)                                    \
-        {                                           \
-            free((char *)(ptr) - GEMM_CANARY_SIZE); \
-            (ptr) = NULL;                           \
-        }                                           \
-    } while (0)
-#define GEMM_VALIDATE(ptr, size) gemm_validate_bounds(ptr, size)
 #else
-#define GEMM_ALLOC(ptr, size)                                                 \
-    do                                                                        \
-    {                                                                         \
-        (ptr) = malloc(size);                                                 \
-        if (!(ptr) && (size) > 0)                                             \
-            VALIDATION_ERROR("Allocation failed: %zu bytes", (size_t)(size)); \
-    } while (0)
-#define GEMM_FREE(ptr) \
-    do                 \
-    {                  \
-        free(ptr);     \
-        (ptr) = NULL;  \
-    } while (0)
-#define GEMM_VALIDATE(ptr, size) ((void)0)
+#define VALIDATE_HEAP_PTR(ptr) VALIDATE_PTR(ptr)
+#endif
+#else
+// Linux: Basic NULL check (no equivalent to _CrtIsValidHeapPointer)
+#define VALIDATE_HEAP_PTR(ptr) VALIDATE_PTR(ptr)
 #endif
 
-#endif // GEMM_VALIDATION_H
+#else
+#define VALIDATE_HEAP_PTR(ptr) ((void)0)
+#endif
+
+#endif /* GEMM_VALIDATION_H */

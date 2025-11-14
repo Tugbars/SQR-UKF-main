@@ -8,6 +8,20 @@ set(CMAKE_C_EXTENSIONS OFF)
 message(STATUS "Building GEMM Library - Full Test Suite")
 
 #===============================================================================
+# VALIDATION LEVEL OPTION
+#===============================================================================
+
+option(GEMM_ENABLE_VALIDATION "Enable runtime validation (debug builds)" ON)
+
+if(CMAKE_BUILD_TYPE MATCHES Debug)
+    set(GEMM_VALIDATION_LEVEL 2 CACHE STRING "Validation level (0=none, 1=basic, 2=full)")
+else()
+    set(GEMM_VALIDATION_LEVEL 0 CACHE STRING "Validation level (0=none, 1=basic, 2=full)")
+endif()
+
+message(STATUS "Validation level: ${GEMM_VALIDATION_LEVEL}")
+
+#===============================================================================
 # Source Directory
 #===============================================================================
 
@@ -26,38 +40,34 @@ else()
     set(GEMM_LINK_FLAGS -lm)
 endif()
 
+# Add validation level definition
+if(GEMM_VALIDATION_LEVEL GREATER 0)
+    list(APPEND GEMM_COMPILE_FLAGS -DGEMM_VALIDATION_LEVEL=${GEMM_VALIDATION_LEVEL})
+    if(NOT MSVC)
+        # Add debug symbols for validation
+        list(APPEND GEMM_COMPILE_FLAGS -g)
+    endif()
+endif()
+
 #===============================================================================
 # Core GEMM Library Sources
 #===============================================================================
 
 set(GEMM_CORE_SOURCES
-    # Static memory pool
     ${GEMM_SRC_DIR}/gemm_static.c
-    
-    # Planning module
     ${GEMM_SRC_DIR}/gemm_planning.c
-    
-    # Tier 1: Small kernels
     ${GEMM_SRC_DIR}/gemm_small.c
-    
-    # Tier 2: Large matrix execution (NOW INCLUDED)
     ${GEMM_SRC_DIR}/gemm_large.c
 )
 
 set(GEMM_CORE_HEADERS
-    # Public API
     ${GEMM_SRC_DIR}/gemm.h
-    
-    # Internal headers
     ${GEMM_SRC_DIR}/gemm_static.h
     ${GEMM_SRC_DIR}/gemm_planning.h
     ${GEMM_SRC_DIR}/gemm_small.h
-    
-    # Utilities (header-only)
     ${GEMM_SRC_DIR}/gemm_utils.h
     ${GEMM_SRC_DIR}/gemm_simd_ops.h
-    
-    # Tier 2 headers (NOW INCLUDED)
+    ${GEMM_SRC_DIR}/gemm_validation.h          # ← Unified validation header
     ${GEMM_SRC_DIR}/gemm_kernels_avx2.h
 )
 
@@ -96,7 +106,6 @@ target_link_libraries(test_gemm_small PRIVATE gemm_lib)
 target_compile_definitions(test_gemm_small PRIVATE STANDALONE)
 target_compile_options(test_gemm_small PRIVATE ${GEMM_COMPILE_FLAGS})
 
-# Force console subsystem (NO WinMain!)
 if(WIN32 AND MINGW)
     target_link_options(test_gemm_small PRIVATE -mconsole)
 endif()
@@ -115,7 +124,6 @@ target_link_libraries(test_gemm_planning PRIVATE gemm_lib)
 target_compile_definitions(test_gemm_planning PRIVATE STANDALONE)
 target_compile_options(test_gemm_planning PRIVATE ${GEMM_COMPILE_FLAGS})
 
-# Force console subsystem (NO WinMain!)
 if(WIN32 AND MINGW)
     target_link_options(test_gemm_planning PRIVATE -mconsole)
 endif()
@@ -124,7 +132,7 @@ if(UNIX OR MINGW)
     target_link_libraries(test_gemm_planning PRIVATE m)
 endif()
 
-# Test 3: Individual Kernel Tests (test_gemm_large.c contains test_kernels_individual)
+# Test 3: Individual Kernel Tests (original)
 add_executable(test_gemm_large 
     ${TEST_DIR}/test_gemm_large.c
     ${TEST_COMMON_HEADER}
@@ -134,13 +142,33 @@ target_link_libraries(test_gemm_large PRIVATE gemm_lib)
 target_compile_definitions(test_gemm_large PRIVATE STANDALONE)
 target_compile_options(test_gemm_large PRIVATE ${GEMM_COMPILE_FLAGS})
 
-# Force console subsystem (NO WinMain!)
 if(WIN32 AND MINGW)
     target_link_options(test_gemm_large PRIVATE -mconsole)
 endif()
 
 if(UNIX OR MINGW)
     target_link_libraries(test_gemm_large PRIVATE m)
+endif()
+
+# Test 4: VALIDATED Individual Kernel Tests (NEW!)
+add_executable(test_gemm_validated 
+    ${TEST_DIR}/test_gemm_validated.c
+    ${TEST_COMMON_HEADER}
+)
+
+target_link_libraries(test_gemm_validated PRIVATE gemm_lib)
+target_compile_definitions(test_gemm_validated PRIVATE 
+    STANDALONE
+    GEMM_VALIDATION_LEVEL=${GEMM_VALIDATION_LEVEL}
+)
+target_compile_options(test_gemm_validated PRIVATE ${GEMM_COMPILE_FLAGS})
+
+if(WIN32 AND MINGW)
+    target_link_options(test_gemm_validated PRIVATE -mconsole)
+endif()
+
+if(UNIX OR MINGW)
+    target_link_libraries(test_gemm_validated PRIVATE m)
 endif()
 
 #===============================================================================
@@ -158,7 +186,6 @@ add_executable(test_all
 target_link_libraries(test_all PRIVATE gemm_lib)
 target_compile_options(test_all PRIVATE ${GEMM_COMPILE_FLAGS})
 
-# Force console subsystem (NO WinMain!)
 if(WIN32 AND MINGW)
     target_link_options(test_all PRIVATE -mconsole)
 endif()
@@ -176,12 +203,14 @@ enable_testing()
 add_test(NAME SmallKernels COMMAND test_gemm_small)
 add_test(NAME Planning COMMAND test_gemm_planning)
 add_test(NAME KernelTests COMMAND test_gemm_large)
+add_test(NAME ValidatedKernels COMMAND test_gemm_validated)  # ← NEW!
 add_test(NAME AllTests COMMAND test_all)
 
 # Set test properties
 set_tests_properties(SmallKernels PROPERTIES TIMEOUT 60)
 set_tests_properties(Planning PROPERTIES TIMEOUT 60)
 set_tests_properties(KernelTests PROPERTIES TIMEOUT 120)
+set_tests_properties(ValidatedKernels PROPERTIES TIMEOUT 180)  # ← Longer timeout
 set_tests_properties(AllTests PROPERTIES TIMEOUT 180)
 
 #===============================================================================
@@ -191,7 +220,7 @@ set_tests_properties(AllTests PROPERTIES TIMEOUT 180)
 # Run all tests
 add_custom_target(run_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_all test_gemm_small test_gemm_planning test_gemm_large
+    DEPENDS test_all test_gemm_small test_gemm_planning test_gemm_large test_gemm_validated
     COMMENT "Running all GEMM tests..."
 )
 
@@ -214,6 +243,13 @@ add_custom_target(run_kernels
     COMMENT "Running individual kernel unit tests..."
 )
 
+# NEW: Run validated tests
+add_custom_target(run_validated
+    COMMAND test_gemm_validated
+    DEPENDS test_gemm_validated
+    COMMENT "Running VALIDATED kernel tests (full instrumentation)..."
+)
+
 add_custom_target(run_unified
     COMMAND test_all
     DEPENDS test_all
@@ -221,43 +257,23 @@ add_custom_target(run_unified
 )
 
 #===============================================================================
-# Performance Benchmark Target (Optional)
+# Address Sanitizer Build Option
 #===============================================================================
 
-#add_executable(benchmark_gemm
-#    ${TEST_DIR}/benchmark_gemm.c
-#)
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
-#target_link_libraries(benchmark_gemm PRIVATE gemm_lib)
-#target_compile_options(benchmark_gemm PRIVATE ${GEMM_COMPILE_FLAGS})
-
-# Force console subsystem (NO WinMain!)
-#if(WIN32 AND MINGW)
-#    target_link_options(benchmark_gemm PRIVATE -mconsole)
-#endif()
-
-#if(UNIX OR MINGW)
-#    target_link_libraries(benchmark_gemm PRIVATE m)
-#endif()
-
-#add_custom_target(run_benchmark
-#    COMMAND benchmark_gemm
-#    DEPENDS benchmark_gemm
-#    COMMENT "Running GEMM performance benchmarks..."
-#)
-
-#===============================================================================
-# Installation (Optional)
-#===============================================================================
-
-install(TARGETS gemm_lib
-    ARCHIVE DESTINATION lib
-    LIBRARY DESTINATION lib
-)
-
-install(FILES ${GEMM_CORE_HEADERS}
-    DESTINATION include/gemm
-)
+if(ENABLE_ASAN)
+    if(NOT MSVC)
+        set(ASAN_FLAGS -fsanitize=address -fno-omit-frame-pointer -g)
+        target_compile_options(test_gemm_validated PRIVATE ${ASAN_FLAGS})
+        target_link_options(test_gemm_validated PRIVATE ${ASAN_FLAGS})
+        message(STATUS "AddressSanitizer ENABLED for test_gemm_validated")
+    else()
+        # MSVC 2019+ supports /fsanitize=address
+        target_compile_options(test_gemm_validated PRIVATE /fsanitize=address)
+        message(STATUS "AddressSanitizer ENABLED for test_gemm_validated (MSVC)")
+    endif()
+endif()
 
 #===============================================================================
 # Build Summary
@@ -268,19 +284,24 @@ message(STATUS "GEMM Test Suite Configuration")
 message(STATUS "====================================")
 message(STATUS "Source directory:  ${GEMM_SRC_DIR}")
 message(STATUS "Test directory:    ${TEST_DIR}")
+message(STATUS "Build type:        ${CMAKE_BUILD_TYPE}")
+message(STATUS "Validation level:  ${GEMM_VALIDATION_LEVEL}")
+message(STATUS "AddressSanitizer:  ${ENABLE_ASAN}")
 message(STATUS "")
 message(STATUS "Build targets:")
-message(STATUS "  gemm_lib            - Core GEMM library")
-message(STATUS "  test_gemm_small     - Small kernels test (standalone)")
-message(STATUS "  test_gemm_planning  - Planning module test (standalone)")
-message(STATUS "  test_gemm_large     - Individual kernel tests (standalone)")
-message(STATUS "  test_all            - Unified test runner")
+message(STATUS "  gemm_lib               - Core GEMM library")
+message(STATUS "  test_gemm_small        - Small kernels test")
+message(STATUS "  test_gemm_planning     - Planning module test")
+message(STATUS "  test_gemm_large        - Individual kernel tests")
+message(STATUS "  test_gemm_validated    - VALIDATED kernel tests ← NEW!")
+message(STATUS "  test_all               - Unified test runner")
 message(STATUS "")
 message(STATUS "Custom targets:")
 message(STATUS "  make run_tests      - Run all tests via CTest")
 message(STATUS "  make run_small      - Run small kernel tests")
 message(STATUS "  make run_planning   - Run planning tests")
 message(STATUS "  make run_kernels    - Run individual kernel tests")
+message(STATUS "  make run_validated  - Run VALIDATED tests ← NEW!")
 message(STATUS "  make run_unified    - Run unified test suite")
 message(STATUS "")
 message(STATUS "Compiler flags: ${GEMM_COMPILE_FLAGS}")
