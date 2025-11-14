@@ -65,7 +65,7 @@
 /**
  * @brief Toggle for aligned memory operations
  *
- * Set to 1: Use aligned loads/stores (_mm256_load_ps / _mm256_store_ps)
+ * Set to 1: Use aligned loads/stores (GEMM_LOAD_PS / GEMM_STORE_PS)
  * Set to 0: Use unaligned loads/stores (_mm256_loadu_ps / _mm256_storeu_ps)
  *
  * NOTE: Aligned operations require 32-byte alignment and may segfault if misaligned.
@@ -256,7 +256,7 @@ static inline __m256 load_cols_from_temp(
     alignas(32) float lane[8] = {0};
     for (size_t j = 0; j < n; ++j)
         lane[j] = temp[j * stride + r];
-    return _mm256_load_ps(lane);
+    return GEMM_LOAD_PS(lane);
 }
 
 //==============================================================================
@@ -303,7 +303,7 @@ static inline void gemm_4x8_panel_avx2fma_add(
 
         for (int t = 0; t < 8; ++t)
         {
-            const __m256 b = _mm256_load_ps(bptr);
+            const __m256 b = GEMM_LOAD_PS(bptr);
             acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc0);
             acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 1), b, acc1);
             acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 2), b, acc2);
@@ -321,7 +321,7 @@ static inline void gemm_4x8_panel_avx2fma_add(
             if (kpf < Kblk)
                 PREFETCH_T0(Bp + kpf * b_k_stride); // ← CHANGED: was kpf * 8
         }
-        const __m256 b = _mm256_load_ps(Bp + k * b_k_stride);                          // ← CHANGED: was k * 8
+        const __m256 b = GEMM_LOAD_PS(Bp + k * b_k_stride);                          // ← CHANGED: was k * 8
         acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 0), b, acc0); // ← CHANGED: was k * 8
         acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 1), b, acc1); // ← CHANGED
         acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 2), b, acc2); // ← CHANGED
@@ -395,7 +395,7 @@ static inline void gemm_4x8_panel_avx2fma_store(
 
         for (int t = 0; t < 8; ++t)
         {
-            const __m256 b = _mm256_load_ps(bptr);
+            const __m256 b = GEMM_LOAD_PS(bptr);
             acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc0);
             acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 1), b, acc1);
             acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 2), b, acc2);
@@ -413,7 +413,7 @@ static inline void gemm_4x8_panel_avx2fma_store(
             if (kpf < Kblk)
                 PREFETCH_T0(Bp + kpf * b_k_stride); // ← USE STRIDE
         }
-        const __m256 b = _mm256_load_ps(Bp + k * b_k_stride); // ← USE STRIDE
+        const __m256 b = GEMM_LOAD_PS(Bp + k * b_k_stride); // ← USE STRIDE
         acc0 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 0), b, acc0);
         acc1 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 1), b, acc1);
         acc2 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 2), b, acc2);
@@ -471,7 +471,7 @@ static inline void gemm_1x8_panel_avx2fma_add(
 
         for (int t = 0; t < 8; ++t)
         {
-            const __m256 b = _mm256_load_ps(bptr);
+            const __m256 b = GEMM_LOAD_PS(bptr);
             acc = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc);
             bptr += b_k_stride; // ← USE STRIDE
             aptr += a_k_stride; // ← USE STRIDE
@@ -486,7 +486,7 @@ static inline void gemm_1x8_panel_avx2fma_add(
             if (kpf < Kblk)
                 PREFETCH_T0(Bp + kpf * b_k_stride); // ← USE STRIDE
         }
-        const __m256 b = _mm256_load_ps(Bp + k * b_k_stride); // ← USE STRIDE
+        const __m256 b = GEMM_LOAD_PS(Bp + k * b_k_stride); // ← USE STRIDE
         acc = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 0), b, acc);
     }
 
@@ -534,7 +534,7 @@ static inline void gemm_1x8_panel_avx2fma_store(
 
         for (int t = 0; t < 8; ++t)
         {
-            const __m256 b = _mm256_load_ps(bptr);
+            const __m256 b = GEMM_LOAD_PS(bptr);
             acc = _mm256_fmadd_ps(_mm256_broadcast_ss(aptr + 0), b, acc);
             bptr += b_k_stride;
             aptr += a_k_stride;
@@ -549,7 +549,7 @@ static inline void gemm_1x8_panel_avx2fma_store(
             if (kpf < Kblk)
                 PREFETCH_T0(Bp + kpf * b_k_stride);
         }
-        const __m256 b = _mm256_load_ps(Bp + k * b_k_stride);
+        const __m256 b = GEMM_LOAD_PS(Bp + k * b_k_stride);
         acc = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 0), b, acc);
     }
 
@@ -595,7 +595,7 @@ static inline void gemm_8x8_panel_avx2fma_add(
     if (Kblk)
     {
         size_t k = 0;
-        __m256 a = _mm256_load_ps(Ap + 0 * a_k_stride); // ← USE STRIDE
+        __m256 a = GEMM_LOAD_PS(Ap + 0 * a_k_stride); // ← USE STRIDE
         const float *brow = Bp + 0 * b_k_stride;        // ← USE STRIDE
 
         for (; k + 1 < Kblk; ++k)
@@ -603,7 +603,7 @@ static inline void gemm_8x8_panel_avx2fma_add(
             if (do_pf)
                 PREFETCH_T0(Bp + (k + 8) * b_k_stride); // ← USE STRIDE
 
-            __m256 a_next = _mm256_load_ps(Ap + (k + 1) * a_k_stride); // ← USE STRIDE
+            __m256 a_next = GEMM_LOAD_PS(Ap + (k + 1) * a_k_stride); // ← USE STRIDE
             const float *b_next = Bp + (k + 1) * b_k_stride;           // ← USE STRIDE
 
             __m256 b;
@@ -659,14 +659,14 @@ static inline void gemm_8x8_panel_avx2fma_add(
     else
     {
         alignas(32) float temp[8 * 8];
-        _mm256_store_ps(temp + 0 * 8, acc0);
-        _mm256_store_ps(temp + 1 * 8, acc1);
-        _mm256_store_ps(temp + 2 * 8, acc2);
-        _mm256_store_ps(temp + 3 * 8, acc3);
-        _mm256_store_ps(temp + 4 * 8, acc4);
-        _mm256_store_ps(temp + 5 * 8, acc5);
-        _mm256_store_ps(temp + 6 * 8, acc6);
-        _mm256_store_ps(temp + 7 * 8, acc7);
+        GEMM_STORE_PS(temp + 0 * 8, acc0);
+        GEMM_STORE_PS(temp + 1 * 8, acc1);
+        GEMM_STORE_PS(temp + 2 * 8, acc2);
+        GEMM_STORE_PS(temp + 3 * 8, acc3);
+        GEMM_STORE_PS(temp + 4 * 8, acc4);
+        GEMM_STORE_PS(temp + 5 * 8, acc5);
+        GEMM_STORE_PS(temp + 6 * 8, acc6);
+        GEMM_STORE_PS(temp + 7 * 8, acc7);
 
         for (size_t r = 0; r < m; ++r)
         {
@@ -705,14 +705,14 @@ static inline void gemm_8x8_panel_avx2fma_store(
     if (Kblk)
     {
         size_t k = 0;
-        __m256 a      = _mm256_load_ps(Ap + 0 * a_k_stride);  // ← USE STRIDE
+        __m256 a      = GEMM_LOAD_PS(Ap + 0 * a_k_stride);  // ← USE STRIDE
         const float *brow = Bp + 0 * b_k_stride;              // ← USE STRIDE
 
         for (; k + 1 < Kblk; ++k)
         {
             if (do_pf) PREFETCH_T0(Bp + (k + 8) * b_k_stride);  // ← USE STRIDE
 
-            __m256 a_next        = _mm256_load_ps(Ap + (k + 1) * a_k_stride);  // ← USE STRIDE
+            __m256 a_next        = GEMM_LOAD_PS(Ap + (k + 1) * a_k_stride);  // ← USE STRIDE
             const float *b_next  = Bp + (k + 1) * b_k_stride;                  // ← USE STRIDE
 
             __m256 b;
@@ -762,14 +762,14 @@ static inline void gemm_8x8_panel_avx2fma_store(
     else
     {
         alignas(32) float temp[8 * 8];
-        _mm256_store_ps(temp + 0 * 8, acc0);
-        _mm256_store_ps(temp + 1 * 8, acc1);
-        _mm256_store_ps(temp + 2 * 8, acc2);
-        _mm256_store_ps(temp + 3 * 8, acc3);
-        _mm256_store_ps(temp + 4 * 8, acc4);
-        _mm256_store_ps(temp + 5 * 8, acc5);
-        _mm256_store_ps(temp + 6 * 8, acc6);
-        _mm256_store_ps(temp + 7 * 8, acc7);
+        GEMM_STORE_PS(temp + 0 * 8, acc0);
+        GEMM_STORE_PS(temp + 1 * 8, acc1);
+        GEMM_STORE_PS(temp + 2 * 8, acc2);
+        GEMM_STORE_PS(temp + 3 * 8, acc3);
+        GEMM_STORE_PS(temp + 4 * 8, acc4);
+        GEMM_STORE_PS(temp + 5 * 8, acc5);
+        GEMM_STORE_PS(temp + 6 * 8, acc6);
+        GEMM_STORE_PS(temp + 7 * 8, acc7);
 
         for (size_t r = 0; r < m; ++r)
         {
@@ -823,8 +823,8 @@ static inline void gemm_16x8_panel_avx2fma_add(
             size_t kk = k + u;
             if (kk >= Kblk)
                 break;
-            __m256 a_lo = _mm256_load_ps(Ap + kk * a_k_stride);     // ← USE STRIDE
-            __m256 a_hi = _mm256_load_ps(Ap + kk * a_k_stride + 8); // ← USE STRIDE
+            __m256 a_lo = GEMM_LOAD_PS(Ap + kk * a_k_stride);     // ← USE STRIDE
+            __m256 a_hi = GEMM_LOAD_PS(Ap + kk * a_k_stride + 8); // ← USE STRIDE
             const float *b_row = Bp + kk * b_k_stride;              // ← USE STRIDE
             __m256 b0 = _mm256_broadcast_ss(b_row + 0);
             __m256 b1 = _mm256_broadcast_ss(b_row + 1);
@@ -875,22 +875,22 @@ static inline void gemm_16x8_panel_avx2fma_add(
     else
     {
         alignas(32) float temp[16 * 8];
-        _mm256_store_ps(temp + 0 * 16, acc_lo0);
-        _mm256_store_ps(temp + 0 * 16 + 8, acc_hi0);
-        _mm256_store_ps(temp + 1 * 16, acc_lo1);
-        _mm256_store_ps(temp + 1 * 16 + 8, acc_hi1);
-        _mm256_store_ps(temp + 2 * 16, acc_lo2);
-        _mm256_store_ps(temp + 2 * 16 + 8, acc_hi2);
-        _mm256_store_ps(temp + 3 * 16, acc_lo3);
-        _mm256_store_ps(temp + 3 * 16 + 8, acc_hi3);
-        _mm256_store_ps(temp + 4 * 16, acc_lo4);
-        _mm256_store_ps(temp + 4 * 16 + 8, acc_hi4);
-        _mm256_store_ps(temp + 5 * 16, acc_lo5);
-        _mm256_store_ps(temp + 5 * 16 + 8, acc_hi5);
-        _mm256_store_ps(temp + 6 * 16, acc_lo6);
-        _mm256_store_ps(temp + 6 * 16 + 8, acc_hi6);
-        _mm256_store_ps(temp + 7 * 16, acc_lo7);
-        _mm256_store_ps(temp + 7 * 16 + 8, acc_hi7);
+        GEMM_STORE_PS(temp + 0 * 16, acc_lo0);
+        GEMM_STORE_PS(temp + 0 * 16 + 8, acc_hi0);
+        GEMM_STORE_PS(temp + 1 * 16, acc_lo1);
+        GEMM_STORE_PS(temp + 1 * 16 + 8, acc_hi1);
+        GEMM_STORE_PS(temp + 2 * 16, acc_lo2);
+        GEMM_STORE_PS(temp + 2 * 16 + 8, acc_hi2);
+        GEMM_STORE_PS(temp + 3 * 16, acc_lo3);
+        GEMM_STORE_PS(temp + 3 * 16 + 8, acc_hi3);
+        GEMM_STORE_PS(temp + 4 * 16, acc_lo4);
+        GEMM_STORE_PS(temp + 4 * 16 + 8, acc_hi4);
+        GEMM_STORE_PS(temp + 5 * 16, acc_lo5);
+        GEMM_STORE_PS(temp + 5 * 16 + 8, acc_hi5);
+        GEMM_STORE_PS(temp + 6 * 16, acc_lo6);
+        GEMM_STORE_PS(temp + 6 * 16 + 8, acc_hi6);
+        GEMM_STORE_PS(temp + 7 * 16, acc_lo7);
+        GEMM_STORE_PS(temp + 7 * 16 + 8, acc_hi7);
 
         for (size_t r = 0; r < m; ++r)
         {
@@ -941,8 +941,8 @@ static inline void gemm_16x8_panel_avx2fma_store(
             size_t kk = k + u;
             if (kk >= Kblk)
                 break;
-            __m256 a_lo = _mm256_load_ps(Ap + kk * a_k_stride);     // ← USE STRIDE
-            __m256 a_hi = _mm256_load_ps(Ap + kk * a_k_stride + 8); // ← USE STRIDE
+            __m256 a_lo = GEMM_LOAD_PS(Ap + kk * a_k_stride);     // ← USE STRIDE
+            __m256 a_hi = GEMM_LOAD_PS(Ap + kk * a_k_stride + 8); // ← USE STRIDE
             const float *b_row = Bp + kk * b_k_stride;              // ← USE STRIDE
             __m256 b0 = _mm256_broadcast_ss(b_row + 0);
             __m256 b1 = _mm256_broadcast_ss(b_row + 1);
@@ -1002,22 +1002,22 @@ static inline void gemm_16x8_panel_avx2fma_store(
     else
     {
         alignas(32) float temp[16 * 8];
-        _mm256_store_ps(temp + 0 * 16, acc_lo0);
-        _mm256_store_ps(temp + 0 * 16 + 8, acc_hi0);
-        _mm256_store_ps(temp + 1 * 16, acc_lo1);
-        _mm256_store_ps(temp + 1 * 16 + 8, acc_hi1);
-        _mm256_store_ps(temp + 2 * 16, acc_lo2);
-        _mm256_store_ps(temp + 2 * 16 + 8, acc_hi2);
-        _mm256_store_ps(temp + 3 * 16, acc_lo3);
-        _mm256_store_ps(temp + 3 * 16 + 8, acc_hi3);
-        _mm256_store_ps(temp + 4 * 16, acc_lo4);
-        _mm256_store_ps(temp + 4 * 16 + 8, acc_hi4);
-        _mm256_store_ps(temp + 5 * 16, acc_lo5);
-        _mm256_store_ps(temp + 5 * 16 + 8, acc_hi5);
-        _mm256_store_ps(temp + 6 * 16, acc_lo6);
-        _mm256_store_ps(temp + 6 * 16 + 8, acc_hi6);
-        _mm256_store_ps(temp + 7 * 16, acc_lo7);
-        _mm256_store_ps(temp + 7 * 16 + 8, acc_hi7);
+        GEMM_STORE_PS(temp + 0 * 16, acc_lo0);
+        GEMM_STORE_PS(temp + 0 * 16 + 8, acc_hi0);
+        GEMM_STORE_PS(temp + 1 * 16, acc_lo1);
+        GEMM_STORE_PS(temp + 1 * 16 + 8, acc_hi1);
+        GEMM_STORE_PS(temp + 2 * 16, acc_lo2);
+        GEMM_STORE_PS(temp + 2 * 16 + 8, acc_hi2);
+        GEMM_STORE_PS(temp + 3 * 16, acc_lo3);
+        GEMM_STORE_PS(temp + 3 * 16 + 8, acc_hi3);
+        GEMM_STORE_PS(temp + 4 * 16, acc_lo4);
+        GEMM_STORE_PS(temp + 4 * 16 + 8, acc_hi4);
+        GEMM_STORE_PS(temp + 5 * 16, acc_lo5);
+        GEMM_STORE_PS(temp + 5 * 16 + 8, acc_hi5);
+        GEMM_STORE_PS(temp + 6 * 16, acc_lo6);
+        GEMM_STORE_PS(temp + 6 * 16 + 8, acc_hi6);
+        GEMM_STORE_PS(temp + 7 * 16, acc_lo7);
+        GEMM_STORE_PS(temp + 7 * 16 + 8, acc_hi7);
 
         for (size_t r = 0; r < m; ++r)
         {
@@ -1069,8 +1069,8 @@ static inline void gemm_16x6_panel_avx2fma_add(
             size_t kk = k + u;
             if (kk >= Kblk)
                 break;
-            __m256 a_lo = _mm256_load_ps(Ap + kk * a_k_stride);     // ← USE STRIDE
-            __m256 a_hi = _mm256_load_ps(Ap + kk * a_k_stride + 8); // ← USE STRIDE
+            __m256 a_lo = GEMM_LOAD_PS(Ap + kk * a_k_stride);     // ← USE STRIDE
+            __m256 a_hi = GEMM_LOAD_PS(Ap + kk * a_k_stride + 8); // ← USE STRIDE
             const float *b_row = Bp + kk * b_k_stride;              // ← USE STRIDE
             for (int j = 0; j < 6; ++j)
             {
@@ -1086,14 +1086,14 @@ static inline void gemm_16x6_panel_avx2fma_add(
         alignas(32) float temp_lo[8 * 8] = {0}, temp_hi[8 * 8] = {0};
         for (int j = 0; j < 6; ++j)
         {
-            _mm256_store_ps(temp_lo + j * 8, acc_lo[j]);
-            _mm256_store_ps(temp_hi + j * 8, acc_hi[j]);
+            GEMM_STORE_PS(temp_lo + j * 8, acc_lo[j]);
+            GEMM_STORE_PS(temp_hi + j * 8, acc_hi[j]);
         }
         __m256 cols_lo[8], cols_hi[8];
         for (int j = 0; j < 8; ++j)
         {
-            cols_lo[j] = _mm256_load_ps(temp_lo + j * 8);
-            cols_hi[j] = _mm256_load_ps(temp_hi + j * 8);
+            cols_lo[j] = GEMM_LOAD_PS(temp_lo + j * 8);
+            cols_hi[j] = GEMM_LOAD_PS(temp_hi + j * 8);
         }
         gemm_transpose_8x8_avx2(cols_lo);
         gemm_transpose_8x8_avx2(cols_hi);
@@ -1122,8 +1122,8 @@ static inline void gemm_16x6_panel_avx2fma_add(
         alignas(32) float temp[16 * 6];
         for (int j = 0; j < 6; ++j)
         {
-            _mm256_store_ps(temp + j * 16, acc_lo[j]);
-            _mm256_store_ps(temp + j * 16 + 8, acc_hi[j]);
+            GEMM_STORE_PS(temp + j * 16, acc_lo[j]);
+            GEMM_STORE_PS(temp + j * 16 + 8, acc_hi[j]);
         }
         for (size_t r = 0; r < m; ++r)
         {
@@ -1172,8 +1172,8 @@ static inline void gemm_16x6_panel_avx2fma_store(
             size_t kk = k + u;
             if (kk >= Kblk)
                 break;
-            __m256 a_lo = _mm256_load_ps(Ap + kk * a_k_stride);     // ← USE STRIDE
-            __m256 a_hi = _mm256_load_ps(Ap + kk * a_k_stride + 8); // ← USE STRIDE
+            __m256 a_lo = GEMM_LOAD_PS(Ap + kk * a_k_stride);     // ← USE STRIDE
+            __m256 a_hi = GEMM_LOAD_PS(Ap + kk * a_k_stride + 8); // ← USE STRIDE
             const float *b_row = Bp + kk * b_k_stride;              // ← USE STRIDE
             for (int j = 0; j < 6; ++j)
             {
@@ -1194,14 +1194,14 @@ static inline void gemm_16x6_panel_avx2fma_store(
         alignas(32) float temp_lo[8 * 8] = {0}, temp_hi[8 * 8] = {0};
         for (int j = 0; j < 6; ++j)
         {
-            _mm256_store_ps(temp_lo + j * 8, acc_lo[j]);
-            _mm256_store_ps(temp_hi + j * 8, acc_hi[j]);
+            GEMM_STORE_PS(temp_lo + j * 8, acc_lo[j]);
+            GEMM_STORE_PS(temp_hi + j * 8, acc_hi[j]);
         }
         __m256 cols_lo[8], cols_hi[8];
         for (int j = 0; j < 8; ++j)
         {
-            cols_lo[j] = _mm256_load_ps(temp_lo + j * 8);
-            cols_hi[j] = _mm256_load_ps(temp_hi + j * 8);
+            cols_lo[j] = GEMM_LOAD_PS(temp_lo + j * 8);
+            cols_hi[j] = GEMM_LOAD_PS(temp_hi + j * 8);
         }
         gemm_transpose_8x8_avx2(cols_lo);
         gemm_transpose_8x8_avx2(cols_hi);
@@ -1226,8 +1226,8 @@ static inline void gemm_16x6_panel_avx2fma_store(
         alignas(32) float temp[16 * 6];
         for (int j = 0; j < 6; ++j)
         {
-            _mm256_store_ps(temp + j * 16, acc_lo[j]);
-            _mm256_store_ps(temp + j * 16 + 8, acc_hi[j]);
+            GEMM_STORE_PS(temp + j * 16, acc_lo[j]);
+            GEMM_STORE_PS(temp + j * 16 + 8, acc_hi[j]);
         }
         for (size_t r = 0; r < m; ++r)
         {
@@ -1279,7 +1279,7 @@ static inline void gemm_8x6_panel_avx2fma_add(
             size_t kk = k + u;
             if (kk >= Kblk)
                 break;
-            __m256 a = _mm256_load_ps(Ap + kk * a_k_stride); // ← USE STRIDE
+            __m256 a = GEMM_LOAD_PS(Ap + kk * a_k_stride); // ← USE STRIDE
             const float *b_row = Bp + kk * b_k_stride;       // ← USE STRIDE
             __m256 b;
             b = _mm256_broadcast_ss(b_row + 0);
@@ -1300,16 +1300,16 @@ static inline void gemm_8x6_panel_avx2fma_add(
     if (m == 8 && n == 6)
     {
         alignas(32) float temp[8 * 8] = {0};
-        _mm256_store_ps(temp + 0 * 8, acc0);
-        _mm256_store_ps(temp + 1 * 8, acc1);
-        _mm256_store_ps(temp + 2 * 8, acc2);
-        _mm256_store_ps(temp + 3 * 8, acc3);
-        _mm256_store_ps(temp + 4 * 8, acc4);
-        _mm256_store_ps(temp + 5 * 8, acc5);
+        GEMM_STORE_PS(temp + 0 * 8, acc0);
+        GEMM_STORE_PS(temp + 1 * 8, acc1);
+        GEMM_STORE_PS(temp + 2 * 8, acc2);
+        GEMM_STORE_PS(temp + 3 * 8, acc3);
+        GEMM_STORE_PS(temp + 4 * 8, acc4);
+        GEMM_STORE_PS(temp + 5 * 8, acc5);
 
         __m256 cols[8];
         for (int j = 0; j < 8; ++j)
-            cols[j] = _mm256_load_ps(temp + j * 8);
+            cols[j] = GEMM_LOAD_PS(temp + j * 8);
 
         gemm_transpose_8x8_avx2(cols);
 
@@ -1328,12 +1328,12 @@ static inline void gemm_8x6_panel_avx2fma_add(
     else
     {
         alignas(32) float temp[8 * 6];
-        _mm256_store_ps(temp + 0 * 8, acc0);
-        _mm256_store_ps(temp + 1 * 8, acc1);
-        _mm256_store_ps(temp + 2 * 8, acc2);
-        _mm256_store_ps(temp + 3 * 8, acc3);
-        _mm256_store_ps(temp + 4 * 8, acc4);
-        _mm256_store_ps(temp + 5 * 8, acc5);
+        GEMM_STORE_PS(temp + 0 * 8, acc0);
+        GEMM_STORE_PS(temp + 1 * 8, acc1);
+        GEMM_STORE_PS(temp + 2 * 8, acc2);
+        GEMM_STORE_PS(temp + 3 * 8, acc3);
+        GEMM_STORE_PS(temp + 4 * 8, acc4);
+        GEMM_STORE_PS(temp + 5 * 8, acc5);
         for (size_t r = 0; r < m; ++r)
         {
             float *cr = c + r * ldc;
@@ -1378,7 +1378,7 @@ static inline void gemm_8x6_panel_avx2fma_store(
             size_t kk = k + u;
             if (kk >= Kblk)
                 break;
-            __m256 a = _mm256_load_ps(Ap + kk * a_k_stride); // ← USE STRIDE
+            __m256 a = GEMM_LOAD_PS(Ap + kk * a_k_stride); // ← USE STRIDE
             const float *b_row = Bp + kk * b_k_stride;       // ← USE STRIDE
             __m256 b;
             b = _mm256_broadcast_ss(b_row + 0);
@@ -1404,16 +1404,16 @@ static inline void gemm_8x6_panel_avx2fma_store(
     if (m == 8 && n == 6)
     {
         alignas(32) float temp[8 * 8] = {0};
-        _mm256_store_ps(temp + 0 * 8, acc0);
-        _mm256_store_ps(temp + 1 * 8, acc1);
-        _mm256_store_ps(temp + 2 * 8, acc2);
-        _mm256_store_ps(temp + 3 * 8, acc3);
-        _mm256_store_ps(temp + 4 * 8, acc4);
-        _mm256_store_ps(temp + 5 * 8, acc5);
+        GEMM_STORE_PS(temp + 0 * 8, acc0);
+        GEMM_STORE_PS(temp + 1 * 8, acc1);
+        GEMM_STORE_PS(temp + 2 * 8, acc2);
+        GEMM_STORE_PS(temp + 3 * 8, acc3);
+        GEMM_STORE_PS(temp + 4 * 8, acc4);
+        GEMM_STORE_PS(temp + 5 * 8, acc5);
 
         __m256 cols[8];
         for (int j = 0; j < 8; ++j)
-            cols[j] = _mm256_load_ps(temp + j * 8);
+            cols[j] = GEMM_LOAD_PS(temp + j * 8);
 
         gemm_transpose_8x8_avx2(cols);
 
@@ -1430,12 +1430,12 @@ static inline void gemm_8x6_panel_avx2fma_store(
     else
     {
         alignas(32) float temp[8 * 6];
-        _mm256_store_ps(temp + 0 * 8, acc0);
-        _mm256_store_ps(temp + 1 * 8, acc1);
-        _mm256_store_ps(temp + 2 * 8, acc2);
-        _mm256_store_ps(temp + 3 * 8, acc3);
-        _mm256_store_ps(temp + 4 * 8, acc4);
-        _mm256_store_ps(temp + 5 * 8, acc5);
+        GEMM_STORE_PS(temp + 0 * 8, acc0);
+        GEMM_STORE_PS(temp + 1 * 8, acc1);
+        GEMM_STORE_PS(temp + 2 * 8, acc2);
+        GEMM_STORE_PS(temp + 3 * 8, acc3);
+        GEMM_STORE_PS(temp + 4 * 8, acc4);
+        GEMM_STORE_PS(temp + 5 * 8, acc5);
         for (size_t r = 0; r < m; ++r)
         {
             float *cr = c + r * ldc;
@@ -1499,8 +1499,8 @@ static inline void gemm_8x16_panel_avx2fma_add(
                 PREFETCH_T0(b + b_k_stride); // ← USE STRIDE
             }
 
-            __m256 b0 = _mm256_load_ps(b);
-            __m256 b1 = _mm256_load_ps(b + 8);
+            __m256 b0 = GEMM_LOAD_PS(b);
+            __m256 b1 = GEMM_LOAD_PS(b + 8);
 
             __m256 a0 = _mm256_broadcast_ss(a + 0);
             c00 = _mm256_fmadd_ps(a0, b0, c00);
@@ -1596,8 +1596,8 @@ static inline void gemm_8x16_panel_avx2fma_add(
     for (size_t k = 0; k < Kblk; ++k)
     {
         const float *b = Bp + k * b_k_stride; // ← USE STRIDE
-        __m256 b0 = _mm256_load_ps(b);
-        __m256 b1 = _mm256_load_ps(b + 8);
+        __m256 b0 = GEMM_LOAD_PS(b);
+        __m256 b1 = GEMM_LOAD_PS(b + 8);
 
         for (size_t r = 0; r < m; ++r)
         {
@@ -1605,22 +1605,22 @@ static inline void gemm_8x16_panel_avx2fma_add(
             float a_val = Ap[k * a_k_stride + r]; // ← CORRECTED!
             __m256 a_broadcast = _mm256_broadcast_ss(&a_val);
 
-            __m256 t0 = _mm256_load_ps(temp + r * 16);
-            __m256 t1 = _mm256_load_ps(temp + r * 16 + 8);
+            __m256 t0 = GEMM_LOAD_PS(temp + r * 16);
+            __m256 t1 = GEMM_LOAD_PS(temp + r * 16 + 8);
 
             t0 = _mm256_fmadd_ps(a_broadcast, b0, t0);
             t1 = _mm256_fmadd_ps(a_broadcast, b1, t1);
 
-            _mm256_store_ps(temp + r * 16, t0);
-            _mm256_store_ps(temp + r * 16 + 8, t1);
+            GEMM_STORE_PS(temp + r * 16, t0);
+            GEMM_STORE_PS(temp + r * 16 + 8, t1);
         }
     }
 
     for (size_t r = 0; r < m; ++r)
     {
         float *cr = c + r * ldc;
-        __m256 t0 = _mm256_load_ps(temp + r * 16);
-        __m256 t1 = _mm256_load_ps(temp + r * 16 + 8);
+        __m256 t0 = GEMM_LOAD_PS(temp + r * 16);
+        __m256 t1 = GEMM_LOAD_PS(temp + r * 16 + 8);
 
         if (n <= 8)
         {
@@ -1704,8 +1704,8 @@ static inline void gemm_8x16_panel_avx2fma_store(
             }
 
             // Iteration k
-            __m256 b0_k0 = _mm256_load_ps(b);
-            __m256 b1_k0 = _mm256_load_ps(b + 8);
+            __m256 b0_k0 = GEMM_LOAD_PS(b);
+            __m256 b1_k0 = GEMM_LOAD_PS(b + 8);
 
             __m256 a0_k0 = _mm256_broadcast_ss(a + 0);
             c00 = _mm256_fmadd_ps(a0_k0, b0_k0, c00);
@@ -1740,8 +1740,8 @@ static inline void gemm_8x16_panel_avx2fma_store(
             c71 = _mm256_fmadd_ps(a7_k0, b1_k0, c71);
 
             // Iteration k+1
-            __m256 b0_k1 = _mm256_load_ps(b + b_k_stride);     // ← USE STRIDE
-            __m256 b1_k1 = _mm256_load_ps(b + b_k_stride + 8); // ← USE STRIDE
+            __m256 b0_k1 = GEMM_LOAD_PS(b + b_k_stride);     // ← USE STRIDE
+            __m256 b1_k1 = GEMM_LOAD_PS(b + b_k_stride + 8); // ← USE STRIDE
 
             __m256 a0_k1 = _mm256_broadcast_ss(a + a_k_stride + 0); // ← USE STRIDE
             c00 = _mm256_fmadd_ps(a0_k1, b0_k1, c00);
@@ -1781,8 +1781,8 @@ static inline void gemm_8x16_panel_avx2fma_store(
 
         if (k < Kblk)
         {
-            __m256 b0 = _mm256_load_ps(b);
-            __m256 b1 = _mm256_load_ps(b + 8);
+            __m256 b0 = GEMM_LOAD_PS(b);
+            __m256 b1 = GEMM_LOAD_PS(b + 8);
 
             __m256 a0 = _mm256_broadcast_ss(a + 0);
             c00 = _mm256_fmadd_ps(a0, b0, c00);
@@ -1866,8 +1866,8 @@ static inline void gemm_8x16_panel_avx2fma_store(
             PREFETCH_T0(Ap + (k + 1) * a_k_stride); // ← USE STRIDE
         }
 
-        __m256 b0 = _mm256_load_ps(b);
-        __m256 b1 = _mm256_load_ps(b + 8);
+        __m256 b0 = GEMM_LOAD_PS(b);
+        __m256 b1 = GEMM_LOAD_PS(b + 8);
 
         size_t r = 0;
         for (; r + 1 < m; r += 2)
@@ -1875,22 +1875,22 @@ static inline void gemm_8x16_panel_avx2fma_store(
             // CRITICAL FIX: Column-major access with stride
             float a_val0 = Ap[k * a_k_stride + r]; // ← CORRECTED!
             __m256 a_broadcast0 = _mm256_broadcast_ss(&a_val0);
-            __m256 t00 = _mm256_load_ps(temp + r * 16);
-            __m256 t01 = _mm256_load_ps(temp + r * 16 + 8);
+            __m256 t00 = GEMM_LOAD_PS(temp + r * 16);
+            __m256 t01 = GEMM_LOAD_PS(temp + r * 16 + 8);
             t00 = _mm256_fmadd_ps(a_broadcast0, b0, t00);
             t01 = _mm256_fmadd_ps(a_broadcast0, b1, t01);
-            _mm256_store_ps(temp + r * 16, t00);
-            _mm256_store_ps(temp + r * 16 + 8, t01);
+            GEMM_STORE_PS(temp + r * 16, t00);
+            GEMM_STORE_PS(temp + r * 16 + 8, t01);
 
             // CRITICAL FIX: Column-major access with stride
             float a_val1 = Ap[k * a_k_stride + (r + 1)]; // ← CORRECTED!
             __m256 a_broadcast1 = _mm256_broadcast_ss(&a_val1);
-            __m256 t10 = _mm256_load_ps(temp + (r + 1) * 16);
-            __m256 t11 = _mm256_load_ps(temp + (r + 1) * 16 + 8);
+            __m256 t10 = GEMM_LOAD_PS(temp + (r + 1) * 16);
+            __m256 t11 = GEMM_LOAD_PS(temp + (r + 1) * 16 + 8);
             t10 = _mm256_fmadd_ps(a_broadcast1, b0, t10);
             t11 = _mm256_fmadd_ps(a_broadcast1, b1, t11);
-            _mm256_store_ps(temp + (r + 1) * 16, t10);
-            _mm256_store_ps(temp + (r + 1) * 16 + 8, t11);
+            GEMM_STORE_PS(temp + (r + 1) * 16, t10);
+            GEMM_STORE_PS(temp + (r + 1) * 16 + 8, t11);
         }
 
         if (r < m)
@@ -1898,20 +1898,20 @@ static inline void gemm_8x16_panel_avx2fma_store(
             // CRITICAL FIX: Column-major access with stride
             float a_val = Ap[k * a_k_stride + r]; // ← CORRECTED!
             __m256 a_broadcast = _mm256_broadcast_ss(&a_val);
-            __m256 t0 = _mm256_load_ps(temp + r * 16);
-            __m256 t1 = _mm256_load_ps(temp + r * 16 + 8);
+            __m256 t0 = GEMM_LOAD_PS(temp + r * 16);
+            __m256 t1 = GEMM_LOAD_PS(temp + r * 16 + 8);
             t0 = _mm256_fmadd_ps(a_broadcast, b0, t0);
             t1 = _mm256_fmadd_ps(a_broadcast, b1, t1);
-            _mm256_store_ps(temp + r * 16, t0);
-            _mm256_store_ps(temp + r * 16 + 8, t1);
+            GEMM_STORE_PS(temp + r * 16, t0);
+            GEMM_STORE_PS(temp + r * 16 + 8, t1);
         }
     }
 
     for (size_t r = 0; r < m; ++r)
     {
         float *cr = c + r * ldc;
-        __m256 t0 = _mm256_load_ps(temp + r * 16);
-        __m256 t1 = _mm256_load_ps(temp + r * 16 + 8);
+        __m256 t0 = GEMM_LOAD_PS(temp + r * 16);
+        __m256 t1 = GEMM_LOAD_PS(temp + r * 16 + 8);
 
         if (n <= 8)
         {
