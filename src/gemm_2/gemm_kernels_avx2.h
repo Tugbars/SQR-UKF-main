@@ -49,15 +49,6 @@
 #endif
 #endif
 
-// Alignment helper
-#ifndef LINALG_ASSUME_ALIGNED
-#if defined(__GNUC__) || defined(__clang__)
-#define LINALG_ASSUME_ALIGNED(p, n) (p) = (__typeof__(p))__builtin_assume_aligned((p), (n))
-#else
-#define LINALG_ASSUME_ALIGNED(p, n) ((void)0)
-#endif
-#endif
-
 //==============================================================================
 // CONFIGURATION: Aligned vs Unaligned Memory Operations
 //==============================================================================
@@ -89,6 +80,15 @@
 // Masked operations (always available, unaligned by nature)
 #define GEMM_MASKLOAD_PS(ptr, mask) _mm256_maskload_ps(ptr, mask)
 #define GEMM_MASKSTORE_PS(ptr, mask, val) _mm256_maskstore_ps(ptr, mask, val)
+
+// Alignment helper
+#ifndef LINALG_ASSUME_ALIGNED
+#if GEMM_USE_ALIGNED_OPS && (defined(__GNUC__) || defined(__clang__))
+#define LINALG_ASSUME_ALIGNED(p, n) (p) = (__typeof__(p))__builtin_assume_aligned((p), (n))
+#else
+#define LINALG_ASSUME_ALIGNED(p, n) ((void)0)
+#endif
+#endif
 
 //==============================================================================
 // HELPER: Build mask for any width (handles > 8)
