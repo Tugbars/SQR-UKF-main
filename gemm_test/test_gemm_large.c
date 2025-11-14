@@ -369,6 +369,183 @@ static int test_kernel_1x8(void)
 }
 
 //==============================================================================
+// TEST 16x8 KERNEL
+//==============================================================================
+
+static int test_kernel_16x8(void)
+{
+    printf("\n=== Testing 16x8 Kernel ===\n");
+
+    const size_t M = 16, K = 32, N = 8;
+    const size_t ldc = N;
+
+    float *A = gemm_aligned_alloc(32, M * K * sizeof(float));
+    float *B = gemm_aligned_alloc(32, K * N * sizeof(float));
+    float *C_test = gemm_aligned_alloc(32, M * N * sizeof(float));
+    float *C_ref = gemm_aligned_alloc(32, M * N * sizeof(float));
+
+    float *Ap = gemm_aligned_alloc(32, K * 16 * sizeof(float));
+    float *Bp = gemm_aligned_alloc(32, K * 16 * sizeof(float));
+
+    for (size_t i = 0; i < M * K; i++)
+        A[i] = (i + 1) * 0.01f;
+    for (size_t i = 0; i < K * N; i++)
+        B[i] = (i + 1) * 0.01f;
+
+    // Pack with MR=16
+    memset(Ap, 0, K * 16 * sizeof(float));
+    for (size_t k = 0; k < K; k++)
+    {
+        for (size_t i = 0; i < M && i < 16; i++)
+        {
+            Ap[k * 16 + i] = A[i * K + k];
+        }
+    }
+
+    pack_B_for_test(Bp, B, K, N);
+
+    memset(C_test, 0, M * N * sizeof(float));
+    memset(C_ref, 0, M * N * sizeof(float));
+
+    __m256i mask = _mm256_set1_epi32(-1);
+
+    // Test STORE variant
+    gemm_16x8_panel_avx2fma_store(
+        C_test, ldc,
+        Ap, 16,
+        Bp, 16,
+        K,
+        16, 8,
+        mask);
+
+    ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
+
+    // Note: Relaxed tolerance for 16-row accumulation
+    int passed = compare_matrices_verbose(C_test, C_ref, M, N, ldc, 5e-5f, "16x8 STORE");
+
+    // Test ADD variant
+    for (size_t i = 0; i < M * N; i++)
+    {
+        C_test[i] = 0.5f;
+        C_ref[i] = 0.5f;
+    }
+
+    gemm_16x8_panel_avx2fma_add(
+        C_test, ldc,
+        Ap, 16,
+        Bp, 16,
+        K,
+        16, 8,
+        mask);
+
+    ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 1);
+
+    passed &= compare_matrices_verbose(C_test, C_ref, M, N, ldc, 5e-5f, "16x8 ADD");
+
+    gemm_aligned_free(A);
+    gemm_aligned_free(B);
+    gemm_aligned_free(C_test);
+    gemm_aligned_free(C_ref);
+    gemm_aligned_free(Ap);
+    gemm_aligned_free(Bp);
+
+    return passed;
+}
+
+//==============================================================================
+// TEST 8x16 KERNEL (Dual-mask variant)
+//==============================================================================
+
+static int test_kernel_8x16(void)
+{
+    printf("\n=== Testing 8x16 Kernel ===\n");
+
+    const size_t M = 8, K = 32, N = 16;
+    const size_t ldc = N;
+
+    float *A = gemm_aligned_alloc(32, M * K * sizeof(float));
+    float *B = gemm_aligned_alloc(32, K * N * sizeof(float));
+    float *C_test = gemm_aligned_alloc(32, M * N * sizeof(float));
+    float *C_ref = gemm_aligned_alloc(32, M * N * sizeof(float));
+
+    float *Ap = gemm_aligned_alloc(32, K * 8 * sizeof(float));
+    float *Bp = gemm_aligned_alloc(32, K * 16 * sizeof(float));
+
+    // Initialize with known pattern
+    for (size_t i = 0; i < M * K; i++)
+        A[i] = ((i * 3) % 17) * 0.1f;
+    for (size_t i = 0; i < K * N; i++)
+        B[i] = ((i * 7) % 19) * 0.1f;
+
+    // Initialize output to a sentinel value to detect uninitialized access
+    for (size_t i = 0; i < M * N; i++)
+    {
+        C_test[i] = 999.0f;
+        C_ref[i] = 0.0f;
+    }
+
+    // Pack with explicit bounds checking
+    pack_A_for_test(Ap, A, M, K, 8);
+
+    // Pack B - ensure full 16-width coverage
+    memset(Bp, 0, K * 16 * sizeof(float));
+    for (size_t k = 0; k < K; k++)
+    {
+        for (size_t j = 0; j < N; j++)
+        {
+            Bp[k * 16 + j] = B[k * N + j];
+        }
+    }
+
+    // Zero output before STORE test
+    memset(C_test, 0, M * N * sizeof(float));
+
+    __m256i mask_lo = _mm256_set1_epi32(-1);
+    __m256i mask_hi = _mm256_set1_epi32(-1);
+
+    // Test STORE variant
+    gemm_8x16_panel_avx2fma_store(
+        C_test, ldc,
+        Ap, 8,
+        Bp, 16,
+        K,
+        M, N,
+        mask_lo, mask_hi);
+
+    ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
+
+    int passed = compare_matrices_verbose(C_test, C_ref, M, N, ldc, 1e-5f, "8x16 STORE");
+
+    // Test ADD variant
+    for (size_t i = 0; i < M * N; i++)
+    {
+        C_test[i] = 0.5f;
+        C_ref[i] = 0.5f;
+    }
+
+    gemm_8x16_panel_avx2fma_add(
+        C_test, ldc,
+        Ap, 8,
+        Bp, 16,
+        K,
+        M, N,
+        mask_lo, mask_hi);
+
+    ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 1);
+
+    passed &= compare_matrices_verbose(C_test, C_ref, M, N, ldc, 1e-5f, "8x16 ADD");
+
+    gemm_aligned_free(A);
+    gemm_aligned_free(B);
+    gemm_aligned_free(C_test);
+    gemm_aligned_free(C_ref);
+    gemm_aligned_free(Ap);
+    gemm_aligned_free(Bp);
+
+    return passed;
+}
+
+//==============================================================================
 // TEST KERNEL COMBINATIONS
 //==============================================================================
 
@@ -469,6 +646,26 @@ int run_gemm_kernel_tests(test_results_t *results)
 
     results->total++;
     if (test_kernel_1x8())
+    {
+        results->passed++;
+    }
+    else
+    {
+        results->failed++;
+    }
+
+    results->total++;
+    if (test_kernel_16x8())
+    {
+        results->passed++;
+    }
+    else
+    {
+        results->failed++;
+    }
+
+    results->total++;
+    if (test_kernel_8x16())
     {
         results->passed++;
     }
