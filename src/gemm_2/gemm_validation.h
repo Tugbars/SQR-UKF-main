@@ -27,38 +27,8 @@
 #endif
 
 //==============================================================================
-// CONFIGURATION
-//==============================================================================
-
-#ifndef GEMM_VALIDATION_LEVEL
-#ifdef NDEBUG
-#define GEMM_VALIDATION_LEVEL 0 // Release: no validation
-#else
-#define GEMM_VALIDATION_LEVEL 2 // Debug: full bounds checking
-#endif
-#endif
-
-#ifndef GEMM_ALIGNMENT
-#define GEMM_ALIGNMENT 32 // Default AVX2 alignment (AVX-512: 64)
-#endif
-
-// Enable verbose validation logging
-#ifndef GEMM_VALIDATION_VERBOSE
-#define GEMM_VALIDATION_VERBOSE 0
-#endif
-
-//==============================================================================
 // UNIFIED DIAGNOSTIC MACROS
 //==============================================================================
-
-#define VALIDATION_ERROR(msg, ...)                              \
-    do                                                          \
-    {                                                           \
-        fprintf(stderr, "VALIDATION ERROR at %s:%d: " msg "\n", \
-                __FILE__, __LINE__, ##__VA_ARGS__);             \
-        fflush(stderr);                                         \
-        abort();                                                \
-    } while (0)
 
 #define VALIDATION_ASSERT(cond, msg, ...)                              \
     do                                                                 \
@@ -119,16 +89,6 @@
             VALIDATION_ERROR("NULL pointer: %s", #ptr); \
         }                                               \
         VALIDATE_HEAP_PTR(ptr);                         \
-    } while (0)
-
-#define VALIDATE_ALIGNED(ptr, alignment)                           \
-    do                                                             \
-    {                                                              \
-        if (((uintptr_t)(ptr) & ((alignment) - 1)) != 0)           \
-        {                                                          \
-            VALIDATION_ERROR("Pointer %p is not %zu-byte aligned", \
-                             (ptr), (size_t)(alignment));          \
-        }                                                          \
     } while (0)
 
 // Kernel entry macro
@@ -420,3 +380,5 @@ static inline void gemm_validate_bounds(const void *ptr, size_t size)
     } while (0)
 #define GEMM_VALIDATE(ptr, size) ((void)0)
 #endif
+
+#endif // GEMM_VALIDATION_H
