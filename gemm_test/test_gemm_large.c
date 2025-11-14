@@ -13,6 +13,97 @@
 #include <math.h>
 
 //==============================================================================
+// MASK GENERATION (copied to avoid linking dependencies)
+//==============================================================================
+
+/**
+ * @brief Build AVX2 mask for partial vector (0-8 lanes)
+ */
+inline void gemm_test_build_mask_avx2(size_t n, __m256i *out)
+{
+    if (n > 8)
+        n = 8;
+
+#if defined(__AVX2__)
+    static const union
+    {
+        __m256i v;
+        int32_t i[8];
+    } lut[9] __attribute__((aligned(32))) = {
+        {.i = {0, 0, 0, 0, 0, 0, 0, 0}},        // 0
+        {.i = {-1, 0, 0, 0, 0, 0, 0, 0}},       // 1
+        {.i = {-1, -1, 0, 0, 0, 0, 0, 0}},      // 2
+        {.i = {-1, -1, -1, 0, 0, 0, 0, 0}},     // 3
+        {.i = {-1, -1, -1, -1, 0, 0, 0, 0}},    // 4
+        {.i = {-1, -1, -1, -1, -1, 0, 0, 0}},   // 5
+        {.i = {-1, -1, -1, -1, -1, -1, 0, 0}},  // 6
+        {.i = {-1, -1, -1, -1, -1, -1, -1, 0}}, // 7
+        {.i = {-1, -1, -1, -1, -1, -1, -1, -1}} // 8
+    };
+    memcpy(out, &lut[n].v, sizeof(__m256i));
+#else
+    int32_t tmp[8];
+    for (size_t k = 0; k < 8; ++k)
+    {
+        tmp[k] = (k < n) ? -1 : 0;
+    }
+    memcpy(out, tmp, sizeof(__m256i));
+#endif
+}
+
+/**
+ * @brief Build mask pair for 16-wide panels
+ */
+inline void gemm_test_build_mask_pair16(size_t w, __m256i *lo, __m256i *hi)
+{
+    if (w >= 16)
+    {
+        gemm_test_build_mask_avx2(8, lo);
+        gemm_test_build_mask_avx2(8, hi);
+    }
+    else if (w > 8)
+    {
+        gemm_test_build_mask_avx2(8, lo);
+        gemm_test_build_mask_avx2(w - 8, hi);
+    }
+    else
+    {
+        gemm_test_build_mask_avx2(w, lo);
+        gemm_test_build_mask_avx2(0, hi);
+    }
+}
+
+//==============================================================================
+// SAFE STORE MACRO (Reference Implementation)
+//==============================================================================
+
+/**
+ * @brief Safe bounds-checked store for 8×16 tiles
+ *
+ * This macro ensures NO out-of-bounds writes by:
+ * 1. Only storing rows r < m
+ * 2. Only storing high 8 columns if n > 8
+ * 3. Using masks for partial columns
+ *
+ * This is the CORRECT way to write microkernel output!
+ */
+#define GEMM_STORE_TILE_8x16(C, ldc, acc_lo, acc_hi, m, n, mask_lo, mask_hi)            \
+    do                                                                                  \
+    {                                                                                   \
+        for (size_t rr = 0; rr < 8; rr++)                                               \
+        {                                                                               \
+            if (rr < (m))                                                               \
+            {                                                                           \
+                /* store columns 0–7 */                                                 \
+                _mm256_maskstore_ps((C) + rr * (ldc) + 0, (mask_lo), (acc_lo)[rr]);     \
+                /* store columns 8–15 only if needed */                                 \
+                if ((n) > 8)                                                            \
+                    _mm256_maskstore_ps((C) + rr * (ldc) + 8, (mask_hi), (acc_hi)[rr]); \
+            }                                                                           \
+        }                                                                               \
+    } while (0)
+
+//==============================================================================
 // TEST INFRASTRUCTURE
 //==============================================================================
 
@@ -159,9 +250,13 @@ static void pack_B_for_test(float *Bp, const float *B, size_t K, size_t N)
 static int test_kernel_8x8(void)
 {
     printf("\n=== Testing 8x8 Kernel ===\n");
+    fflush(stdout);
 
     const size_t M = 8, K = 32, N = 8;
     const size_t ldc = N;
+
+    printf("  Allocating buffers...\n");
+    fflush(stdout);
 
     // Use library's aligned allocation
     float *A = gemm_aligned_alloc(32, M * K * sizeof(float));
@@ -172,13 +267,27 @@ static int test_kernel_8x8(void)
     float *Ap = gemm_aligned_alloc(32, K * 8 * sizeof(float));
     float *Bp = gemm_aligned_alloc(32, K * 16 * sizeof(float));
 
+    if (!A || !B || !C_test || !C_ref || !Ap || !Bp)
+    {
+        printf("  ERROR: Allocation failed!\n");
+        return 0;
+    }
+
+    printf("  Initializing data...\n");
+    fflush(stdout);
+
     // Initialize
     for (size_t i = 0; i < M * K; i++)
         A[i] = (i % 7) * 0.1f;
     for (size_t i = 0; i < K * N; i++)
         B[i] = (i % 5) * 0.1f;
 
+    printf("  Packing A...\n");
+    fflush(stdout);
     pack_A_for_test(Ap, A, M, K, 8);
+
+    printf("  Packing B...\n");
+    fflush(stdout);
     pack_B_for_test(Bp, B, K, N);
 
     // Test STORE variant
@@ -512,19 +621,20 @@ static int test_kernel_8x16(void)
     // Zero output before STORE test
     memset(C_test, 0, M * N * sizeof(float));
 
-    __m256i mask_lo = _mm256_set1_epi32(-1);
-    __m256i mask_hi = _mm256_set1_epi32(-1);
+    // Build masks for 16-wide panel
+    __m256i mask_lo, mask_hi;
+    gemm_test_build_mask_pair16(N, &mask_lo, &mask_hi);
 
     printf("  Calling 8x16 STORE kernel...\n");
     fflush(stdout); // Ensure we see this before crash
 
-    // Test STORE variant
+    // Test STORE variant - CRITICAL: pass actual M and N!
     gemm_8x16_panel_avx2fma_store(
         C_test, ldc,
         Ap, 8,
         Bp, 16,
         K,
-        M, N,
+        M, N, // ← CRITICAL: Actual dimensions, not assumed 8×16
         mask_lo, mask_hi);
 
     printf("  STORE kernel completed\n");
@@ -610,7 +720,7 @@ static int test_kernel_16x6(void)
     memset(C_ref, 0, M * N * sizeof(float));
 
     __m256i mask;
-    gemm_build_mask_avx2(N, &mask);
+    gemm_test_build_mask_avx2(N, &mask);
 
     // Test STORE
     gemm_16x6_panel_avx2fma_store(
@@ -685,7 +795,7 @@ static int test_kernel_8x6(void)
     memset(C_ref, 0, M * N * sizeof(float));
 
     __m256i mask;
-    gemm_build_mask_avx2(N, &mask);
+    gemm_test_build_mask_avx2(N, &mask);
 
     // Test STORE
     gemm_8x6_panel_avx2fma_store(
@@ -802,7 +912,7 @@ static int test_edge_cases(void)
         memset(C_ref, 0, M * N * sizeof(float));
 
         __m256i mask;
-        gemm_build_mask_avx2(N, &mask);
+        gemm_test_build_mask_avx2(N, &mask);
 
         gemm_8x8_panel_avx2fma_store(C_test, ldc, Ap, 8, Bp, 16, K, M, N, mask);
         ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
@@ -1031,3 +1141,4 @@ int main(void)
     return run_gemm_kernel_tests(&results);
 }
 #endif
+
