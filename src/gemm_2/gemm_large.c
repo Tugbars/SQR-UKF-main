@@ -30,16 +30,16 @@
 // STRIDE DESCRIPTOR
 //==============================================================================
 
-
 /**
  * @brief Describes strides used in packed buffers
- * 
+ *
  * Used to make stride contracts explicit between packing and kernel execution.
  * Helps catch packing/kernel mismatches at runtime via assertions.
  */
-typedef struct {
-    size_t a_k_stride;   // Stride between K iterations in packed A (MR: 8 or 16)
-    size_t b_k_stride;   // Stride between K iterations in packed B (always 16)
+typedef struct
+{
+    size_t a_k_stride; // Stride between K iterations in packed A (MR: 8 or 16)
+    size_t b_k_stride; // Stride between K iterations in packed B (always 16)
 } pack_strides_t;
 
 /**
@@ -102,16 +102,16 @@ static pack_strides_t pack_A_panel_scaled(
     size_t i0, size_t ib,
     size_t k0, size_t kb,
     float alpha,
-    size_t requested_mr)  // Explicit request from caller
+    size_t requested_mr) // Explicit request from caller
 {
     (void)M;
 
     // Determine actual MR based on tile height
     size_t actual_mr = (ib >= 16) ? 16 : 8;
-    
+
     // Validate: catch planning/packing mismatches
     assert(requested_mr == actual_mr && "MR mismatch: planning error");
-    
+
     memset(Ap, 0, kb * actual_mr * sizeof(float));
 
     if (alpha == 1.0f)
@@ -124,7 +124,7 @@ static pack_strides_t pack_A_panel_scaled(
             }
 
             const float *src_col = A + i0 * K + (k0 + k);
-            float *dst = Ap + k * actual_mr;  // Use actual_mr
+            float *dst = Ap + k * actual_mr; // Use actual_mr
 
             for (size_t i = 0; i < ib; ++i)
             {
@@ -142,7 +142,7 @@ static pack_strides_t pack_A_panel_scaled(
             }
 
             const float *src_col = A + i0 * K + (k0 + k);
-            float *dst = Ap + k * actual_mr;  // Use actual_mr
+            float *dst = Ap + k * actual_mr; // Use actual_mr
 
             for (size_t i = 0; i < ib; ++i)
             {
@@ -154,7 +154,7 @@ static pack_strides_t pack_A_panel_scaled(
     // Return actual stride used
     pack_strides_t strides;
     strides.a_k_stride = actual_mr;
-    strides.b_k_stride = 0;  // N/A for A
+    strides.b_k_stride = 0; // N/A for A
     return strides;
 }
 
@@ -169,9 +169,9 @@ static pack_strides_t pack_B_panel(
     size_t j0, size_t jb)
 {
     (void)K;
-    
-    const size_t B_STRIDE = 16;  // Always pad to 16
-    
+
+    const size_t B_STRIDE = 16; // Always pad to 16
+
     memset(Bp, 0, kb * B_STRIDE * sizeof(float));
 
     for (size_t k = 0; k < kb; ++k)
@@ -193,7 +193,7 @@ static pack_strides_t pack_B_panel(
 
     // Return actual stride used
     pack_strides_t strides;
-    strides.a_k_stride = 0;          // N/A for B
+    strides.a_k_stride = 0; // N/A for B
     strides.b_k_stride = B_STRIDE;
     return strides;
 }
@@ -207,9 +207,9 @@ static inline void dispatch_kernel(
     float *restrict c,
     size_t ldc,
     const float *restrict Ap,
-    size_t a_k_stride,  // ← ADDED
+    size_t a_k_stride, // ← ADDED
     const float *restrict Bp,
-    size_t b_k_stride,  // ← ADDED
+    size_t b_k_stride, // ← ADDED
     size_t Kblk,
     size_t m_block,
     size_t n_block,
@@ -283,6 +283,7 @@ static inline void dispatch_kernel(
                                     Bp, b_k_stride, Kblk, m_block - 8, n_block,
                                     mask_lo, mask_hi);
         break;
+
     case KERN_16x16_STORE:
         gemm_8x16_panel_avx2fma_store(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
                                       Kblk, 8, n_block, mask_lo, mask_hi);
@@ -378,7 +379,7 @@ int gemm_execute_plan(
                 size_t j = j0 + p * plan->NR;
                 size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                float *Bp_panel = Bp + p * plan->KC * 16;  // B always padded to stride 16
+                float *Bp_panel = Bp + p * plan->KC * 16; // B always padded to stride 16
 
                 // CAPTURE B stride from packing
                 b_strides = pack_B_panel(Bp_panel, B, plan->K, plan->N,
@@ -438,9 +439,9 @@ int gemm_execute_plan(
                             cptr,
                             plan->N,
                             Ap,
-                            a_strides.a_k_stride,  // ← EXPLICIT A stride
+                            a_strides.a_k_stride, // ← EXPLICIT A stride
                             bptr,
-                            b_strides.b_k_stride,  // ← EXPLICIT B stride
+                            b_strides.b_k_stride, // ← EXPLICIT B stride
                             kb,
                             mh,
                             jw,

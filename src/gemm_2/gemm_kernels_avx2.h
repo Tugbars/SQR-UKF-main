@@ -1460,8 +1460,8 @@ void gemm_8x16_panel_avx2fma_add(
     __m256i mask_lo,
     __m256i mask_hi)
 {
-    assert(a_k_stride == 8 && "8x16 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
+
 
     LINALG_ASSUME_ALIGNED(Ap, 32);
     LINALG_ASSUME_ALIGNED(Bp, 32);
@@ -1664,8 +1664,7 @@ void gemm_8x16_panel_avx2fma_store(
     __m256i mask_lo,
     __m256i mask_hi)
 {
-    assert(a_k_stride == 8 && "8x16 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
 
     LINALG_ASSUME_ALIGNED(Ap, 32);
     LINALG_ASSUME_ALIGNED(Bp, 32);

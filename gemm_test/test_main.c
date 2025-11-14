@@ -1,27 +1,22 @@
 /**
  * @file test_main.c
  * @brief Unified test runner for all GEMM test suites
- * 
- * Runs all test suites and aggregates results
- * 
- * @author TUGBARS
- * @date 2025
  */
 
 #include "test_common.h"
 #include <stdio.h>
 #include <string.h>
 
-// Test suite runners (declared in respective test files)
+// Test suite runners
 extern int run_gemm_small_tests(test_results_t *results);
 extern int run_gemm_planning_tests(test_results_t *results);
-extern int run_gemm_large_tests(test_results_t *results);  // ← NEW
+extern int run_gemm_kernel_tests(test_results_t *results);  // ← In test_gemm_large.c
 
 int main(int argc, char **argv)
 {
     test_results_t small_results = {0};
     test_results_t planning_results = {0};
-    test_results_t large_results = {0};  // ← NEW
+    test_results_t kernel_results = {0};
     test_results_t total_results = {0};
 
     printf("\n");
@@ -29,30 +24,30 @@ int main(int argc, char **argv)
     printf("║             GEMM Library - Full Test Suite               ║\n");
     printf("╚═══════════════════════════════════════════════════════════╝\n");
 
-    // Parse command-line arguments for selective testing
+    // Parse command-line arguments
     int run_small = 1;
     int run_planning = 1;
-    int run_large = 1;  // ← NEW
+    int run_kernels = 1;
 
     if (argc > 1) {
         run_small = 0;
         run_planning = 0;
-        run_large = 0;  // ← NEW
+        run_kernels = 0;
         
         for (int i = 1; i < argc; i++) {
-            if (strcmp(argv[i], "small") == 0 || strcmp(argv[i], "tier1") == 0) {
+            if (strcmp(argv[i], "small") == 0) {
                 run_small = 1;
             } else if (strcmp(argv[i], "planning") == 0) {
                 run_planning = 1;
-            } else if (strcmp(argv[i], "large") == 0 || strcmp(argv[i], "tier2") == 0) {  // ← NEW
-                run_large = 1;
+            } else if (strcmp(argv[i], "kernels") == 0) {
+                run_kernels = 1;
             } else if (strcmp(argv[i], "all") == 0) {
                 run_small = 1;
                 run_planning = 1;
-                run_large = 1;  // ← NEW
+                run_kernels = 1;
             } else {
                 printf("Unknown test suite: %s\n", argv[i]);
-                printf("Usage: %s [small|planning|large|all]\n", argv[0]);
+                printf("Usage: %s [small|planning|kernels|all]\n", argv[0]);
                 return 1;
             }
         }
@@ -78,21 +73,24 @@ int main(int argc, char **argv)
         run_gemm_planning_tests(&planning_results);
     }
 
-    if (run_large) {  // ← NEW
+    if (run_kernels) {
         printf("\n");
         printf("════════════════════════════════════════════════════════════\n");
-        printf(" Running: Tier 2 (Large Matrices) Test Suite\n");
+        printf(" Running: Individual Kernel Unit Tests\n");
         printf("════════════════════════════════════════════════════════════\n");
-        run_gemm_large_tests(&large_results);
+        run_gemm_kernel_tests(&kernel_results);
     }
 
     //==========================================================================
     // Aggregate results
     //==========================================================================
 
-    total_results.total = small_results.total + planning_results.total + large_results.total;  // ← UPDATED
-    total_results.passed = small_results.passed + planning_results.passed + large_results.passed;  // ← UPDATED
-    total_results.failed = small_results.failed + planning_results.failed + large_results.failed;  // ← UPDATED
+    total_results.total = small_results.total + planning_results.total + 
+                         kernel_results.total;
+    total_results.passed = small_results.passed + planning_results.passed + 
+                          kernel_results.passed;
+    total_results.failed = small_results.failed + planning_results.failed + 
+                          kernel_results.failed;
 
     //==========================================================================
     // Final summary
@@ -104,20 +102,20 @@ int main(int argc, char **argv)
     printf("╠═══════════════════════════════════════════════════════════╣\n");
 
     if (run_small) {
-        printf("║  Small Kernels:  %3d/%3d passed                            ║\n",
+        printf("║  Small Matrices: %3d/%3d passed                           ║\n",
                small_results.passed, small_results.total);
     }
     if (run_planning) {
-        printf("║  Planning:       %3d/%3d passed                            ║\n",
+        printf("║  Planning:       %3d/%3d passed                           ║\n",
                planning_results.passed, planning_results.total);
     }
-    if (run_large) {  // ← NEW
-        printf("║  Large Matrices: %3d/%3d passed                            ║\n",
-               large_results.passed, large_results.total);
+    if (run_kernels) {
+        printf("║  Kernel Units:   %3d/%3d passed                           ║\n",
+               kernel_results.passed, kernel_results.total);
     }
 
     printf("╠═══════════════════════════════════════════════════════════╣\n");
-    printf("║  TOTAL:          %3d/%3d passed                            ║\n",
+    printf("║  TOTAL:          %3d/%3d passed                           ║\n",
            total_results.passed, total_results.total);
     printf("╚═══════════════════════════════════════════════════════════╝\n");
 
@@ -126,6 +124,13 @@ int main(int argc, char **argv)
         return 0;
     } else {
         printf("\n❌ " TEST_FAIL " %d test(s) failed\n\n", total_results.failed);
+        
+        // Provide guidance
+        if (kernel_results.failed > 0) {
+            printf("💡 TIP: Fix kernel unit tests first - they're the foundation.\n");
+            printf("   Run: ./test_all kernels\n\n");
+        }
+        
         return 1;
     }
 }
