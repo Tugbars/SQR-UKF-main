@@ -17,7 +17,7 @@
  * @date 2025
  */
 
-#include "gemm_kernels_avx2_safe.h"
+#include "gemm_kernels_avx2.h"
 #include "gemm_simd_ops.h"
 #include "gemm_small.h"
 #include "gemm_planning.h"
@@ -586,7 +586,7 @@ int gemm_dynamic(
     if (!plan)
         return -1;
 
-    ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
+    int ret = gemm_execute_plan(plan, C, A, B, alpha, beta);
     gemm_plan_destroy(plan);
     return ret;
 }

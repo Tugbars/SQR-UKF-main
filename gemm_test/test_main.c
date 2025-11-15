@@ -10,8 +10,9 @@
 // Test suite runners
 extern int run_gemm_small_tests(test_results_t *results);
 extern int run_gemm_planning_tests(test_results_t *results);
-extern int run_gemm_kernel_tests(test_results_t *results);  // ← In test_gemm_large.c
-extern int run_gemm_validated_tests(test_results_t *results); // ← NEW: validated kernel tests
+extern int run_gemm_kernel_tests(test_results_t *results);  
+extern int run_gemm_validated_tests(test_results_t *results); 
+extern int run_gemm_execute_tests(test_results_t *results);  
 
 int main(int argc, char **argv)
 {
@@ -19,6 +20,7 @@ int main(int argc, char **argv)
     test_results_t planning_results = {0};
     test_results_t kernel_results = {0};
     test_results_t validated_results = {0};
+    test_results_t execute_results = {0};  
     test_results_t total_results = {0};
 
     printf("\n");
@@ -31,6 +33,7 @@ int main(int argc, char **argv)
     int run_planning = 1;
     int run_kernels = 1;
     int run_validated = 1;
+    int run_execute = 1;  
 
     if (argc > 1) {
         run_small = 0;
@@ -45,14 +48,24 @@ int main(int argc, char **argv)
                 run_planning = 1;
             } else if (strcmp(argv[i], "kernels") == 0) {
                 run_kernels = 1;
-            } else if (strcmp(argv[i], "validated") == 0) {
+            }
+            else if (strcmp(argv[i], "validated") == 0)
+            {
                 run_validated = 1;
-            } else if (strcmp(argv[i], "all") == 0) {
+            }
+            else if (strcmp(argv[i], "execute") == 0)
+            { // ← NEW
+                run_execute = 1;
+            }
+            else if (strcmp(argv[i], "all") == 0)
+            {
                 run_small = 1;
                 run_planning = 1;
                 run_kernels = 1;
                 run_validated = 1;
-            } else {
+            }
+            else
+            {
                 printf("Unknown test suite: %s\n", argv[i]);
                 printf("Usage: %s [small|planning|kernels|validated|all]\n", argv[0]);
                 return 1;
@@ -96,6 +109,14 @@ int main(int argc, char **argv)
         run_gemm_validated_tests(&validated_results);
     }
 
+    if (run_execute) {  // ← NEW
+        printf("\n");
+        printf("════════════════════════════════════════════════════════════\n");
+        printf(" Running: Execution Pipeline Test Suite\n");
+        printf("════════════════════════════════════════════════════════════\n");
+        run_gemm_execute_tests(&execute_results);
+    }
+
     //==========================================================================
     // Aggregate results
     //==========================================================================
@@ -131,6 +152,10 @@ int main(int argc, char **argv)
     if (run_validated) {
         printf("║  Validated:      %3d/%3d passed                           ║\n",
                validated_results.passed, validated_results.total);
+    }
+    if (run_execute) {  // ← NEW
+        printf("║  Execution:      %3d/%3d passed                           ║\n",
+               execute_results.passed, execute_results.total);
     }
 
     printf("╠═══════════════════════════════════════════════════════════╣\n");
