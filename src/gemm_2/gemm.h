@@ -283,6 +283,10 @@ int kalman_update_simple(
     const float * restrict H,
     size_t n, size_t m);
 
+void gemm_get_tuning(size_t M, size_t K, size_t N,
+                     size_t *MC, size_t *KC, size_t *NC,
+                     size_t *MR, size_t *NR);
+
 
 #ifdef __cplusplus
 }
