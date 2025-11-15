@@ -14,7 +14,7 @@
 //==============================================================================
 
 #ifndef GEMM_STATIC_MAX_DIM
-#define GEMM_STATIC_MAX_DIM 512
+#define GEMM_STATIC_MAX_DIM 64
 #endif
 
 #define GEMM_STATIC_POOL_SIZE (GEMM_STATIC_MAX_DIM * GEMM_STATIC_MAX_DIM * sizeof(float))

@@ -37,6 +37,24 @@ typedef enum {
 } gemm_error_t;
 
 //==============================================================================
+// OPAQUE TYPES
+//==============================================================================
+
+/**
+ * @brief Opaque handle for GEMM execution plan
+ * 
+ * A plan encapsulates:
+ * - Matrix dimensions
+ * - Cache blocking parameters
+ * - Workspace allocation
+ * - Kernel selection
+ * 
+ * Plans can be reused for multiple GEMMs with the same dimensions,
+ * amortizing planning overhead across many operations.
+ */
+typedef struct gemm_plan gemm_plan_t;
+
+//==============================================================================
 // CONFIGURATION
 //==============================================================================
 
@@ -101,6 +119,63 @@ static inline int gemm(
 {
     return gemm_auto(C, A, B, M, K, N, 1.0f, 0.0f);
 }
+
+//==============================================================================
+// PLANNED EXECUTION API (for repeated GEMMs with same dimensions)
+//==============================================================================
+
+/**
+ * @brief Create execution plan for GEMM
+ * 
+ * Pre-computes cache blocking parameters and allocates workspace.
+ * Plan can be reused for multiple GEMMs with same M, K, N.
+ * 
+ * Use case: Kalman filters, repeated matrix operations in loops
+ * 
+ * @param M Number of rows in A and C
+ * @param K Number of columns in A, rows in B
+ * @param N Number of columns in B and C
+ * @return Plan handle on success, NULL on failure
+ * 
+ * @note Call gemm_plan_destroy() when done to free resources
+ * 
+ * Example:
+ * @code
+ *   gemm_plan_t *plan = gemm_plan_create(100, 100, 100);
+ *   for (int i = 0; i < 1000; i++) {
+ *       gemm_execute_plan(plan, C, A, B, 1.0f, 0.0f);
+ *   }
+ *   gemm_plan_destroy(plan);
+ * @endcode
+ */
+gemm_plan_t* gemm_plan_create(size_t M, size_t K, size_t N);
+
+/**
+ * @brief Execute GEMM using pre-created plan
+ * 
+ * @param plan Execution plan created by gemm_plan_create()
+ * @param C Output matrix (M×N, row-major)
+ * @param A Input matrix (M×K, row-major)
+ * @param B Input matrix (K×N, row-major)
+ * @param alpha Scalar multiplier for A*B
+ * @param beta Scalar multiplier for C
+ * @return 0 on success, negative error code on failure
+ * 
+ * @note Dimensions must match those used in gemm_plan_create()
+ */
+int gemm_execute_plan(
+    gemm_plan_t *plan,
+    float * restrict C,
+    const float * restrict A,
+    const float * restrict B,
+    float alpha, float beta);
+
+/**
+ * @brief Destroy execution plan and free resources
+ * 
+ * @param plan Plan to destroy (can be NULL)
+ */
+void gemm_plan_destroy(gemm_plan_t *plan);
 
 //==============================================================================
 // SYMMETRIC OPERATIONS (Optimized for Kalman Filters)

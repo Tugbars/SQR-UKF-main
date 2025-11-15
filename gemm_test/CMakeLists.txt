@@ -201,6 +201,31 @@ if(UNIX OR MINGW)
 endif()
 
 #===============================================================================
+# Benchmark Suite: Performance Comparison (Optimized vs Naive)
+#===============================================================================
+
+add_executable(test_benchmark 
+    ${TEST_DIR}/test_benchmark.c
+)
+
+target_link_libraries(test_benchmark PRIVATE gemm_lib)
+target_compile_options(test_benchmark PRIVATE ${GEMM_COMPILE_FLAGS})
+
+# Warn if not in Release mode
+if(NOT CMAKE_BUILD_TYPE MATCHES Release)
+    message(WARNING "Benchmark should be built in Release mode for accurate results!")
+    message(WARNING "  Configure with: cmake -B build -DCMAKE_BUILD_TYPE=Release")
+endif()
+
+if(WIN32 AND MINGW)
+    target_link_options(test_benchmark PRIVATE -mconsole)
+endif()
+
+if(UNIX OR MINGW)
+    target_link_libraries(test_benchmark PRIVATE m)
+endif()
+
+#===============================================================================
 # Unified Test Runner (All Test Suites)
 #===============================================================================
 
@@ -296,6 +321,13 @@ add_custom_target(run_unified
     COMMENT "Running unified test suite (all tests)..."
 )
 
+# Run benchmark
+add_custom_target(run_benchmark
+    COMMAND test_benchmark
+    DEPENDS test_benchmark
+    COMMENT "Running GEMM performance benchmark (optimized vs naive)..."
+)
+
 #===============================================================================
 # Address Sanitizer Build Option
 #===============================================================================
@@ -387,7 +419,8 @@ message(STATUS "  test_gemm_small         - Small kernels test (Tier 1)")
 message(STATUS "  test_gemm_planning      - Planning module test")
 message(STATUS "  test_gemm_large         - Individual kernel tests")
 message(STATUS "  test_gemm_validated     - Validated kernel tests (instrumented)")
-message(STATUS "  test_gemm_execute       - Execution pipeline tests (NEW!)")
+message(STATUS "  test_gemm_execute       - Execution pipeline tests")
+message(STATUS "  test_benchmark          - Performance benchmark (optimized vs naive)")
 message(STATUS "  test_all                - Unified test runner")
 message(STATUS "")
 message(STATUS "Custom targets (make <target>):")
@@ -396,7 +429,8 @@ message(STATUS "  run_small        - Run small kernel tests")
 message(STATUS "  run_planning     - Run planning tests")
 message(STATUS "  run_kernels      - Run individual kernel tests")
 message(STATUS "  run_validated    - Run validated tests")
-message(STATUS "  run_execute      - Run execution pipeline tests (NEW!)")
+message(STATUS "  run_execute      - Run execution pipeline tests")
+message(STATUS "  run_benchmark    - Run performance benchmark")
 message(STATUS "  run_unified      - Run unified test suite")
 
 if(ENABLE_VALGRIND AND VALGRIND_EXECUTABLE)
@@ -404,14 +438,3 @@ if(ENABLE_VALGRIND AND VALGRIND_EXECUTABLE)
     message(STATUS "  valgrind_validated  - Run validated tests under Valgrind")
 endif()
 
-message(STATUS "")
-message(STATUS "Compiler flags:")
-message(STATUS "  ${GEMM_COMPILE_FLAGS}")
-message(STATUS "")
-message(STATUS "╔════════════════════════════════════════════════════════════╗")
-message(STATUS "║  Quick Start:                                              ║")
-message(STATUS "║    cmake -B build                                          ║")
-message(STATUS "║    cmake --build build                                     ║")
-message(STATUS "║    cd build && make run_execute                            ║")
-message(STATUS "╚════════════════════════════════════════════════════════════╝")
-message(STATUS "")
