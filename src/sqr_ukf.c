@@ -211,8 +211,8 @@ static void create_weights(float Wc[],
                            float kappa,
                            uint8_t L)
 {
-    const size_t N  = (size_t)(2u * L + 1u);    //!< Number of sigma points
-    const float  Lf = (float)L;                 //!< State size as float
+    const size_t N = (size_t)(2u * L + 1u); //!< Number of sigma points
+    const float Lf = (float)L;              //!< State size as float
 
     /* λ = α^2 (L + κ) − L */
     const float lam = alpha * alpha * (Lf + kappa) - Lf;
@@ -232,11 +232,11 @@ static void create_weights(float Wc[],
     if (ukf_has_avx2() && N >= 9)
     {
         const __m256 v = _mm256_set1_ps(hv);
-        size_t i = 1;                              //!< Start filling from index 1
+        size_t i = 1; //!< Start filling from index 1
         for (; i + 7 < N; i += 8)
         {
-            _mm256_storeu_ps(&Wm[i], v);          //!< Store 8 identical Wm values
-            _mm256_storeu_ps(&Wc[i], v);          //!< Store 8 identical Wc values
+            _mm256_storeu_ps(&Wm[i], v); //!< Store 8 identical Wm values
+            _mm256_storeu_ps(&Wc[i], v); //!< Store 8 identical Wc values
         }
         /* Scalar cleanup for the remaining elements (if N is not a multiple of 8). */
         for (; i < N; ++i)
@@ -296,73 +296,103 @@ static void create_sigma_point_matrix(float X[],
                                       float kappa,
                                       uint8_t L8)
 {
-    const size_t L = (size_t)L8;               //!< State dimension
-    const size_t N = 2u * L + 1u;              //!< Number of sigma points
-    const float  gamma = alpha * sqrtf((float)L + kappa);  //!< σ scaling
+    const size_t L = (size_t)L8;
+    const size_t N = 2u * L + 1u;
+    const float gamma = alpha * sqrtf((float)L + kappa);
 
 #if LINALG_SIMD_ENABLE
-    if (ukf_has_avx2() && L >= 8)
+    if (ukf_has_avx2() && L >= 16) // Higher threshold for unrolling
     {
-        const __m256 g  = _mm256_set1_ps(gamma);   //!< +γ broadcast
-        const __m256 ng = _mm256_set1_ps(-gamma);  //!< −γ broadcast
+        const __m256 g = _mm256_set1_ps(gamma);
+        const __m256 ng = _mm256_set1_ps(-gamma);
 
-        /* Prefetch policy */
-        const size_t pf_elts   = UKF_PREFETCH_DIST_BYTES / sizeof(float);
-        const int    do_pf     = (L >= (size_t)UKF_PREFETCH_MIN_L);
-        const int    rows_ahead= UKF_PREFETCH_ROWS_AHEAD;
+        const size_t pf_elts = UKF_PREFETCH_DIST_BYTES / sizeof(float);
+        const int do_pf = (L >= (size_t)UKF_PREFETCH_MIN_L);
+        const int rows_ahead = UKF_PREFETCH_ROWS_AHEAD;
 
-        for (size_t i = 0; i < L; ++i)
+        size_t i = 0;
+
+        /* Process 2 rows at a time - fits in registers */
+        for (; i + 1 < L; i += 2)
         {
-            float *Xi        = X + i * N;     //!< Row pointer of X (state i across columns)
-            const float *Si  = S + i * L;     //!< Row pointer of S (state i across its L entries)
-            const __m256 xi8 = _mm256_set1_ps(x[i]);  //!< Broadcast x[i] to 8 lanes
+            float *Xi0 = X + (i + 0) * N;
+            float *Xi1 = X + (i + 1) * N;
+            const float *Si0 = S + (i + 0) * L;
+            const float *Si1 = S + (i + 1) * L;
 
-            /* Column 0 is the mean itself */
-            Xi[0] = x[i];
+            const __m256 xi0 = _mm256_set1_ps(x[i + 0]);
+            const __m256 xi1 = _mm256_set1_ps(x[i + 1]);
 
-            /* Prefetch a few future rows of S and X to warm caches (optional) */
-            if (do_pf && rows_ahead > 0)
+            Xi0[0] = x[i + 0];
+            Xi1[0] = x[i + 1];
+
+            /* Prefetch ahead for both rows */
+            if (do_pf && rows_ahead > 0 && i + 2 < L)
             {
-                for (int ra = 1; ra <= rows_ahead; ++ra)
-                {
-                    const size_t ip = i + (size_t)ra;
-                    if (ip < L)
-                    {
-                        const float *Spi = S + ip * L;
-                        float *Xpi       = X + ip * N;
-                        _mm_prefetch((const char *)Spi, _MM_HINT_T0);
-                        _mm_prefetch((const char *)Xpi, _MM_HINT_T0);
-                    }
-                }
+                _mm_prefetch((const char *)(S + (i + 2) * L), _MM_HINT_T0);
+                _mm_prefetch((const char *)(X + (i + 2) * N), _MM_HINT_T0);
             }
 
-            /* Vectorized loop over S row in chunks of 8:
-               We produce X[i, 1..L] = x[i] + γ*S[i, :]
-                         and X[i, L+1..2L] = x[i] − γ*S[i, :]                 */
             size_t j = 0;
             for (; j + 7 < L; j += 8)
             {
-                if (do_pf)
+                if (do_pf && j + pf_elts + 8 < L)
                 {
-                    _mm_prefetch((const char *)(Si + j + pf_elts),            _MM_HINT_T0);
-                    _mm_prefetch((const char *)(Xi + 1 + j + pf_elts),        _MM_HINT_T0);
-                    _mm_prefetch((const char *)(Xi + 1 + L + j + pf_elts),    _MM_HINT_T0);
+                    _mm_prefetch((const char *)(Si0 + j + pf_elts), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(Si1 + j + pf_elts), _MM_HINT_T0);
                 }
 
-                __m256 s8    = _mm256_loadu_ps(Si + j);          //!< Load 8 entries from S row
-                __m256 plus  = _mm256_fmadd_ps(g,  s8, xi8);     //!< x[i] + γ * S[i, j..j+7]
-                __m256 minus = _mm256_fmadd_ps(ng, s8, xi8);     //!< x[i] − γ * S[i, j..j+7]
+                /* Row 0: load, compute, store immediately (frees registers) */
+                __m256 s0 = _mm256_loadu_ps(Si0 + j);
+                __m256 plus0 = _mm256_fmadd_ps(g, s0, xi0);
+                __m256 minus0 = _mm256_fmadd_ps(ng, s0, xi0);
+                _mm256_storeu_ps(Xi0 + 1 + j, plus0);
+                _mm256_storeu_ps(Xi0 + 1 + L + j, minus0);
 
-                _mm256_storeu_ps(Xi + 1 + j,       plus);        //!< Write +γ branch
-                _mm256_storeu_ps(Xi + 1 + L + j,   minus);       //!< Write −γ branch
+                /* Row 1: load, compute, store immediately */
+                __m256 s1 = _mm256_loadu_ps(Si1 + j);
+                __m256 plus1 = _mm256_fmadd_ps(g, s1, xi1);
+                __m256 minus1 = _mm256_fmadd_ps(ng, s1, xi1);
+                _mm256_storeu_ps(Xi1 + 1 + j, plus1);
+                _mm256_storeu_ps(Xi1 + 1 + L + j, minus1);
             }
 
-            /* Scalar tail for the remaining (L % 8) elements */
+            /* Scalar tail for both rows */
+            for (; j < L; ++j)
+            {
+                const float s0 = Si0[j];
+                const float s1 = Si1[j];
+                Xi0[1 + j] = x[i + 0] + gamma * s0;
+                Xi0[1 + L + j] = x[i + 0] - gamma * s0;
+                Xi1[1 + j] = x[i + 1] + gamma * s1;
+                Xi1[1 + L + j] = x[i + 1] - gamma * s1;
+            }
+        }
+
+        /* Handle last row if L is odd */
+        if (i < L)
+        {
+            float *Xi = X + i * N;
+            const float *Si = S + i * L;
+            const __m256 xi8 = _mm256_set1_ps(x[i]);
+
+            Xi[0] = x[i];
+
+            size_t j = 0;
+            for (; j + 7 < L; j += 8)
+            {
+                __m256 s8 = _mm256_loadu_ps(Si + j);
+                __m256 plus = _mm256_fmadd_ps(g, s8, xi8);
+                __m256 minus = _mm256_fmadd_ps(ng, s8, xi8);
+                _mm256_storeu_ps(Xi + 1 + j, plus);
+                _mm256_storeu_ps(Xi + 1 + L + j, minus);
+            }
+
             for (; j < L; ++j)
             {
                 const float s = Si[j];
-                Xi[1 + j]       = x[i] + gamma * s;  //!< +γ column
-                Xi[1 + L + j]   = x[i] - gamma * s;  //!< −γ column
+                Xi[1 + j] = x[i] + gamma * s;
+                Xi[1 + L + j] = x[i] - gamma * s;
             }
         }
         return;
@@ -372,16 +402,16 @@ static void create_sigma_point_matrix(float X[],
     /* ------------------------ Scalar fallback ------------------------ */
     for (size_t i = 0; i < L; ++i)
     {
-        float *Xi        = X + i * N;     //!< Row pointer of X (state i across columns)
-        const float *Si  = S + i * L;     //!< Row pointer of S (state i across its L entries)
+        float *Xi = X + i * N;       //!< Row pointer of X (state i across columns)
+        const float *Si = S + i * L; //!< Row pointer of S (state i across its L entries)
 
-        Xi[0] = x[i];                     //!< Mean in column 0
+        Xi[0] = x[i]; //!< Mean in column 0
 
         for (size_t j = 0; j < L; ++j)
         {
             const float s = Si[j];
-            Xi[1 + j]       = x[i] + gamma * s;  //!< +γ column
-            Xi[1 + L + j]   = x[i] - gamma * s;  //!< −γ column
+            Xi[1 + j] = x[i] + gamma * s;     //!< +γ column
+            Xi[1 + L + j] = x[i] - gamma * s; //!< −γ column
         }
     }
 }
@@ -403,7 +433,7 @@ static void create_sigma_point_matrix(float X[],
  *   - Falls back to scalar if allocation fails or N < 8.
  */
 static void compute_transition_function(float Xstar[], const float X[], const float u[],
-                                         void (*F)(float[], float[], float[]), uint8_t L8)
+                                        void (*F)(float[], float[], float[]), uint8_t L8)
 {
     const size_t L = (size_t)L8;
     const size_t N = 2u * L + 1u;
@@ -412,8 +442,8 @@ static void compute_transition_function(float Xstar[], const float X[], const fl
     if (ukf_has_avx2() && N >= 8)
     {
         /* SoA buffers: 8 states of length L each (k-major). */
-        float *x = (float *)ukf_aligned_alloc((size_t)8 * L * sizeof(float));
-        float *d = (float *)ukf_aligned_alloc((size_t)8 * L * sizeof(float));
+        float *x = (float *)gemm_aligned_alloc(32, (size_t)8 * L * sizeof(float));
+        float *d = (float *)gemm_aligned_alloc(32, (size_t)8 * L * sizeof(float));
         if (x && d)
         {
             const int do_pf = (L >= (size_t)UKF_TRANS_PF_MIN_L);
@@ -423,7 +453,6 @@ static void compute_transition_function(float Xstar[], const float X[], const fl
             size_t j = 0;
             for (; j + 7 < N; j += 8)
             {
-
                 /* pack 8 columns (j..j+7) into SoA */
                 for (size_t i = 0; i < L; ++i)
                 {
@@ -443,9 +472,11 @@ static void compute_transition_function(float Xstar[], const float X[], const fl
 
                     /* load 8 contiguous sigmas from row i */
                     __m256 v = _mm256_loadu_ps(&X[i * N + j]);
-                    /* lane buffer then scalar-lane scatter into SoA x[k*L + i] */
-                    alignas(32) float lanes[8];
-                    _mm256_store_ps(lanes, v);
+
+                    /* Scatter to SoA layout using UNALIGNED store to stack buffer */
+                    float lanes[8];             // NO alignas - can't guarantee it!
+                    _mm256_storeu_ps(lanes, v); // Use UNALIGNED store
+
 #pragma GCC ivdep
                     for (int k = 0; k < 8; ++k)
                         x[(size_t)k * L + i] = lanes[k];
@@ -476,14 +507,14 @@ static void compute_transition_function(float Xstar[], const float X[], const fl
                     Xstar[i * N + j] = dk[i];
             }
 
-            ukf_aligned_free(x);
-            ukf_aligned_free(d);
+            gemm_aligned_free(x);
+            gemm_aligned_free(d);
             return;
         }
         if (x)
-            ukf_aligned_free(x);
+            gemm_aligned_free(x);
         if (d)
-            ukf_aligned_free(d);
+            gemm_aligned_free(d);
     }
 #endif
 
@@ -534,95 +565,206 @@ static void compute_transition_function(float Xstar[], const float X[], const fl
  *  The function automatically detects AVX2 support and falls back to portable scalar code.
  *  Prefetching hints are used to reduce memory stalls when L is large enough.
  */
+#if LINALG_SIMD_ENABLE
+/**
+ * @brief Improved horizontal sum with better scheduling
+ */
+static inline float avx2_sum_ps_opt(__m256 v)
+{
+    /* Reduce to 128-bit */
+    __m128 vlow = _mm256_castps256_ps128(v);
+    __m128 vhigh = _mm256_extractf128_ps(v, 1);
+    vlow = _mm_add_ps(vlow, vhigh); // [a+e, b+f, c+g, d+h]
+
+    /* Horizontal add within 128-bit */
+    __m128 shuf = _mm_movehdup_ps(vlow); // [b+f, b+f, d+h, d+h]
+    vlow = _mm_add_ps(vlow, shuf);       // [a+b+e+f, *, c+d+g+h, *]
+    shuf = _mm_movehl_ps(shuf, vlow);    // [c+d+g+h, *]
+    vlow = _mm_add_ss(vlow, shuf);       // [a+b+c+d+e+f+g+h]
+
+    return _mm_cvtss_f32(vlow);
+}
+#endif
+
 static void multiply_sigma_point_matrix_to_weights(float x[],
                                                    const float X[],
                                                    const float W[],
                                                    uint8_t L)
 {
-    const size_t Ls = (size_t)L;          //!< State dimension
-    const size_t N  = 2u * Ls + 1u;       //!< Number of sigma points
+    const size_t Ls = (size_t)L;
+    const size_t N = 2u * Ls + 1u;
 
-    /* --------------------- Scalar fallback path --------------------- */
-    if (!ukf_has_avx2() || N < 8)
+    /* Scalar fallback */
+    if (!ukf_has_avx2() || N < 16)
     {
         for (size_t i = 0; i < Ls; ++i)
         {
-            const float *row = &X[i * N]; //!< Pointer to i-th row of sigma points
+            const float *row = &X[i * N];
             float acc = 0.0f;
             for (size_t j = 0; j < N; ++j)
-                acc += W[j] * row[j];     //!< Accumulate weighted sum for this state dimension
+                acc += W[j] * row[j];
             x[i] = acc;
         }
         return;
     }
 
 #if LINALG_SIMD_ENABLE
-    /* --------------------- Vectorized AVX2 path --------------------- */
-    const int do_pf = (Ls >= (size_t)UKF_MEAN_PF_MIN_ROWS); //!< Enable prefetch for large matrices
-    const int rows_ahead = UKF_MEAN_PF_ROWS_AHEAD;          //!< Number of future rows to prefetch
+    const int do_pf = (Ls >= (size_t)UKF_MEAN_PF_MIN_ROWS);
+    const int rows_ahead = UKF_MEAN_PF_ROWS_AHEAD;
+
+    /* Prefetch weights ONCE (reused for all rows) */
+    if (do_pf)
+    {
+        for (size_t j = 0; j < N; j += 64)
+            _mm_prefetch((const char *)(&W[j]), _MM_HINT_T0);
+    }
 
     size_t i = 0;
-    for (; i + 1 < Ls; i += 2)
+
+    /* 4-way unrolling - processes 4 rows at a time */
+    for (; i + 3 < Ls; i += 4)
     {
-        /* Process two consecutive rows (state dimensions) together */
         const float *row0 = &X[(i + 0) * N];
         const float *row1 = &X[(i + 1) * N];
+        const float *row2 = &X[(i + 2) * N];
+        const float *row3 = &X[(i + 3) * N];
 
-        /* Prefetch a few rows ahead to keep data in cache */
+        /* Prefetch future rows */
         if (do_pf && rows_ahead > 0)
         {
             for (int ra = 1; ra <= rows_ahead; ++ra)
             {
-                const size_t ip = i + (size_t)ra * 2;
+                const size_t ip = i + (size_t)ra * 4;
                 if (ip < Ls)
                 {
                     _mm_prefetch((const char *)(&X[ip * N]), _MM_HINT_T0);
                     if (ip + 1 < Ls)
                         _mm_prefetch((const char *)(&X[(ip + 1) * N]), _MM_HINT_T0);
+                    if (ip + 2 < Ls)
+                        _mm_prefetch((const char *)(&X[(ip + 2) * N]), _MM_HINT_T0);
+                    if (ip + 3 < Ls)
+                        _mm_prefetch((const char *)(&X[(ip + 3) * N]), _MM_HINT_T0);
                 }
             }
         }
 
-        /* Vector accumulators for two rows */
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+
+        size_t j = 0;
+
+        /* Inner loop 2x unrolled to hide FMA latency */
+        for (; j + 15 < N; j += 16)
+        {
+            /* First 8 elements */
+            __m256 wv0 = _mm256_loadu_ps(&W[j]);
+            __m256 x00 = _mm256_loadu_ps(&row0[j]);
+            __m256 x10 = _mm256_loadu_ps(&row1[j]);
+            __m256 x20 = _mm256_loadu_ps(&row2[j]);
+            __m256 x30 = _mm256_loadu_ps(&row3[j]);
+
+            /* Second 8 elements (start loading while FMAs execute) */
+            __m256 wv1 = _mm256_loadu_ps(&W[j + 8]);
+            __m256 x01 = _mm256_loadu_ps(&row0[j + 8]);
+            __m256 x11 = _mm256_loadu_ps(&row1[j + 8]);
+
+            /* First set of FMAs */
+            acc0 = _mm256_fmadd_ps(wv0, x00, acc0);
+            acc1 = _mm256_fmadd_ps(wv0, x10, acc1);
+
+            /* Continue loading while FMAs execute */
+            __m256 x21 = _mm256_loadu_ps(&row2[j + 8]);
+            __m256 x31 = _mm256_loadu_ps(&row3[j + 8]);
+
+            /* More FMAs */
+            acc2 = _mm256_fmadd_ps(wv0, x20, acc2);
+            acc3 = _mm256_fmadd_ps(wv0, x30, acc3);
+
+            /* Second set of FMAs (different weight vector) */
+            acc0 = _mm256_fmadd_ps(wv1, x01, acc0);
+            acc1 = _mm256_fmadd_ps(wv1, x11, acc1);
+            acc2 = _mm256_fmadd_ps(wv1, x21, acc2);
+            acc3 = _mm256_fmadd_ps(wv1, x31, acc3);
+        }
+
+        /* Handle 8-element chunks */
+        for (; j + 7 < N; j += 8)
+        {
+            __m256 wv = _mm256_loadu_ps(&W[j]);
+            __m256 x0 = _mm256_loadu_ps(&row0[j]);
+            __m256 x1 = _mm256_loadu_ps(&row1[j]);
+            __m256 x2 = _mm256_loadu_ps(&row2[j]);
+            __m256 x3 = _mm256_loadu_ps(&row3[j]);
+
+            acc0 = _mm256_fmadd_ps(wv, x0, acc0);
+            acc1 = _mm256_fmadd_ps(wv, x1, acc1);
+            acc2 = _mm256_fmadd_ps(wv, x2, acc2);
+            acc3 = _mm256_fmadd_ps(wv, x3, acc3);
+        }
+
+        /* Reduce accumulators */
+        float sum0 = avx2_sum_ps_opt(acc0);
+        float sum1 = avx2_sum_ps_opt(acc1);
+        float sum2 = avx2_sum_ps_opt(acc2);
+        float sum3 = avx2_sum_ps_opt(acc3);
+
+        /* Scalar tail */
+        for (; j < N; ++j)
+        {
+            const float w = W[j];
+            sum0 += w * row0[j];
+            sum1 += w * row1[j];
+            sum2 += w * row2[j];
+            sum3 += w * row3[j];
+        }
+
+        x[i + 0] = sum0;
+        x[i + 1] = sum1;
+        x[i + 2] = sum2;
+        x[i + 3] = sum3;
+    }
+
+    /* 2-way unrolling for remaining rows */
+    for (; i + 1 < Ls; i += 2)
+    {
+        const float *row0 = &X[(i + 0) * N];
+        const float *row1 = &X[(i + 1) * N];
+
         __m256 acc0 = _mm256_setzero_ps();
         __m256 acc1 = _mm256_setzero_ps();
 
         size_t j = 0;
         for (; j + 7 < N; j += 8)
         {
-            /**
-             * Load 8 weights and the corresponding 8 sigma points for each of
-             * the two rows, then accumulate using FMA:
-             *   acc += W * X
-             */
-            __m256 wv = _mm256_loadu_ps(&W[j]);   //!< Load 8 weights
-            __m256 x0 = _mm256_loadu_ps(&row0[j]);//!< Load 8 sigma values (row 0)
-            __m256 x1 = _mm256_loadu_ps(&row1[j]);//!< Load 8 sigma values (row 1)
-            acc0 = _mm256_fmadd_ps(wv, x0, acc0); //!< acc0 += W * X0
-            acc1 = _mm256_fmadd_ps(wv, x1, acc1); //!< acc1 += W * X1
+            __m256 wv = _mm256_loadu_ps(&W[j]);
+            __m256 x0 = _mm256_loadu_ps(&row0[j]);
+            __m256 x1 = _mm256_loadu_ps(&row1[j]);
+            acc0 = _mm256_fmadd_ps(wv, x0, acc0);
+            acc1 = _mm256_fmadd_ps(wv, x1, acc1);
         }
 
-        /* Reduce 8-lane accumulators to scalar sums */
-        float sum0 = avx2_sum_ps(acc0);
-        float sum1 = avx2_sum_ps(acc1);
+        float sum0 = avx2_sum_ps_opt(acc0);
+        float sum1 = avx2_sum_ps_opt(acc1);
 
-        /* Handle any leftover (non-multiple-of-8) sigma points */
         for (; j < N; ++j)
         {
-            sum0 += W[j] * row0[j];
-            sum1 += W[j] * row1[j];
+            const float w = W[j];
+            sum0 += w * row0[j];
+            sum1 += w * row1[j];
         }
 
-        /* Store weighted means for these two state dimensions */
         x[i + 0] = sum0;
         x[i + 1] = sum1;
     }
 
-    /* Handle last row if L is odd */
+    /* Last row if L is odd */
     if (i < Ls)
     {
         const float *row = &X[i * N];
         __m256 acc = _mm256_setzero_ps();
+
         size_t j = 0;
         for (; j + 7 < N; j += 8)
         {
@@ -630,20 +772,12 @@ static void multiply_sigma_point_matrix_to_weights(float x[],
             __m256 xv = _mm256_loadu_ps(&row[j]);
             acc = _mm256_fmadd_ps(wv, xv, acc);
         }
-        float sum = avx2_sum_ps(acc);
+
+        float sum = avx2_sum_ps_opt(acc);
         for (; j < N; ++j)
             sum += W[j] * row[j];
+
         x[i] = sum;
-    }
-#else
-    /* --------------------- Portable fallback (no AVX2) --------------------- */
-    for (size_t i2 = 0; i2 < Ls; ++i2)
-    {
-        const float *row = &X[i2 * N];
-        float acc = 0.0f;
-        for (size_t j = 0; j < N; ++j)
-            acc += W[j] * row[j];
-        x[i2] = acc;
     }
 #endif
 }
@@ -696,163 +830,244 @@ static void multiply_sigma_point_matrix_to_weights(float x[],
  * @warning S, X, and Rsr must not alias. All matrices are row-major.
  * @note    This routine assumes an **upper** SR convention end-to-end.
  */
-static int create_state_estimation_error_covariance_matrix(float S[],
-                                                           float W[],
-                                                           float X[],
-                                                           float x[],
-                                                           const float Rsr[],
-                                                           uint8_t L8)
+/**
+ * @brief Build square-root state covariance S (SR-UKF) via QR of weighted deviations.
+ *
+ * @param[out] S       Output square-root covariance (L × L), upper-triangular.
+ * @param[out] ws      Workspace structure (caller manages lifetime).
+ * @param[in]  W       Covariance weights, length N = 2L + 1.
+ * @param[in]  X       Propagated sigma points (L × N), row-major.
+ * @param[in]  x       Predicted state mean (L).
+ * @param[in]  Rsr     Square-root of process noise (L × L), upper-triangular.
+ * @param[in]  L8      Dimension L.
+ *
+ * @retval 0       Success.
+ * @retval -ENOMEM Workspace allocation failed.
+ * @retval -EIO    QR decomposition failed.
+ * @retval -EFAULT Resulting S has non-positive/NaN diagonal.
+ */
+static int create_state_estimation_error_covariance_matrix(
+    float S[],
+    ukf_qr_ws_t *ws,
+    float W[],
+    float X[],
+    float x[],
+    const float Rsr[],
+    uint8_t L8)
 {
-    const size_t L = (size_t)L8;                 //!< State dimension
-    const size_t N = 2u * L + 1u;                //!< # of sigma points
-    const size_t K = 2u * L;                     //!< # of deviation columns (excluding mean)
-    const size_t M = 3u * L;                     //!< Augmented rows (deviations + SR noise)
+    const size_t L = (size_t)L8;
+    const size_t N = 2u * L + 1u;
+    const size_t K = 2u * L;      // Deviation columns
+    const size_t M = 3u * L;      // Augmented rows
 
-    const float w1s = sqrtf(fabsf(W[1]));        //!< |W[1]|^1/2 for columns 1..K
-    const float w0s = sqrtf(fabsf(W[0]));        //!< |W[0]|^1/2 for mean deviation
+    const float w1s = sqrtf(fabsf(W[1]));
+    const float w0s = sqrtf(fabsf(W[0]));
 
-    /* Reusable QR workspace (thread-local if supported) */
-#if defined(__GNUC__) || defined(__clang__)
-    static __thread ukf_qr_ws_t ws = {0};
-#else
-    static ukf_qr_ws_t ws = {0};
-#endif
-    if (ukf_qr_ws_ensure(&ws, L) != 0)
+    /* Ensure workspace is large enough */
+    if (ukf_qr_ws_ensure(ws, L) != 0)
         return -ENOMEM;
 
-    float *Aprime = ws.Aprime;   /* M×L, column i holds stacked blocks for state i */
-    float *R_     = ws.R_;       /* M×L, will hold R from QR (we copy upper L×L)  */
-    float *b      = ws.b;        /* L, mean deviation vector scaled by w0s        */
+    float *Aprime = ws->Aprime;  // M×L column-major
+    float *R_     = ws->R_;      // M×L
+    float *b      = ws->b;       // L
 
-    /* Prefetch policy knobs */
-    const int    do_pf      = (int)(L >= (size_t)UKF_APRIME_PF_MIN_L);
-    const int    rows_ahead = UKF_APRIME_PF_ROWS_AHEAD;
-    const size_t pf_elems   = (size_t)UKF_APRIME_PF_DIST_BYTES / sizeof(float);
+    const int do_pf = (L >= (size_t)UKF_APRIME_PF_MIN_L);
+    const int rows_ahead = UKF_APRIME_PF_ROWS_AHEAD;
 
+    /* ----------------------------------------------------------------
+     * Build Aprime and b vector
+     * ---------------------------------------------------------------- */
 #if LINALG_SIMD_ENABLE
-    if (ukf_has_avx2() && L >= 8)
+    if (ukf_has_avx2() && L >= 16)
     {
         const __m256 w1v = _mm256_set1_ps(w1s);
-
-        for (size_t i = 0; i < L; ++i)
+        
+        size_t i = 0;
+        
+        /* Process 2 state dimensions at a time */
+        for (; i + 1 < L; i += 2)
         {
-            const float *Xi = X + i * N;   //!< Row i of X (state i across all sigmas)
-            const float  xi = x[i];
-
-            /* Row-ahead prefetch (optional) */
-            if (do_pf && rows_ahead > 0)
+            const float *Xi0 = X + (i + 0) * N;
+            const float *Xi1 = X + (i + 1) * N;
+            const float xi0 = x[i + 0];
+            const float xi1 = x[i + 1];
+            
+            /* Prefetch ahead */
+            if (do_pf && rows_ahead > 0 && i + 2 < L)
             {
-                for (int ra = 1; ra <= rows_ahead; ++ra)
-                {
-                    const size_t ip = i + (size_t)ra;
-                    if (ip < L)
-                    {
-                        _mm_prefetch((const char *)(X   + ip * N), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Rsr + ip * L), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Aprime + ip),  _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Aprime + (K * L) + ip), _MM_HINT_T0);
-                    }
-                }
+                _mm_prefetch((const char *)(X + (i + 2) * N), _MM_HINT_T0);
+                _mm_prefetch((const char *)(Rsr + (i + 2) * L), _MM_HINT_T0);
             }
 
-            /* b[i] = w0s * (Xi[0] − x[i])  (contiguous access) */
-            b[i] = w0s * (Xi[0] - xi);
+            /* Mean deviation: b[i] = w0s * (X[i,0] - x[i]) */
+            b[i + 0] = w0s * (Xi0[0] - xi0);
+            b[i + 1] = w0s * (Xi1[0] - xi1);
 
-            /* Deviations block (rows 0..K−1), 8-wide chunks:
-               Aprime[r*L + i] = w1s * (X[i, r+1] − x[i])                               */
+            /* Broadcast state means */
+            const __m256 xi0v = _mm256_set1_ps(xi0);
+            const __m256 xi1v = _mm256_set1_ps(xi1);
+
+            /* ---- Deviations block: rows 0..K-1 ---- */
             size_t r = 0;
-            const __m256 xi8 = _mm256_set1_ps(xi);
             for (; r + 7 < K; r += 8)
             {
-                if (do_pf && r + pf_elems + 8 < K)
-                    _mm_prefetch((const char *)(&Xi[r + 1 + pf_elems]), _MM_HINT_T0);
+                /* Load 8 sigma points for each state */
+                __m256 Xv0 = _mm256_loadu_ps(&Xi0[r + 1]);
+                __m256 Xv1 = _mm256_loadu_ps(&Xi1[r + 1]);
+                
+                /* Compute weighted deviations: w1 * (X - x) */
+                __m256 diff0 = _mm256_sub_ps(Xv0, xi0v);
+                __m256 diff1 = _mm256_sub_ps(Xv1, xi1v);
+                __m256 out0  = _mm256_mul_ps(w1v, diff0);
+                __m256 out1  = _mm256_mul_ps(w1v, diff1);
 
-                __m256 Xv   = _mm256_loadu_ps(&Xi[r + 1]);       //!< Load 8 sigma values
-                __m256 diff = _mm256_sub_ps(Xv, xi8);            //!< (X − x)
-                __m256 out  = _mm256_mul_ps(w1v, diff);          //!< Scale by w1
-
-                /* Column-major write into Aprime’s stacked block for column i:
-                   (strided stores via a small lane buffer) */
-                alignas(32) float lanes[8];
-                _mm256_store_ps(lanes, out);
-#pragma GCC ivdep
-                for (int k2 = 0; k2 < 8; ++k2)
-                    Aprime[(r + (size_t)k2) * L + i] = lanes[k2];
+                /* Scatter to column-major Aprime using UNALIGNED stores */
+                float lanes0[8], lanes1[8];
+                _mm256_storeu_ps(lanes0, out0);  // NOT aligned!
+                _mm256_storeu_ps(lanes1, out1);
+                
+                /* Scalar scatter (unavoidable for column-major layout) */
+                for (int k = 0; k < 8; ++k)
+                {
+                    Aprime[(r + k) * L + (i + 0)] = lanes0[k];
+                    Aprime[(r + k) * L + (i + 1)] = lanes1[k];
+                }
             }
+            
+            /* Scalar tail for deviations */
             for (; r < K; ++r)
-                Aprime[r * L + i] = w1s * (Xi[r + 1] - xi);
+            {
+                Aprime[r * L + (i + 0)] = w1s * (Xi0[r + 1] - xi0);
+                Aprime[r * L + (i + 1)] = w1s * (Xi1[r + 1] - xi1);
+            }
 
-            /* SR noise block (rows K..M−1), copy row i of upper SR noise Rsr */
+            /* ---- SR noise block: rows K..M-1 ---- */
+            const float *Rsr0 = Rsr + (i + 0) * L;
+            const float *Rsr1 = Rsr + (i + 1) * L;
+            
             size_t t = 0;
             for (; t + 7 < L; t += 8)
             {
-                if (do_pf && t + pf_elems + 8 < L)
+                __m256 Sv0 = _mm256_loadu_ps(&Rsr0[t]);
+                __m256 Sv1 = _mm256_loadu_ps(&Rsr1[t]);
+                
+                float lanes0[8], lanes1[8];
+                _mm256_storeu_ps(lanes0, Sv0);
+                _mm256_storeu_ps(lanes1, Sv1);
+                
+                for (int k = 0; k < 8; ++k)
                 {
-                    _mm_prefetch((const char *)(&Rsr[i * L + t + pf_elems]), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(Aprime + (K + t + pf_elems) * L + i), _MM_HINT_T0);
+                    Aprime[(K + t + k) * L + (i + 0)] = lanes0[k];
+                    Aprime[(K + t + k) * L + (i + 1)] = lanes1[k];
                 }
+            }
+            
+            /* Scalar tail for SR noise */
+            for (; t < L; ++t)
+            {
+                Aprime[(K + t) * L + (i + 0)] = Rsr0[t];
+                Aprime[(K + t) * L + (i + 1)] = Rsr1[t];
+            }
+        }
 
-                __m256 Sv = _mm256_loadu_ps(&Rsr[i * L + t]);    //!< Load 8 from SR noise row i
-                alignas(32) float lanes[8];
-                _mm256_store_ps(lanes, Sv);
-#pragma GCC ivdep
-                for (int k2 = 0; k2 < 8; ++k2)
-                    Aprime[(K + t + (size_t)k2) * L + i] = lanes[k2];
+        /* Handle last state dimension if L is odd */
+        if (i < L)
+        {
+            const float *Xi = X + i * N;
+            const float xi = x[i];
+            
+            b[i] = w0s * (Xi[0] - xi);
+            
+            const __m256 xiv = _mm256_set1_ps(xi);
+            
+            /* Deviations */
+            size_t r = 0;
+            for (; r + 7 < K; r += 8)
+            {
+                __m256 Xv   = _mm256_loadu_ps(&Xi[r + 1]);
+                __m256 diff = _mm256_sub_ps(Xv, xiv);
+                __m256 out  = _mm256_mul_ps(w1v, diff);
+                
+                float lanes[8];
+                _mm256_storeu_ps(lanes, out);
+                
+                for (int k = 0; k < 8; ++k)
+                    Aprime[(r + k) * L + i] = lanes[k];
+            }
+            for (; r < K; ++r)
+                Aprime[r * L + i] = w1s * (Xi[r + 1] - xi);
+            
+            /* SR noise */
+            const float *Rsri = Rsr + i * L;
+            size_t t = 0;
+            for (; t + 7 < L; t += 8)
+            {
+                __m256 Sv = _mm256_loadu_ps(&Rsri[t]);
+                
+                float lanes[8];
+                _mm256_storeu_ps(lanes, Sv);
+                
+                for (int k = 0; k < 8; ++k)
+                    Aprime[(K + t + k) * L + i] = lanes[k];
             }
             for (; t < L; ++t)
-                Aprime[(K + t) * L + i] = Rsr[i * L + t];
+                Aprime[(K + t) * L + i] = Rsri[t];
         }
     }
     else
 #endif
     {
-        /* Portable scalar build of A′ and b */
+        /* Scalar path - cleaner and more readable */
         for (size_t i = 0; i < L; ++i)
         {
             const float *Xi = X + i * N;
-            const float  xi = x[i];
-
-            if (do_pf && rows_ahead > 0)
+            const float xi = x[i];
+            
+            /* Prefetch */
+            if (do_pf && rows_ahead > 0 && i + 1 < L)
             {
-                for (int ra = 1; ra <= rows_ahead; ++ra)
-                {
-                    const size_t ip = i + (size_t)ra;
-                    if (ip < L)
-                    {
-                        _mm_prefetch((const char *)(X   + ip * N), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Rsr + ip * L), _MM_HINT_T0);
-                    }
-                }
+                _mm_prefetch((const char *)(X + (i + 1) * N), _MM_HINT_T0);
+                _mm_prefetch((const char *)(Rsr + (i + 1) * L), _MM_HINT_T0);
             }
 
             b[i] = w0s * (Xi[0] - xi);
 
+            /* Deviations */
             for (size_t r = 0; r < K; ++r)
                 Aprime[r * L + i] = w1s * (Xi[r + 1] - xi);
 
+            /* SR noise */
+            const float *Rsri = Rsr + i * L;
             for (size_t t = 0; t < L; ++t)
-                Aprime[(K + t) * L + i] = Rsr[i * L + t];
+                Aprime[(K + t) * L + i] = Rsri[t];
         }
     }
 
-    /* QR of A′ (M×L); we only need R. qr() must skip Q work when only_compute_R=true. */
-    if (qr(Aprime, /*Q=*/NULL, R_, (uint16_t)M, (uint16_t)L, /*only_compute_R=*/true) != 0)
+    /* ----------------------------------------------------------------
+     * QR decomposition: Aprime = Q * R (we only need R)
+     * ---------------------------------------------------------------- */
+    if (qr(Aprime, NULL, R_, (uint16_t)M, (uint16_t)L, true) != 0)
         return -EIO;
 
-    /* Copy the upper L×L block of R_ into S (upper-triangular SR) */
-    memcpy(S, R_, (size_t)L * L * sizeof(float));
+    /* Extract upper L×L block of R into S */
+    memcpy(S, R_, L * L * sizeof(float));
 
-    int rc = cholupdate(/*L=*/S, /*x=*/(const float *)b, /*n=*/(uint16_t)L,
-                    /*is_upper=*/true, /*rank_one_update=*/(W[0] >= 0.0f));
-    if (rc != 0) {
-        /* SR covariance update failed (should be rare for prediction step) */
-        return rc;  /* propagate error (-EDOM or -ENOMEM) */
-    }
+    /* ----------------------------------------------------------------
+     * Cholesky rank-1 update/downdate with mean deviation
+     * ---------------------------------------------------------------- */
+    int rc = cholupdate(S, b, (uint16_t)L, true, (W[0] >= 0.0f));
+    if (rc != 0)
+        return rc;
 
-    /* Simple SPD sanity check: diagonal elements must be positive and finite */
+    /* ----------------------------------------------------------------
+     * Sanity check: S must be SPD (positive definite diagonal)
+     * ---------------------------------------------------------------- */
     for (size_t i = 0; i < L; ++i)
-        if (!(S[i * L + i] > 0.0f && isfinite(S[i * L + i])))
+    {
+        const float sii = S[i * L + i];
+        if (!(sii > 0.0f && isfinite(sii)))
             return -EFAULT;
+    }
 
     return 0;
 }
@@ -911,197 +1126,171 @@ static inline void ukf_transpose8x8_ps(__m256 in[8], __m256 out[8])
 /**
  * @brief Compute cross-covariance Pxy = X_c · diag(W) · Y_c^T without materializing diag(W).
  *
- * @details
- *  Given sigma-point matrices @p X and @p Y (each L × N, row-major; N = 2L+1) and their means
- *  @p x and @p y (length L), this routine computes the cross-covariance:
- *
- *  \f[
- *      P_{xy} \;=\; \sum_{j=0}^{N-1} W_j \,(X_{\cdot j}-x)\,(Y_{\cdot j}-y)^{\top}
- *                 \;=\; X_c \;\mathrm{diag}(W)\; Y_c^{\top},
- *  \f]
- *
- *  where the centered (but not yet weighted) matrices are:
- *   - \( X_c = X - x \mathbb{1}^{\top} \in \mathbb{R}^{L\times N} \)
- *   - \( Y_c = Y - y \mathbb{1}^{\top} \in \mathbb{R}^{L\times N} \)
- *
- *  Implementation outline (non-destructive):
- *   1) Build a padded/centered/weighted copy \( \tilde{X} \in \mathbb{R}^{L\times N_8} \),
- *      with \( \tilde{X}_{i,j} = (X_{i,j}-x_i)\,W_j \) and zero-pad columns to
- *      \( N_8=\lceil N/8\rceil\cdot 8 \) for vectorization.
- *   2) Build a padded, centered transpose \( \widetilde{Y^T} \in \mathbb{R}^{N_8\times L} \),
- *      with \( \widetilde{Y^T}_{j,k} = (Y_{k,j}-y_k) \) and zero-pad rows (j ≥ N).
- *   3) Multiply once: \( P = \tilde{X} \cdot \widetilde{Y^T} \).
- *
- *  Vectorization:
- *   - Step (1) uses AVX2 to compute \((X-x)\odot W\) 8 elements at a time per row.
- *   - Step (2) uses an AVX2 8×8 transpose micro-kernel to efficiently build \(Y_c^T\).
- *   - Step (3) relies on the project’s optimized @ref mul kernel (row-major GEMM-lite).
- *
- *  Advantages:
- *   - Avoids explicitly forming a dense diag(W).
- *   - Performs a single GEMM-like multiply rather than two.
- *   - Keeps inputs @p X and @p Y intact (non-destructive).
- *
- * @param[out] P   Output cross-covariance (L × L), row-major. Fully written.
+ * @param[out] P   Output cross-covariance (L × L), row-major.
  * @param[in]  W   Weights vector of length N = 2L + 1.
- * @param[in]  X   Sigma matrix for state (L × N), row-major. **Not** modified.
- * @param[in]  Y   Sigma matrix for measurement (L × N), row-major. **Not** modified.
+ * @param[in]  X   Sigma matrix for state (L × N), row-major.
+ * @param[in]  Y   Sigma matrix for measurement (L × N), row-major.
  * @param[in]  x   Mean of X (length L).
  * @param[in]  y   Mean of Y (length L).
- * @param[in]  L8  Dimension L (stored as uint8_t to match surrounding API).
+ * @param[in]  L8  Dimension L.
  *
- * @note
- *  - This function is **non-destructive**: inputs @p X and @p Y are not modified.
- *  - Temporary buffers are 32B-aligned and padded to a multiple of 8 columns/rows.
- *  - All matrices are row-major. @ref mul is expected to handle the provided shapes.
+ * @retval 0       Success.
+ * @retval -ENOMEM Memory allocation failed.
+ * @retval -EIO    Matrix multiplication failed.
+ *
+ * @note Non-destructive: X and Y are not modified.
  */
-static void create_state_cross_covariance_matrix(float *RESTRICT P,
-                                                 float *RESTRICT W,
+static int create_state_cross_covariance_matrix(float *RESTRICT P,
+                                                 const float *RESTRICT W,
                                                  const float *RESTRICT X,
                                                  const float *RESTRICT Y,
                                                  const float *RESTRICT x,
                                                  const float *RESTRICT y,
                                                  uint8_t L8)
 {
-    const size_t L  = (size_t)L8;                  //!< State / measurement dimension
-    const size_t N  = 2u * L + 1u;                 //!< Number of sigma points
-    const size_t N8 = ukf_round_up8(N);            //!< Padded to next multiple of 8 for SIMD
+    const size_t L  = (size_t)L8;
+    const size_t N  = 2u * L + 1u;
+    const size_t N8 = ukf_round_up8(N);
 
-    /* Zero the output cross-covariance. */
+    /* Zero output */
     memset(P, 0, L * L * sizeof(float));
 
-    /* Allocate centered/weighted temporaries:
-       - Xc : L × N8  (row-major)
-       - YTc: N8 × L  (row-major) == (centered Y)^T with padding on rows j ≥ N
-     */
-    float *Xc  = (float *)linalg_aligned_alloc(32, L * N8 * sizeof(float));
-    float *YTc = (float *)linalg_aligned_alloc(32, N8 * L * sizeof(float));
+    /* Allocate temporaries:
+       - Xc:  L × N8   (weighted centered X)
+       - YTc: N8 × L   (centered Y transpose)
+    */
+    float *Xc  = (float *)gemm_aligned_alloc(32, L * N8 * sizeof(float));
+    float *YTc = (float *)gemm_aligned_alloc(32, N8 * L * sizeof(float));
     if (!Xc || !YTc)
     {
-        if (Xc)  linalg_aligned_free(Xc);
-        if (YTc) linalg_aligned_free(YTc);
-        return; /* Out-of-memory; leave P as zeros */
+        if (Xc)  gemm_aligned_free(Xc);
+        if (YTc) gemm_aligned_free(YTc);
+        return -ENOMEM;
     }
 
-    /* Prefetch / tiling knobs */
-    const int    do_pf_rows  = (int)(L >= (size_t)UKF_PXY_PF_MIN_L);
-    const int    do_pf_in    = (int)(N >= (size_t)UKF_PXY_PF_MIN_N);
-    const int    rows_ahead  = UKF_PXY_PF_ROWS_AHEAD;
-    const size_t pf_elems    = (size_t)UKF_PXY_PF_DIST_BYTES / sizeof(float);
+    const int do_pf = (L >= (size_t)UKF_PXY_PF_MIN_L);
 
     /* ----------------------------------------------------------------
-     * Step 1: Build Xc = (X - x) ⊙ W, with column-padding to N8.
+     * Step 1: Build Xc = (X - x) ⊙ W  (element-wise weighted centering)
      * ---------------------------------------------------------------- */
 #if LINALG_SIMD_ENABLE
-    if (ukf_has_avx2() && N >= 8)
+    if (ukf_has_avx2() && N >= 16)
     {
-        for (size_t i = 0; i < L; ++i)
+        size_t i = 0;
+        
+        /* Process 2 rows at a time */
+        for (; i + 1 < L; i += 2)
         {
-            const float *Xi = X  + i * N;      //!< Row i of X
-            float       *Xci = Xc + i * N8;    //!< Row i of Xc
-            const __m256 xi8 = _mm256_set1_ps(x[i]);
+            const float *Xi0 = X  + (i + 0) * N;
+            const float *Xi1 = X  + (i + 1) * N;
+            float *Xci0 = Xc + (i + 0) * N8;
+            float *Xci1 = Xc + (i + 1) * N8;
+            
+            const __m256 xi0v = _mm256_set1_ps(x[i + 0]);
+            const __m256 xi1v = _mm256_set1_ps(x[i + 1]);
 
-            /* Row-ahead prefetch for X rows and Xc destinations */
-            if (do_pf_rows && rows_ahead > 0)
+            /* Prefetch next 2 rows */
+            if (do_pf && i + 2 < L)
             {
-                for (int ra = 1; ra <= rows_ahead; ++ra)
-                {
-                    const size_t ip = i + (size_t)ra;
-                    if (ip < L)
-                    {
-                        _mm_prefetch((const char *)(X  + ip * N),  _MM_HINT_T0);
-                        _mm_prefetch((const char *)(Xc + ip * N8), _MM_HINT_T0);
-                    }
-                }
+                _mm_prefetch((const char *)(X + (i + 2) * N), _MM_HINT_T0);
+                _mm_prefetch((const char *)(X + (i + 3) * N), _MM_HINT_T0);
             }
 
             size_t j = 0;
             for (; j + 7 < N; j += 8)
             {
-                if (do_pf_in && j + pf_elems + 8 < N)
-                {
-                    _mm_prefetch((const char *)(Xi + j + pf_elems), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(W  + j + pf_elems), _MM_HINT_T0);
-                }
-                __m256 xv   = _mm256_loadu_ps(Xi + j);          //!< X entries
-                __m256 wv   = _mm256_loadu_ps(W  + j);          //!< weights
-                __m256 diff = _mm256_sub_ps(xv, xi8);           //!< (X - x)
-                _mm256_storeu_ps(Xci + j, _mm256_mul_ps(diff, wv)); //!< (X - x) ⊙ W
+                __m256 wv = _mm256_loadu_ps(W + j);
+                
+                /* Row 0: (X - x) * W */
+                __m256 xv0   = _mm256_loadu_ps(Xi0 + j);
+                __m256 diff0 = _mm256_sub_ps(xv0, xi0v);
+                __m256 res0  = _mm256_mul_ps(diff0, wv);
+                _mm256_storeu_ps(Xci0 + j, res0);
+                
+                /* Row 1: (X - x) * W */
+                __m256 xv1   = _mm256_loadu_ps(Xi1 + j);
+                __m256 diff1 = _mm256_sub_ps(xv1, xi1v);
+                __m256 res1  = _mm256_mul_ps(diff1, wv);
+                _mm256_storeu_ps(Xci1 + j, res1);
             }
-            /* Scalar remainder and padding */
-            for (; j < N; ++j)  Xci[j] = (Xi[j] - x[i]) * W[j];
-            for (; j < N8; ++j) Xci[j] = 0.0f;
+            
+            /* Scalar tail and padding */
+            for (; j < N; ++j)
+            {
+                Xci0[j] = (Xi0[j] - x[i + 0]) * W[j];
+                Xci1[j] = (Xi1[j] - x[i + 1]) * W[j];
+            }
+            for (; j < N8; ++j)
+            {
+                Xci0[j] = 0.0f;
+                Xci1[j] = 0.0f;
+            }
+        }
+
+        /* Handle last row if L is odd */
+        if (i < L)
+        {
+            const float *Xi = X + i * N;
+            float *Xci = Xc + i * N8;
+            const __m256 xiv = _mm256_set1_ps(x[i]);
+
+            size_t j = 0;
+            for (; j + 7 < N; j += 8)
+            {
+                __m256 wv   = _mm256_loadu_ps(W + j);
+                __m256 xv   = _mm256_loadu_ps(Xi + j);
+                __m256 diff = _mm256_sub_ps(xv, xiv);
+                _mm256_storeu_ps(Xci + j, _mm256_mul_ps(diff, wv));
+            }
+            for (; j < N; ++j)
+                Xci[j] = (Xi[j] - x[i]) * W[j];
+            for (; j < N8; ++j)
+                Xci[j] = 0.0f;
         }
     }
     else
 #endif
     {
+        /* Scalar fallback */
         for (size_t i = 0; i < L; ++i)
         {
-            const float *Xi = X  + i * N;
-            float       *Xci = Xc + i * N8;
+            const float *Xi = X + i * N;
+            float *Xci = Xc + i * N8;
+            const float xi = x[i];
 
-            if (do_pf_rows && rows_ahead > 0)
-            {
-                for (int ra = 1; ra <= rows_ahead; ++ra)
-                {
-                    const size_t ip = i + (size_t)ra;
-                    if (ip < L)
-                        _mm_prefetch((const char *)(X + ip * N), _MM_HINT_T0);
-                }
-            }
+            if (do_pf && i + 1 < L)
+                _mm_prefetch((const char *)(X + (i + 1) * N), _MM_HINT_T0);
 
             size_t j = 0;
             for (; j < N; ++j)
-            {
-                if (do_pf_in && j + pf_elems + 1 < N)
-                {
-                    _mm_prefetch((const char *)(Xi + j + pf_elems), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(W  + j + pf_elems), _MM_HINT_T0);
-                }
-                Xci[j] = (Xi[j] - x[i]) * W[j];
-            }
-            for (; j < N8; ++j) Xci[j] = 0.0f;
+                Xci[j] = (Xi[j] - xi) * W[j];
+            for (; j < N8; ++j)
+                Xci[j] = 0.0f;
         }
     }
 
     /* ----------------------------------------------------------------
-     * Step 2: Build YTc = (Y - y)^T with row-padding to N8.
-     *         YTc has shape (N8 × L), row-major, i.e., each row is one
-     *         centered sigma column from Y (or zeros for padded rows).
+     * Step 2: Build YTc = (Y - y)^T with row-padding to N8
      * ---------------------------------------------------------------- */
 #if LINALG_SIMD_ENABLE
-    if (ukf_has_avx2() && N >= 8 && L >= 8)
+    if (ukf_has_avx2() && N >= 8 && L >= 16)
     {
-        /* Zero-pad rows j = N..N8-1 (these entire rows are 0) */
+        /* Zero-pad extra rows */
         for (size_t jp = N; jp < N8; ++jp)
             memset(YTc + jp * L, 0, L * sizeof(float));
 
+        /* Process Y in 8-row panels using transpose kernel */
         size_t k0 = 0;
-        for (; k0 + 7 < L; k0 += 8)        /* Process Y in 8-row panels */
+        for (; k0 + 7 < L; k0 += 8)
         {
-            /* Prefetch upcoming 8-row panels of Y */
-            if (do_pf_rows && rows_ahead > 0)
-            {
-                for (int ra = 1; ra <= rows_ahead; ++ra)
-                {
-                    const size_t kp = k0 + (size_t)ra * 8;
-                    if (kp < L)
-                        _mm_prefetch((const char *)(Y + kp * N), _MM_HINT_T0);
-                }
-            }
+            /* Prefetch next panel */
+            if (do_pf && k0 + 8 < L)
+                _mm_prefetch((const char *)(Y + (k0 + 8) * N), _MM_HINT_T0);
 
             size_t j0 = 0;
-            for (; j0 + 7 < N; j0 += 8)   /* For each 8-wide column block */
+            for (; j0 + 7 < N; j0 += 8)
             {
-                if (do_pf_in && j0 + pf_elems + 8 < N)
-                {
-                    for (int r = 0; r < 8; ++r)
-                        _mm_prefetch((const char *)(Y + (k0 + (size_t)r) * N + j0 + pf_elems), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(YTc + (j0 + pf_elems) * L + k0), _MM_HINT_T0);
-                }
-
-                /* Load 8 rows × 8 cols tile of Y and center by y */
+                /* Load 8x8 tile from Y and center by y */
                 __m256 row[8];
                 for (int r = 0; r < 8; ++r)
                 {
@@ -1110,7 +1299,7 @@ static void create_state_cross_covariance_matrix(float *RESTRICT P,
                     row[r] = _mm256_sub_ps(_mm256_loadu_ps(Yr), yr);
                 }
 
-                /* Transpose 8×8 block so we can write contiguous rows into YTc */
+                /* Transpose 8x8 and store to YTc */
                 __m256 col[8];
                 ukf_transpose8x8_ps(row, col);
 
@@ -1118,21 +1307,22 @@ static void create_state_cross_covariance_matrix(float *RESTRICT P,
                     _mm256_storeu_ps(YTc + (j0 + (size_t)c) * L + k0, col[c]);
             }
 
-            /* Handle N-tail for these 8 rows */
+            /* Scalar tail for this 8-row panel */
             for (; j0 < N; ++j0)
             {
-                float *YTrow = YTc + j0 * L;   /* row j0 in YTc */
+                float *YTrow = YTc + j0 * L;
                 for (int r = 0; r < 8; ++r)
                     YTrow[k0 + (size_t)r] = Y[(k0 + (size_t)r) * N + j0] - y[k0 + (size_t)r];
             }
         }
 
-        /* Handle remaining rows (L-tail) one-by-one */
+        /* Handle remaining rows (L % 8 tail) */
         for (; k0 < L; ++k0)
         {
+            const float yk = y[k0];
             size_t j = 0;
             for (; j < N; ++j)
-                YTc[j * L + k0] = Y[k0 * N + j] - y[k0];
+                YTc[j * L + k0] = Y[k0 * N + j] - yk;
             for (; j < N8; ++j)
                 YTc[j * L + k0] = 0.0f;
         }
@@ -1140,34 +1330,28 @@ static void create_state_cross_covariance_matrix(float *RESTRICT P,
     else
 #endif
     {
-        /* Portable path: build centered Y^T directly */
+        /* Scalar fallback: build Y^T directly */
         for (size_t j = 0; j < N; ++j)
         {
-            const float *Ycol0 = Y + j;    /* Address Y[0,j] in row-major: Y[k*N + j] */
-            float *YTrow = YTc + j * L;    /* Row j in YTc (since YTc is N8×L row-major) */
+            float *YTrow = YTc + j * L;
             for (size_t k = 0; k < L; ++k)
-                YTrow[k] = Ycol0[k * N] - y[k];
+                YTrow[k] = Y[k * N + j] - y[k];
         }
-        /* Zero-pad extra rows (j = N..N8-1) */
+        /* Zero-pad extra rows */
         for (size_t j = N; j < N8; ++j)
             memset(YTc + j * L, 0, L * sizeof(float));
     }
 
     /* ----------------------------------------------------------------
-     * Step 3: Multiply once — P = Xc · YTc
+     * Step 3: Matrix multiply P = Xc · YTc
      * ---------------------------------------------------------------- */
-    if (do_pf_rows)
-    {
-        _mm_prefetch((const char *)Xc, _MM_HINT_T0);
-        _mm_prefetch((const char *)YTc, _MM_HINT_T0);
-        _mm_prefetch((const char *)P,  _MM_HINT_T0);
-    }
-    /* Shapes: Xc (L×N8), YTc (N8×L) → P (L×L) */
-    (void)mul(P, Xc, YTc, (uint16_t)L, (uint16_t)N8, (uint16_t)N8, (uint16_t)L);
+    int rc = mul(P, Xc, YTc, (uint16_t)L, (uint16_t)N8, (uint16_t)N8, (uint16_t)L);
 
-    /* Free temporaries */
-    linalg_aligned_free(Xc);
-    linalg_aligned_free(YTc);
+    /* Cleanup */
+    gemm_aligned_free(Xc);
+    gemm_aligned_free(YTc);
+
+    return rc;
 }
 
 /**
@@ -1220,25 +1404,25 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     const float *RESTRICT Pxy,
     uint8_t L8)
 {
-    const uint16_t n  = (uint16_t)L8;
-    const size_t   nn = (size_t)n * (size_t)n;
+    const uint16_t n = (uint16_t)L8;
+    const size_t nn = (size_t)n * (size_t)n;
 
     /* Thread-local reusable workspace (Z, U, Uk, Ky, yyhat). */
     static __thread ukf_upd_ws_t uws = {0};
     if (ukf_upd_ws_ensure(&uws, n) != 0)
         return -ENOMEM;
 
-    float *Z     = uws.Z;     /* (n×n) RHS workspace → becomes K */
-    float *U     = uws.U;     /* (n×n) temporary for K*Sy */
-    float *Uk    = uws.Uk;    /* (n)   single column buffer for chol downdate */
-    float *Ky    = uws.Ky;    /* (n)   K*(y−yhat) */
+    float *Z = uws.Z;         /* (n×n) RHS workspace → becomes K */
+    float *U = uws.U;         /* (n×n) temporary for K*Sy */
+    float *Uk = uws.Uk;       /* (n)   single column buffer for chol downdate */
+    float *Ky = uws.Ky;       /* (n)   K*(y−yhat) */
     float *yyhat = uws.yyhat; /* (n)   innovation v = y − yhat */
 
     /* Z := Pxy (we’ll overwrite it into K after the triangular solves) */
     memcpy(Z, Pxy, nn * sizeof(float));
 
     /* Prefetch knobs for large problems */
-    const int    do_pf   = (n >= (uint16_t)UKF_UPD_PF_MIN_N);
+    const int do_pf = (n >= (uint16_t)UKF_UPD_PF_MIN_N);
     const size_t pf_elts = (size_t)UKF_UPD_PF_DIST_BYTES / sizeof(float);
 
     /* --------------------------------------------------------------
@@ -1250,18 +1434,20 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     {
         for (uint16_t i = 0; i < n; ++i)
         {
-            const float sii = Sy[(size_t)i * n + i];  /* diagonal (scalar) */
+            const float sii = Sy[(size_t)i * n + i]; /* diagonal (scalar) */
 
             for (uint16_t c0 = 0; c0 < n; c0 += UKF_UPD_COLBLOCK)
             {
                 const uint16_t bc = (uint16_t)((c0 + UKF_UPD_COLBLOCK <= n)
-                                    ? UKF_UPD_COLBLOCK : (n - c0));
+                                                   ? UKF_UPD_COLBLOCK
+                                                   : (n - c0));
 
                 /* Z[i,*] -= Σ_{k<i} Sy[k,i] * Z[k,*] */
                 for (uint16_t k = 0; k < i; ++k)
                 {
                     const float m = Sy[(size_t)k * n + i];
-                    if (m == 0.0f) continue;
+                    if (m == 0.0f)
+                        continue;
                     const __m256 mv = _mm256_set1_ps(m);
 
                     uint16_t c = 0;
@@ -1324,13 +1510,15 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
             for (uint16_t c0 = 0; c0 < n; c0 += UKF_UPD_COLBLOCK)
             {
                 const uint16_t bc = (uint16_t)((c0 + UKF_UPD_COLBLOCK <= n)
-                                    ? UKF_UPD_COLBLOCK : (n - c0));
+                                                   ? UKF_UPD_COLBLOCK
+                                                   : (n - c0));
 
                 /* Z[i,*] -= Σ_{k>i} Sy[i,k] * Z[k,*] */
                 for (uint16_t k = (uint16_t)(i + 1); k < n; ++k)
                 {
                     const float m = Sy[(size_t)i * n + k];
-                    if (m == 0.0f) continue;
+                    if (m == 0.0f)
+                        continue;
                     const __m256 mv = _mm256_set1_ps(m);
 
                     uint16_t c = 0;
@@ -1391,18 +1579,20 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
         {
             if (do_pf && i + pf_elts + 8 < n)
             {
-                _mm_prefetch((const char *)(y    + i + pf_elts), _MM_HINT_T0);
+                _mm_prefetch((const char *)(y + i + pf_elts), _MM_HINT_T0);
                 _mm_prefetch((const char *)(yhat + i + pf_elts), _MM_HINT_T0);
             }
-            __m256 vy  = _mm256_loadu_ps(y    + i);
+            __m256 vy = _mm256_loadu_ps(y + i);
             __m256 vyh = _mm256_loadu_ps(yhat + i);
             _mm256_storeu_ps(yyhat + i, _mm256_sub_ps(vy, vyh));
         }
-        for (; i < n; ++i) yyhat[i] = y[i] - yhat[i];
+        for (; i < n; ++i)
+            yyhat[i] = y[i] - yhat[i];
     }
     else
     {
-        for (uint16_t i = 0; i < n; ++i) yyhat[i] = y[i] - yhat[i];
+        for (uint16_t i = 0; i < n; ++i)
+            yyhat[i] = y[i] - yhat[i];
     }
 
     /* Gain-times-innovation: Ky = K * (y − ŷ) */
@@ -1416,14 +1606,16 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
         for (; (uint16_t)(i + 7) < n; i = (uint16_t)(i + 8))
         {
             __m256 xv = _mm256_loadu_ps(xhat + i);
-            __m256 kv = _mm256_loadu_ps(Ky   + i);
+            __m256 kv = _mm256_loadu_ps(Ky + i);
             _mm256_storeu_ps(xhat + i, _mm256_add_ps(xv, kv));
         }
-        for (; i < n; ++i) xhat[i] += Ky[i];
+        for (; i < n; ++i)
+            xhat[i] += Ky[i];
     }
     else
     {
-        for (uint16_t i = 0; i < n; ++i) xhat[i] += Ky[i];
+        for (uint16_t i = 0; i < n; ++i)
+            xhat[i] += Ky[i];
     }
 
     /* Helper matrix: U = K * S_y (n×n) */
@@ -1450,7 +1642,7 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
             - Measurement is wildly inconsistent (outlier)
             - R is too small (overconfident measurement model)
             - Numerical issues accumulated                              */
-            return rc;  /* Let caller handle divergence */
+            return rc; /* Let caller handle divergence */
         }
     }
 
@@ -1527,7 +1719,7 @@ int sqr_ukf(float y[], float xhat[],
 
     // 2) sigma → X  (state)
     create_sigma_point_matrix(X, xhat, S, alpha, kappa, (uint8_t)L);
-    
+
     // 3) propagate through F → X*
     compute_transition_function(Xst, X, u, F, (uint8_t)L);
 
