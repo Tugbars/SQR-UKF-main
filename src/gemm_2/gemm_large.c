@@ -515,6 +515,13 @@ int gemm_dynamic(
     return ret;
 }
 
+void gemm_get_tuning(size_t M, size_t K, size_t N,
+                     size_t *MC, size_t *KC, size_t *NC,
+                     size_t *MR, size_t *NR)
+{
+    gemm_select_blocking(M, K, N, MC, KC, NC, MR, NR);
+}
+
 /*
 3. Big correctness landmine: pack_A_panel_simd
 
