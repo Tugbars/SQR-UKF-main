@@ -14,6 +14,7 @@
 #include "gemm_planning.h"
 #include "gemm_static.h"
 #include "gemm_utils.h"
+#include "gemm_kernels_avx2.h"
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
@@ -165,6 +166,56 @@ void gemm_select_kernels(
     *kernel_width = 8;
 }
 
+
+//==============================================================================
+// FUNCTION POINTER ASSIGNMENT
+//==============================================================================
+
+/**
+ * @brief Assign standard kernel function pointer
+ * 
+ * Only returns function pointers for kernels that match the standard signature.
+ * 4x8 and 1x8 kernels have different signatures and should only be called
+ * through dispatch_kernel() for edge tiles.
+ */
+static gemm_kernel_std_fn get_std_kernel_function_pointer(gemm_kernel_id_t kernel_id)
+{
+    switch (kernel_id) {
+        case KERN_16x8_ADD:    return gemm_16x8_panel_avx2fma_add;
+        case KERN_16x8_STORE:  return gemm_16x8_panel_avx2fma_store;
+        case KERN_8x8_ADD:     return gemm_8x8_panel_avx2fma_add;
+        case KERN_8x8_STORE:   return gemm_8x8_panel_avx2fma_store;
+        case KERN_16x6_ADD:    return gemm_16x6_panel_avx2fma_add;
+        case KERN_16x6_STORE:  return gemm_16x6_panel_avx2fma_store;
+        case KERN_8x6_ADD:     return gemm_8x6_panel_avx2fma_add;
+        case KERN_8x6_STORE:   return gemm_8x6_panel_avx2fma_store;
+        
+        // 4x8 and 1x8 have different signatures - don't use function pointers
+        // They're only called for edge tiles through dispatch_kernel()
+        case KERN_4x8_ADD:
+        case KERN_4x8_STORE:
+        case KERN_1x8_ADD:
+        case KERN_1x8_STORE:
+            return NULL;  // Will fall back to dispatch_kernel()
+        
+        default:
+            return NULL;
+    }
+}
+
+/**
+ * @brief Assign wide kernel function pointer (8x16 only)
+ */
+static gemm_kernel_wide_fn get_wide_kernel_function_pointer(gemm_kernel_id_t kernel_id)
+{
+    switch (kernel_id) {
+        case KERN_8x16_ADD:    return gemm_8x16_panel_avx2fma_add;
+        case KERN_8x16_STORE:  return gemm_8x16_panel_avx2fma_store;
+        default:               return NULL;
+    }
+}
+
+
 //==============================================================================
 // PANEL PRE-COMPUTATION (SIMPLIFIED - NO MASKS!)
 //==============================================================================
@@ -220,6 +271,10 @@ gemm_plan_t *gemm_plan_create(size_t M, size_t K, size_t N)
     return gemm_plan_create_with_mode(M, K, N, mode);
 }
 
+//==============================================================================
+// PLAN CREATION
+//==============================================================================
+
 gemm_plan_t *gemm_plan_create_with_mode(
     size_t M, size_t K, size_t N,
     gemm_memory_mode_t mode)
@@ -244,20 +299,53 @@ gemm_plan_t *gemm_plan_create_with_mode(
                          &plan->MR, &plan->NR);
 
     //--------------------------------------------------------------------------
-    // PRE-COMPUTE TILE COUNTS (NEW!)
+    // PRE-COMPUTE TILE COUNTS
     //--------------------------------------------------------------------------
     plan->n_nc_tiles = (N + plan->NC - 1) / plan->NC;
     plan->n_kc_tiles = (K + plan->KC - 1) / plan->KC;
     plan->n_mc_tiles = (M + plan->MC - 1) / plan->MC;
 
-    //--------------------------------------------------------------------------
-    // PRE-SELECT KERNELS FOR FULL TILES (NEW!)
+     //--------------------------------------------------------------------------
+    // PRE-SELECT KERNELS FOR FULL TILES
     //--------------------------------------------------------------------------
     int dummy_width;
     gemm_select_kernels(plan->MR, plan->NR,
                        &plan->kern_full_add,
                        &plan->kern_full_store,
                        &dummy_width);
+
+     //--------------------------------------------------------------------------
+    // ASSIGN FUNCTION POINTERS BASED ON KERNEL TYPE
+    //--------------------------------------------------------------------------
+    
+    // Check kernel type
+    if (plan->kern_full_add == KERN_16x16_ADD)
+    {
+        // KERN_16x16 is composite (2x 8x16 calls) - handle specially in execution
+        plan->kern_full_is_wide = 2;
+        plan->kern_full_add_wide_fn = gemm_8x16_panel_avx2fma_add;
+        plan->kern_full_store_wide_fn = gemm_8x16_panel_avx2fma_store;
+        plan->kern_full_add_fn = NULL;
+        plan->kern_full_store_fn = NULL;
+    }
+    else if (plan->kern_full_add == KERN_8x16_ADD)
+    {
+        // 8x16 is a true wide kernel
+        plan->kern_full_is_wide = 1;
+        plan->kern_full_add_wide_fn = get_wide_kernel_function_pointer(plan->kern_full_add);
+        plan->kern_full_store_wide_fn = get_wide_kernel_function_pointer(plan->kern_full_store);
+        plan->kern_full_add_fn = NULL;
+        plan->kern_full_store_fn = NULL;
+    }
+    else
+    {
+        // Standard 8-wide or narrower kernel
+        plan->kern_full_is_wide = 0;
+        plan->kern_full_add_fn = get_std_kernel_function_pointer(plan->kern_full_add);
+        plan->kern_full_store_fn = get_std_kernel_function_pointer(plan->kern_full_store);
+        plan->kern_full_add_wide_fn = NULL;
+        plan->kern_full_store_wide_fn = NULL;
+    }
 
     //--------------------------------------------------------------------------
     // Allocate panel descriptors
@@ -274,7 +362,7 @@ gemm_plan_t *gemm_plan_create_with_mode(
     precompute_panels(plan);
 
     //--------------------------------------------------------------------------
-    // Setup Workspace
+    // Setup Workspace (unchanged)
     //--------------------------------------------------------------------------
     if (mode == GEMM_MEM_STATIC)
     {

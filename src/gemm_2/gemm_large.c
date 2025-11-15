@@ -306,6 +306,10 @@ static inline void dispatch_kernel(
 // MAIN EXECUTION LOOP (OPTIMIZED!)
 //==============================================================================
 
+//==============================================================================
+// MAIN EXECUTION LOOP (OPTIMIZED WITH FUNCTION POINTERS!)
+//==============================================================================
+
 int gemm_execute_plan(
     gemm_plan_t *plan,
     float *restrict C,
@@ -347,6 +351,17 @@ int gemm_execute_plan(
     const size_t n_nc_tiles = plan->n_nc_tiles;
     const size_t n_kc_tiles = plan->n_kc_tiles;
     const size_t n_mc_tiles = plan->n_mc_tiles;
+    
+    //--------------------------------------------------------------------------
+    // Pre-load function pointers for fast path dispatch
+    //--------------------------------------------------------------------------
+    __m256i mask_unused = _mm256_setzero_si256();
+    
+    int use_wide = plan->kern_full_is_wide;
+    gemm_kernel_std_fn full_add_fn = plan->kern_full_add_fn;
+    gemm_kernel_std_fn full_store_fn = plan->kern_full_store_fn;
+    gemm_kernel_wide_fn full_add_wide_fn = plan->kern_full_add_wide_fn;
+    gemm_kernel_wide_fn full_store_wide_fn = plan->kern_full_store_wide_fn;
 
     //--------------------------------------------------------------------------
     // NC → KC → MC loop structure (maximize B reuse in L2 cache)
@@ -404,49 +419,112 @@ int gemm_execute_plan(
                         size_t j = j0 + p * plan->NR;
                         size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                        //------------------------------------------------------
-                        // FAST PATH: Full tiles (most common case)
-                        //------------------------------------------------------
-                        gemm_kernel_id_t kernel_id;
+                        float *cptr = C + i * plan->N + j;
+                        float *bptr = Bp + p * plan->KC * 16;
 
+                        //------------------------------------------------------
+                        // FAST PATH: Full tiles (90%+ of iterations)
+                        // DIRECT FUNCTION POINTER CALL - NO SWITCH!
+                        //------------------------------------------------------
                         if (mh == plan->MR && jw == plan->NR)
                         {
-                            // USE PRE-SELECTED KERNELS (no selection overhead!)
-                            kernel_id = (kt == 0 && first_accumulation)
-                                            ? plan->kern_full_store
-                                            : plan->kern_full_add;
+                            int is_store = (kt == 0 && first_accumulation);
+                            
+                            if (use_wide == 0)
+                            {
+                                //----------------------------------------------
+                                // Standard kernel (8-wide or narrower)
+                                //----------------------------------------------
+                                if (full_add_fn && full_store_fn)
+                                {
+                                    // FAST: Direct function pointer call
+                                    if (is_store)
+                                        full_store_fn(cptr, plan->N, Ap, a_strides.a_k_stride,
+                                                    bptr, b_strides.b_k_stride,
+                                                    kb, mh, jw, mask_unused);
+                                    else
+                                        full_add_fn(cptr, plan->N, Ap, a_strides.a_k_stride,
+                                                  bptr, b_strides.b_k_stride,
+                                                  kb, mh, jw, mask_unused);
+                                }
+                                else
+                                {
+                                    // Fallback: function pointer unavailable (e.g., 4x8/1x8)
+                                    // This should never happen for full tiles with MR=8/16
+                                    gemm_kernel_id_t kernel_id = is_store 
+                                        ? plan->kern_full_store 
+                                        : plan->kern_full_add;
+                                    dispatch_kernel(kernel_id, cptr, plan->N,
+                                                  Ap, a_strides.a_k_stride,
+                                                  bptr, b_strides.b_k_stride,
+                                                  kb, mh, jw);
+                                }
+                            }
+                            else if (use_wide == 1)
+                            {
+                                //----------------------------------------------
+                                // 8x16 kernel (true wide)
+                                //----------------------------------------------
+                                if (is_store)
+                                    full_store_wide_fn(cptr, plan->N, Ap, a_strides.a_k_stride,
+                                                     bptr, b_strides.b_k_stride,
+                                                     kb, mh, jw, mask_unused, mask_unused);
+                                else
+                                    full_add_wide_fn(cptr, plan->N, Ap, a_strides.a_k_stride,
+                                                   bptr, b_strides.b_k_stride,
+                                                   kb, mh, jw, mask_unused, mask_unused);
+                            }
+                            else
+                            {
+                                //----------------------------------------------
+                                // 16x16 kernel (composite: 2x 8x16 calls)
+                                //----------------------------------------------
+                                if (is_store)
+                                {
+                                    full_store_wide_fn(cptr, plan->N, Ap, a_strides.a_k_stride,
+                                                     bptr, b_strides.b_k_stride,
+                                                     kb, 8, jw, mask_unused, mask_unused);
+                                    full_store_wide_fn(cptr + 8 * plan->N, plan->N, Ap + 8, a_strides.a_k_stride,
+                                                     bptr, b_strides.b_k_stride,
+                                                     kb, mh - 8, jw, mask_unused, mask_unused);
+                                }
+                                else
+                                {
+                                    full_add_wide_fn(cptr, plan->N, Ap, a_strides.a_k_stride,
+                                                   bptr, b_strides.b_k_stride,
+                                                   kb, 8, jw, mask_unused, mask_unused);
+                                    full_add_wide_fn(cptr + 8 * plan->N, plan->N, Ap + 8, a_strides.a_k_stride,
+                                                   bptr, b_strides.b_k_stride,
+                                                   kb, mh - 8, jw, mask_unused, mask_unused);
+                                }
+                            }
                         }
                         else
                         {
                             //--------------------------------------------------
-                            // SLOW PATH: Edge tiles (rare, only at boundaries)
+                            // SLOW PATH: Edge tiles (rare, <10% of iterations)
+                            // Use switch - doesn't matter for performance
                             //--------------------------------------------------
                             gemm_kernel_id_t kern_add, kern_store;
                             int dummy_width;
                             gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy_width);
+                            
+                            gemm_kernel_id_t kernel_id = (kt == 0 && first_accumulation)
+                                ? kern_store
+                                : kern_add;
 
-                            kernel_id = (kt == 0 && first_accumulation)
-                                            ? kern_store
-                                            : kern_add;
+                            dispatch_kernel(
+                                kernel_id,
+                                cptr,
+                                plan->N,
+                                Ap,
+                                a_strides.a_k_stride,
+                                bptr,
+                                b_strides.b_k_stride,
+                                kb,
+                                mh,
+                                jw);
                         }
-
-                        //------------------------------------------------------
-                        // Dispatch kernel
-                        //------------------------------------------------------
-                        float *cptr = C + i * plan->N + j;
-                        float *bptr = Bp + p * plan->KC * 16;
-
-                        dispatch_kernel(
-                            kernel_id,
-                            cptr,
-                            plan->N,
-                            Ap,
-                            a_strides.a_k_stride,
-                            bptr,
-                            b_strides.b_k_stride,
-                            kb,
-                            mh,
-                            jw);
                     }
                 }
             }

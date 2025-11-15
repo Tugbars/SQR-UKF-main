@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "gemm_static.h"
+#include <immintrin.h>
 
 //==============================================================================
 // BLOCKING PARAMETERS (Tuned for Intel 14900K)
@@ -32,12 +33,32 @@ typedef enum {
 } gemm_kernel_id_t;
 
 //==============================================================================
+// KERNEL FUNCTION POINTER TYPES
+//==============================================================================
+
+// Standard kernel signature (16x8, 8x8, 16x6, 8x6)
+typedef void (*gemm_kernel_std_fn)(
+    float *restrict c, size_t ldc,
+    const float *restrict Ap, size_t a_k_stride,
+    const float *restrict Bp, size_t b_k_stride,
+    size_t Kblk, size_t m_block, size_t n_block,
+    __m256i mask);
+
+// Wide kernel signature (8x16, 16x16)
+typedef void (*gemm_kernel_wide_fn)(
+    float *restrict c, size_t ldc,
+    const float *restrict Ap, size_t a_k_stride,
+    const float *restrict Bp, size_t b_k_stride,
+    size_t Kblk, size_t m_block, size_t n_block,
+    __m256i mask_lo, __m256i mask_hi);
+
+//==============================================================================
 // SIMPLIFIED PANEL DESCRIPTOR (NO MASKS!)
 //==============================================================================
 
 typedef struct {
-    size_t j_start;   // Starting column
-    size_t j_width;   // Actual width (<= NR)
+    size_t j_start;
+    size_t j_width;
 } panel_info_t;
 
 //==============================================================================
@@ -66,23 +87,35 @@ typedef struct gemm_plan {
     size_t MR, NR;
     
     //--------------------------------------------------------------------------
-    // PRE-COMPUTED EXECUTION METADATA (NEW!)
+    // PRE-COMPUTED EXECUTION METADATA
     //--------------------------------------------------------------------------
-    size_t n_nc_tiles;   // (N + NC - 1) / NC
-    size_t n_kc_tiles;   // (K + KC - 1) / KC
-    size_t n_mc_tiles;   // (M + MC - 1) / MC
+    size_t n_nc_tiles;
+    size_t n_kc_tiles;
+    size_t n_mc_tiles;
     
     //--------------------------------------------------------------------------
-    // PRE-SELECTED KERNELS FOR FULL TILES (NEW!)
+    // PRE-SELECTED KERNELS FOR FULL TILES
     //--------------------------------------------------------------------------
-    gemm_kernel_id_t kern_full_add;      // Full MR×NR tile (ADD)
-    gemm_kernel_id_t kern_full_store;    // Full MR×NR tile (STORE)
+    gemm_kernel_id_t kern_full_add;      // Kernel ID (for debugging)
+    gemm_kernel_id_t kern_full_store;    // Kernel ID (for debugging)
+    
+    
+    // FUNCTION POINTERS (for direct call - eliminates switch overhead)
+    gemm_kernel_std_fn kern_full_add_fn;
+    gemm_kernel_std_fn kern_full_store_fn;
+
+     // For wide kernels (16-wide):
+    gemm_kernel_wide_fn kern_full_add_wide_fn;
+    gemm_kernel_wide_fn kern_full_store_wide_fn;
+    
+    // Flag: 1 if full kernels are 16-wide (need special handling)
+    int kern_full_is_wide;
     
     //--------------------------------------------------------------------------
     // Panel Descriptors (NO MASKS!)
     //--------------------------------------------------------------------------
-    size_t n_npanels;        // Number of N-panels
-    panel_info_t *npanels;   // Array of panel descriptors (just j_start, j_width)
+    size_t n_npanels;
+    panel_info_t *npanels;
     
     //--------------------------------------------------------------------------
     // Memory Strategy
