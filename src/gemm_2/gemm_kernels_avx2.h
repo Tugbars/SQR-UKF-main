@@ -38,6 +38,13 @@
 #define LINALG_NT_STORES 1
 #endif
 
+#define GEMM_PREFETCH_A_ENABLE 1  // Enable A-prefetch for deep matrices
+
+#define GEMM_PREFETCH_A_DISTANCE 64  // Distance in K-iterations (tunable!)
+
+#define GEMM_PREFETCH_A_MIN_K 128  // Only enable for K ≥ this threshold
+
+
 // Prefetch macros
 #ifdef _MSC_VER
 #define PREFETCH_T0(addr) _mm_prefetch((const char *)(addr), _MM_HINT_T0)
@@ -1121,6 +1128,15 @@ static inline void gemm_8x6_panel_avx2fma_store(
  *
  * SAFETY: Unchanged (no alignas, no masked stores)
  */
+/**
+ * @brief 8×16 kernel (ADD): C += A*B - WITH A-PREFETCH
+ *
+ * OPTIMIZATIONS:
+ * - Unroll K-loop by 2 with interleaved computation
+ * - Software pipelined loads
+ * - A-panel prefetching for deep K (NEW!)
+ * - Register pressure: 16 accumulators (8 rows × 2 col groups) = safe!
+ */
 static inline void gemm_8x16_panel_avx2fma_add(
     float *RESTRICT c,
     size_t ldc,
@@ -1161,14 +1177,31 @@ static inline void gemm_8x16_panel_avx2fma_add(
         const float *a = Ap;
         const float *b = Bp;
 
-        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+        // ✅ NEW: Prefetch control
+        const int do_pf_b = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
+        
+#if GEMM_PREFETCH_A_ENABLE
+        const int do_pf_a = (int)(Kblk >= (size_t)GEMM_PREFETCH_A_MIN_K);
+        const size_t pf_a_dist = GEMM_PREFETCH_A_DISTANCE;
+#else
+        const int do_pf_a = 0;
+        const size_t pf_a_dist = 0;
+#endif
+
+        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation + A-prefetch
         size_t k = 0;
         for (; k + 1 < Kblk; k += 2)
         {
-            if (k + 8 < Kblk)
+            // ✅ Prefetch B (short distance, into L1)
+            if (do_pf_b && k + 8 < Kblk)
             {
-                PREFETCH_T0(a + 2 * a_k_stride);
-                PREFETCH_T0(b + 2 * b_k_stride);
+                PREFETCH_T0(b + 2 * b_k_stride);  // k+2 iterations ahead
+            }
+
+            // ✅ NEW: Prefetch A (long distance, into L2)
+            if (do_pf_a && k + pf_a_dist < Kblk)
+            {
+                PREFETCH_T1(a + pf_a_dist * a_k_stride);  // Much further ahead
             }
 
             // Load K iteration 0
@@ -1288,7 +1321,7 @@ static inline void gemm_8x16_panel_avx2fma_add(
             c71 = _mm256_fmadd_ps(a7, b1, c71);
         }
 
-        // ✅ WRITEBACK (full tile, no masking)
+        // ✅ WRITEBACK (unchanged)
         float *c0 = c;
         _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c00));
         _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c01));
@@ -1423,6 +1456,15 @@ static inline void gemm_8x16_panel_avx2fma_add(
  *
  * SAFETY: Unchanged (no alignas, no masked stores)
  */
+/**
+ * @brief 8×16 kernel (STORE): C = A*B - WITH A-PREFETCH
+ *
+ * OPTIMIZATIONS:
+ * - Unroll K-loop by 2 with interleaved computation
+ * - Software pipelined loads
+ * - A-panel prefetching for deep K (NEW!)
+ * - Register pressure: 16 accumulators (8 rows × 2 col groups) = safe!
+ */
 static inline void gemm_8x16_panel_avx2fma_store(
     float *RESTRICT c,
     size_t ldc,
@@ -1463,14 +1505,31 @@ static inline void gemm_8x16_panel_avx2fma_store(
         const float *a = Ap;
         const float *b = Bp;
 
-        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+        // ✅ NEW: Prefetch control (same as ADD variant)
+        const int do_pf_b = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
+        
+#if GEMM_PREFETCH_A_ENABLE
+        const int do_pf_a = (int)(Kblk >= (size_t)GEMM_PREFETCH_A_MIN_K);
+        const size_t pf_a_dist = GEMM_PREFETCH_A_DISTANCE;
+#else
+        const int do_pf_a = 0;
+        const size_t pf_a_dist = 0;
+#endif
+
+        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation + A-prefetch
         size_t k = 0;
         for (; k + 1 < Kblk; k += 2)
         {
-            if (k + 8 < Kblk)
+            // ✅ Prefetch B (short distance, into L1)
+            if (do_pf_b && k + 8 < Kblk)
             {
-                PREFETCH_T0(a + 2 * a_k_stride);
-                PREFETCH_T0(b + 2 * b_k_stride);
+                PREFETCH_T0(b + 2 * b_k_stride);  // k+2 iterations ahead
+            }
+
+            // ✅ NEW: Prefetch A (long distance, into L2)
+            if (do_pf_a && k + pf_a_dist < Kblk)
+            {
+                PREFETCH_T1(a + pf_a_dist * a_k_stride);  // Much further ahead
             }
 
             // Load K iteration 0
@@ -1590,7 +1649,7 @@ static inline void gemm_8x16_panel_avx2fma_store(
             c71 = _mm256_fmadd_ps(a7, b1, c71);
         }
 
-        // ✅ WRITEBACK (STORE mode - no load/add needed)
+        // ✅ WRITEBACK (STORE mode - no load/add, just write directly)
         float *c0 = c;
         _mm256_storeu_ps(c0, c00);
         _mm256_storeu_ps(c0 + 8, c01);
