@@ -106,16 +106,22 @@
  * @brief Safely write partial vector to C (n < 8)
  * Uses scalar loop instead of masked stores for simplicity and safety
  */
-static inline void __attribute__((always_inline))
-gemm_store_partial_add(float *RESTRICT c, __m256 acc, size_t n)
+static inline void gemm_store_partial_add(float *RESTRICT c, __m256 acc, size_t n)
 {
-    // Extract to temp buffer, then scalar copy
+    // Extract to temp buffer (compiler will optimize)
     float tmp[8];
     _mm256_storeu_ps(tmp, acc);
-
-    for (size_t j = 0; j < n; j++)
-    {
-        c[j] += tmp[j]; // ADD mode
+    
+    // Unrolled scalar loop (compiler-friendly pattern)
+    switch (n) {
+        case 7: c[6] += tmp[6]; // fallthrough
+        case 6: c[5] += tmp[5]; // fallthrough
+        case 5: c[4] += tmp[4]; // fallthrough
+        case 4: c[3] += tmp[3]; // fallthrough
+        case 3: c[2] += tmp[2]; // fallthrough
+        case 2: c[1] += tmp[1]; // fallthrough
+        case 1: c[0] += tmp[0]; // fallthrough
+        case 0: break;
     }
 }
 
