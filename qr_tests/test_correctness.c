@@ -1,342 +1,927 @@
 /**
- * @file test_qr_gemm_integrated.c
- * @brief Comprehensive QR+GEMM testing with planning
+ * @file test_qr_blocked.c
+ * @brief Unit tests for GEMM-accelerated blocked QR decomposition
+ *
+ * Tests:
+ * - Reconstruction accuracy: A = Q*R
+ * - Orthogonality: Q^T * Q = I
+ * - Upper triangular R
+ * - Various matrix shapes (square, tall, wide)
+ * - Edge cases and numerical stability
+ *
+ * @author TUGBARS
+ * @date 2025
  */
 
+#include "test_common.h"
+#include "../linalg/qr.h"
+#include "../gemm/gemm.h"
+#include "../gemm/gemm_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <math.h>
-#include <stdint.h>
 #include <string.h>
-#include <time.h>
-#include "qr.h"
-#include "../gemm/gemm.h"
+#include <math.h>
+#include <float.h>
 
 //==============================================================================
-// ENHANCED QR WORKSPACE WITH GEMM PLANNING
+// MATRIX UTILITIES
 //==============================================================================
-
-typedef struct {
-    qr_workspace *base;
-    
-    // Pre-planned GEMM operations for block reflector
-    gemm_plan_t *plan_ytc;    // Z = Y^T * C
-    gemm_plan_t *plan_tz;     // Z = T * Z  
-    gemm_plan_t *plan_yz;     // C -= Y * Z
-    
-    // Cached dimensions
-    uint16_t m_max;
-    uint16_t n_max;
-    uint16_t ib;
-} qr_workspace_planned;
 
 /**
- * @brief Allocate QR workspace with GEMM planning
+ * @brief Compute Frobenius norm: ||A||_F = sqrt(sum(A[i,j]^2))
  */
-qr_workspace_planned* qr_workspace_planned_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib)
+static double frobenius_norm(const float *A, uint16_t m, uint16_t n)
 {
-    qr_workspace_planned *ws = calloc(1, sizeof(qr_workspace_planned));
-    if (!ws) return NULL;
-    
-    // Allocate base QR workspace
-    ws->base = qr_workspace_alloc(m_max, n_max, ib);
-    if (!ws->base) {
-        free(ws);
-        return NULL;
+    double sum = 0.0;
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < n; j++)
+        {
+            double val = (double)A[i * n + j];
+            sum += val * val;
+        }
     }
-    
-    ws->m_max = m_max;
-    ws->n_max = n_max;
-    ws->ib = ib ? ib : 32;
-    
-    // Pre-plan all GEMM operations
-    gemm_error_t error;
-    
-    // Y^T * C: [ib×m] * [m×n]
-    ws->plan_ytc = gemm_plan_create_safe(ws->ib, m_max, n_max,
-                                         NULL, NULL, NULL,
-                                         1.0f, 0.0f, &error);
-    
-    // T * Z: [ib×ib] * [ib×n] - This will use tiny matrix kernels!
-    ws->plan_tz = gemm_plan_create_safe(ws->ib, ws->ib, n_max,
-                                        NULL, NULL, NULL,
-                                        1.0f, 0.0f, &error);
-    
-    // Y * Z: [m×ib] * [ib×n]
-    ws->plan_yz = gemm_plan_create_safe(m_max, ws->ib, n_max,
-                                        NULL, NULL, NULL,
-                                        -1.0f, 1.0f, &error);  // Note: alpha=-1, beta=1 for C -= Y*Z
-    
-    if (!ws->plan_ytc || !ws->plan_tz || !ws->plan_yz) {
-        qr_workspace_planned_free(ws);
-        return NULL;
-    }
-    
-    return ws;
+    return sqrt(sum);
 }
 
-void qr_workspace_planned_free(qr_workspace_planned *ws)
+/**
+ * @brief Compute max absolute value in matrix
+ */
+static double max_abs(const float *A, uint16_t m, uint16_t n)
 {
-    if (!ws) return;
-    
-    gemm_plan_destroy(ws->plan_ytc);
-    gemm_plan_destroy(ws->plan_tz);
-    gemm_plan_destroy(ws->plan_yz);
-    qr_workspace_free(ws->base);
-    free(ws);
+    double max_val = 0.0;
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < n; j++)
+        {
+            double val = fabs((double)A[i * n + j]);
+            if (val > max_val)
+                max_val = val;
+        }
+    }
+    return max_val;
+}
+
+/**
+ * @brief Compute relative error: ||A - B||_F / ||A||_F
+ */
+static double relative_error(const float *A, const float *B, uint16_t m, uint16_t n)
+{
+    double diff_norm = 0.0;
+    double a_norm = 0.0;
+
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < n; j++)
+        {
+            double a = (double)A[i * n + j];
+            double b = (double)B[i * n + j];
+            double diff = a - b;
+
+            diff_norm += diff * diff;
+            a_norm += a * a;
+        }
+    }
+
+    if (a_norm < 1e-30)
+        return 0.0;
+
+    return sqrt(diff_norm / a_norm);
+}
+
+/**
+ * @brief Print matrix for debugging
+ */
+static void print_matrix_debug(const char *name, const float *M,
+                               uint16_t rows, uint16_t cols, uint16_t max_display)
+{
+    printf("%s (%dx%d):\n", name, rows, cols);
+    uint16_t display_rows = (rows < max_display) ? rows : max_display;
+    uint16_t display_cols = (cols < max_display) ? cols : max_display;
+
+    for (uint16_t i = 0; i < display_rows; i++)
+    {
+        for (uint16_t j = 0; j < display_cols; j++)
+        {
+            printf("%8.4f ", M[i * cols + j]);
+        }
+        if (cols > max_display)
+            printf("...");
+        printf("\n");
+    }
+    if (rows > max_display)
+        printf("...\n");
+    printf("\n");
+}
+
+/**
+ * @brief Check if R is upper triangular
+ */
+static int is_upper_triangular(const float *R, uint16_t m, uint16_t n, double tol)
+{
+    int errors = 0;
+    double max_lower = 0.0;
+
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < n; j++)
+        {
+            if (i > j) // Lower triangle
+            {
+                double val = fabs((double)R[i * n + j]);
+                if (val > max_lower)
+                    max_lower = val;
+                if (val > tol)
+                {
+                    if (errors < 3) // Print first 3 errors
+                    {
+                        printf("    Lower triangle error at [%d,%d] = %.6e\n",
+                               i, j, val);
+                    }
+                    errors++;
+                }
+            }
+        }
+    }
+
+    if (errors > 0)
+    {
+        printf("    R not upper triangular: %d errors, max lower = %.6e\n",
+               errors, max_lower);
+        return 0;
+    }
+
+    printf("    R is upper triangular (max lower = %.6e)\n", max_lower);
+    return 1;
 }
 
 //==============================================================================
-// OPTIMIZED BLOCK REFLECTOR WITH PLANNED GEMM
+// QR PROPERTY CHECKERS
 //==============================================================================
 
-static int apply_block_reflector_planned(
-    float *C,
-    const float *Y,
-    const float *YT,
-    const float *T,
-    uint16_t m,
-    uint16_t n,
-    uint16_t ib,
-    qr_workspace_planned *ws)
+/**
+ * @brief Test Q^T * Q = I (orthogonality)
+ */
+static int check_orthogonality(const float *Q, uint16_t m, double tol,
+                               const char *test_name)
 {
-    float *Z = ws->base->Z;
-    float *Z_temp = ws->base->Z_temp;
-    
-    // Step 1: Z = Y^T * C
-    gemm_execute_plan(ws->plan_ytc, Z, YT, C, 1.0f, 0.0f);
-    
-    // Step 2: Z = T * Z (tiny matrix multiply - super fast!)
-    memcpy(Z_temp, Z, (size_t)ib * n * sizeof(float));
-    gemm_execute_plan(ws->plan_tz, Z, T, Z_temp, 1.0f, 0.0f);
-    
-    // Step 3: C = C - Y * Z (fused with beta=1, alpha=-1)
-    gemm_execute_plan(ws->plan_yz, C, Y, Z, -1.0f, 1.0f);
-    
+    printf("  Checking orthogonality (Q^T * Q = I)...\n");
+
+    // Compute Q^T * Q using GEMM
+    float *QTQ = gemm_aligned_alloc(32, m * m * sizeof(float));
+    if (!QTQ)
+    {
+        printf("    ERROR: Allocation failed\n");
+        return 0;
+    }
+
+    // QTQ = Q^T * Q  (m×m = m×m * m×m)
+    int ret = gemm_auto(QTQ, Q, Q, m, m, m, 1.0f, 0.0f);
+    if (ret != 0)
+    {
+        printf("    ERROR: GEMM failed\n");
+        gemm_aligned_free(QTQ);
+        return 0;
+    }
+
+    // Check if QTQ ≈ I
+    int errors = 0;
+    double max_diag_err = 0.0;
+    double max_offdiag = 0.0;
+
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < m; j++)
+        {
+            double val = (double)QTQ[i * m + j];
+            double expected = (i == j) ? 1.0 : 0.0;
+            double err = fabs(val - expected);
+
+            if (i == j)
+            {
+                if (err > max_diag_err)
+                    max_diag_err = err;
+            }
+            else
+            {
+                if (fabs(val) > max_offdiag)
+                    max_offdiag = fabs(val);
+            }
+
+            if (err > tol)
+            {
+                if (errors < 3)
+                {
+                    printf("    Orthogonality error at [%d,%d]: "
+                           "got %.6e, expected %.6e, diff %.6e\n",
+                           i, j, val, expected, err);
+                }
+                errors++;
+            }
+        }
+    }
+
+    gemm_aligned_free(QTQ);
+
+    if (errors > 0)
+    {
+        printf("    %s: Q not orthogonal (%d errors)\n", test_name, errors);
+        printf("    Max diagonal error: %.6e\n", max_diag_err);
+        printf("    Max off-diagonal:   %.6e\n", max_offdiag);
+        return 0;
+    }
+
+    printf("    %s: Q is orthogonal\n", test_name);
+    printf("    Max diagonal error: %.6e\n", max_diag_err);
+    printf("    Max off-diagonal:   %.6e\n", max_offdiag);
+    return 1;
+}
+
+/**
+ * @brief Test A = Q * R (reconstruction)
+ */
+static int check_reconstruction(const float *A, const float *Q, const float *R,
+                                uint16_t m, uint16_t n, double tol,
+                                const char *test_name)
+{
+    printf("  Checking reconstruction (A = Q*R)...\n");
+
+    // Compute Q * R
+    float *QR = gemm_aligned_alloc(32, m * n * sizeof(float));
+    if (!QR)
+    {
+        printf("    ERROR: Allocation failed\n");
+        return 0;
+    }
+
+    // QR = Q * R  (m×n = m×m * m×n)
+    int ret = gemm_auto(QR, Q, R, m, m, n, 1.0f, 0.0f);
+    if (ret != 0)
+    {
+        printf("    ERROR: GEMM failed\n");
+        gemm_aligned_free(QR);
+        return 0;
+    }
+
+    // Compute ||A - QR||_F / ||A||_F
+    double rel_err = relative_error(A, QR, m, n);
+    double a_norm = frobenius_norm(A, m, n);
+
+    gemm_aligned_free(QR);
+
+    if (rel_err > tol)
+    {
+        printf("    %s: Reconstruction FAILED\n", test_name);
+        printf("    ||A||_F        = %.6e\n", a_norm);
+        printf("    ||A - QR||_F / ||A||_F = %.6e (tolerance: %.6e)\n",
+               rel_err, tol);
+        return 0;
+    }
+
+    printf("    %s: Reconstruction PASSED\n", test_name);
+    printf("    ||A - QR||_F / ||A||_F = %.6e\n", rel_err);
+    return 1;
+}
+
+//==============================================================================
+// REFERENCE IMPLEMENTATION (Simple Gram-Schmidt for validation)
+//==============================================================================
+
+/**
+ * @brief Classical Gram-Schmidt QR (for small test matrices only)
+ *
+ * WARNING: Numerically unstable! Only for testing small, well-conditioned matrices.
+ */
+static int qr_gram_schmidt_reference(const float *A, float *Q, float *R,
+                                     uint16_t m, uint16_t n)
+{
+    if (m < n)
+        return -1; // Underdetermined system
+
+    // Copy A to Q
+    memcpy(Q, A, m * n * sizeof(float));
+    memset(R, 0, m * n * sizeof(float));
+
+    for (uint16_t j = 0; j < n; j++)
+    {
+        // R[j,j] = ||Q[:,j]||
+        double norm_sq = 0.0;
+        for (uint16_t i = 0; i < m; i++)
+        {
+            double val = (double)Q[i * n + j];
+            norm_sq += val * val;
+        }
+        double norm = sqrt(norm_sq);
+        R[j * n + j] = (float)norm;
+
+        if (norm < 1e-12)
+        {
+            return -1; // Rank deficient
+        }
+
+        // Q[:,j] = Q[:,j] / R[j,j]
+        for (uint16_t i = 0; i < m; i++)
+        {
+            Q[i * n + j] /= (float)norm;
+        }
+
+        // Orthogonalize remaining columns
+        for (uint16_t k = j + 1; k < n; k++)
+        {
+            // R[j,k] = Q[:,j]^T * Q[:,k]
+            double dot = 0.0;
+            for (uint16_t i = 0; i < m; i++)
+            {
+                dot += (double)Q[i * n + j] * (double)Q[i * n + k];
+            }
+            R[j * n + k] = (float)dot;
+
+            // Q[:,k] = Q[:,k] - R[j,k] * Q[:,j]
+            for (uint16_t i = 0; i < m; i++)
+            {
+                Q[i * n + k] -= (float)dot * Q[i * n + j];
+            }
+        }
+    }
+
+    // Extend Q to full m×m orthogonal matrix (if needed)
+    // For testing, we only need the first n columns
+
     return 0;
 }
 
 //==============================================================================
-// BLOCKED QR WITH PLANNED GEMM
+// INDIVIDUAL QR TESTS
 //==============================================================================
 
-int qr_blocked_planned(qr_workspace_planned *ws, const float *A, 
-                       float *Q, float *R, uint16_t m, uint16_t n, bool only_R)
+/**
+ * @brief Test small square matrix (8×8)
+ */
+static int test_qr_small_square(void)
 {
-    if (!ws || !A || !R) return -EINVAL;
-    
-    qr_workspace *base = ws->base;
-    
-    // Copy A to workspace
-    memcpy(base->Cpack, A, (size_t)m * n * sizeof(float));
-    float *Awork = base->Cpack;
-    
-    const uint16_t kmax = (m < n) ? m : n;
-    const uint16_t ib = ws->ib;
-    
-    // Main blocked loop
-    for (uint16_t k = 0; k < kmax; k += ib) {
-        const uint16_t block_size = (k + ib <= kmax) ? ib : (kmax - k);
-        const uint16_t rows_below = m - k;
-        const uint16_t cols_right = n - k - block_size;
-        
-        // 1. Panel factorization (dual-packs Y and YT)
-        panel_qr(&Awork[k * n + k], base->Y, base->YT, &base->tau[k],
-                rows_below, n, block_size);
-        
-        // 2. Build T matrix
-        build_T_matrix(base->Y, &base->tau[k], base->T, rows_below, block_size);
-        
-        // 3. Apply block reflector with planned GEMM
-        if (cols_right > 0) {
-            int ret = apply_block_reflector_planned(
-                &Awork[k * n + k + block_size],
-                base->Y, base->YT, base->T,
-                rows_below, cols_right, block_size,
-                ws);
-            if (ret != 0) return ret;
-        }
-    }
-    
-    // Extract R
-    for (uint16_t i = 0; i < m; ++i) {
-        for (uint16_t j = 0; j < n; ++j) {
-            R[i * n + j] = (i <= j) ? Awork[i * n + j] : 0.0f;
-        }
-    }
-    
-    // Form Q if needed (could also use planned GEMM here)
-    if (!only_R && Q) {
-        // ... existing Q formation code ...
-    }
-    
-    return 0;
-}
+    printf("\n=== Testing Small Square QR (8×8) ===\n");
 
-//==============================================================================
-// PERFORMANCE BENCHMARK
-//==============================================================================
+    const uint16_t m = 8, n = 8;
 
-static double get_time_sec(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1e-9;
-}
+    float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
 
-static void benchmark_qr(uint16_t m, uint16_t n, uint16_t ib, const char *desc)
-{
-    printf("  [BENCH] %s (%ux%u, ib=%u):\n", desc, m, n, ib);
-    
-    float *A = malloc((size_t)m * n * sizeof(float));
-    float *Q = malloc((size_t)m * m * sizeof(float));
-    float *R = malloc((size_t)m * n * sizeof(float));
-    
-    // Random matrix
-    for (size_t i = 0; i < (size_t)m * n; ++i) {
-        A[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
+    // Initialize with well-conditioned random matrix
+    srand(12345);
+    for (uint16_t i = 0; i < m * n; i++)
+    {
+        A[i] = ((float)(rand() % 200) - 100.0f) / 100.0f;
     }
-    
-    // Warmup
-    qr_workspace *ws_basic = qr_workspace_alloc(m, n, ib);
-    qr_ws_blocked(ws_basic, A, Q, R, m, n, true);
-    
-    // Benchmark basic blocked QR
-    const int n_runs = 100;
-    double t_start = get_time_sec();
-    for (int i = 0; i < n_runs; i++) {
-        qr_ws_blocked(ws_basic, A, Q, R, m, n, true);
-    }
-    double t_basic = (get_time_sec() - t_start) / n_runs;
-    
-    // Benchmark planned QR
-    qr_workspace_planned *ws_planned = qr_workspace_planned_alloc(m, n, ib);
-    
-    t_start = get_time_sec();
-    for (int i = 0; i < n_runs; i++) {
-        qr_blocked_planned(ws_planned, A, Q, R, m, n, true);
-    }
-    double t_planned = (get_time_sec() - t_start) / n_runs;
-    
-    double gflops_basic = (2.0 * m * n * n - 2.0/3.0 * n * n * n) / (t_basic * 1e9);
-    double gflops_planned = (2.0 * m * n * n - 2.0/3.0 * n * n * n) / (t_planned * 1e9);
-    
-    printf("    Basic:   %.3f ms (%.1f GFLOP/s)\n", t_basic * 1000, gflops_basic);
-    printf("    Planned: %.3f ms (%.1f GFLOP/s) - %.1fx speedup\n", 
-           t_planned * 1000, gflops_planned, t_basic / t_planned);
-    
-    qr_workspace_free(ws_basic);
-    qr_workspace_planned_free(ws_planned);
-    free(A); free(Q); free(R);
-}
 
-//==============================================================================
-// CORRECTNESS TEST WITH DIFFERENT SIZE CLASSES
-//==============================================================================
+    // Add diagonal dominance for better conditioning
+    for (uint16_t i = 0; i < MIN(m, n); i++)
+    {
+        A[i * n + i] += 5.0f;
+    }
 
-static int test_correctness_planned(uint16_t m, uint16_t n, uint16_t ib, const char *desc)
-{
-    printf("  [TEST] %s (%ux%u, ib=%u)... ", desc, m, n, ib);
-    
-    qr_workspace_planned *ws = qr_workspace_planned_alloc(m, n, ib);
-    if (!ws) {
-        printf("FAIL (workspace alloc)\n");
-        return 1;
-    }
-    
-    float *A = malloc((size_t)m * n * sizeof(float));
-    float *Q = malloc((size_t)m * m * sizeof(float));
-    float *R = malloc((size_t)m * n * sizeof(float));
-    float *QR = malloc((size_t)m * n * sizeof(float));
-    
-    // Random test matrix
-    for (size_t i = 0; i < (size_t)m * n; ++i) {
-        A[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
-    }
-    
-    // Factor with planned QR
-    int ret = qr_blocked_planned(ws, A, Q, R, m, n, false);
-    if (ret != 0) {
-        printf("FAIL (factorization error %d)\n", ret);
+    printf("  Running blocked QR...\n");
+    int ret = qr_blocked(A, Q, R, m, n, false);
+
+    if (ret != 0)
+    {
+        printf("  ERROR: qr_blocked returned %d\n", ret);
         goto cleanup;
     }
-    
-    // Reconstruct Q*R using optimized GEMM
-    gemm_auto(QR, Q, R, m, m, n, 1.0f, 0.0f);
-    
-    // Compute error
-    float normA = frobenius_norm(A, m, n);
-    for (size_t i = 0; i < (size_t)m * n; ++i) {
-        QR[i] = A[i] - QR[i];
-    }
-    float normErr = frobenius_norm(QR, m, n);
-    float relErr = normErr / normA;
-    
-    const float tol = 1e-4f;
-    if (relErr > tol) {
-        printf("FAIL (rel_err=%.2e)\n", relErr);
-        ret = 1;
-    } else {
-        printf("PASS (rel_err=%.2e)\n", relErr);
-        ret = 0;
-    }
-    
+
+    printf("  Verifying results...\n");
+    int passed = 1;
+
+    // Check R is upper triangular
+    passed &= is_upper_triangular(R, m, n, 1e-5);
+
+    // Check Q orthogonality
+    passed &= check_orthogonality(Q, m, 1e-5, "8×8");
+
+    // Check reconstruction
+    passed &= check_reconstruction(A, Q, R, m, n, 1e-4, "8×8");
+
 cleanup:
-    free(A); free(Q); free(R); free(QR);
-    qr_workspace_planned_free(ws);
-    return ret;
+    gemm_aligned_free(A);
+    gemm_aligned_free(Q);
+    gemm_aligned_free(R);
+
+    return passed;
+}
+
+/**
+ * @brief Test tall matrix (128×32)
+ */
+static int test_qr_tall(void)
+{
+    printf("\n=== Testing Tall QR (128×32) ===\n");
+
+    const uint16_t m = 128, n = 32;
+
+    float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+    // Initialize
+    srand(54321);
+    for (uint16_t i = 0; i < m * n; i++)
+    {
+        A[i] = ((float)(rand() % 200) - 100.0f) / 50.0f;
+    }
+
+    printf("  Running blocked QR...\n");
+    int ret = qr_blocked(A, Q, R, m, n, false);
+
+    if (ret != 0)
+    {
+        printf("  ERROR: qr_blocked returned %d\n", ret);
+        goto cleanup;
+    }
+
+    int passed = 1;
+    passed &= is_upper_triangular(R, m, n, 1e-4);
+    passed &= check_orthogonality(Q, m, 1e-4, "128×32");
+    passed &= check_reconstruction(A, Q, R, m, n, 1e-3, "128×32");
+
+cleanup:
+    gemm_aligned_free(A);
+    gemm_aligned_free(Q);
+    gemm_aligned_free(R);
+
+    return passed;
+}
+
+/**
+ * @brief Test wide matrix (32×16) - only R
+ */
+static int test_qr_wide(void)
+{
+    printf("\n=== Testing Wide QR (32×16, R only) ===\n");
+
+    const uint16_t m = 32, n = 16;
+
+    float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *A_copy = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+    // Initialize
+    srand(99999);
+    for (uint16_t i = 0; i < m * n; i++)
+    {
+        A[i] = ((float)(rand() % 100)) / 25.0f;
+    }
+    memcpy(A_copy, A, m * n * sizeof(float));
+
+    printf("  Running blocked QR (only_R=true)...\n");
+    int ret = qr_blocked(A, NULL, R, m, n, true);
+
+    if (ret != 0)
+    {
+        printf("  ERROR: qr_blocked returned %d\n", ret);
+        goto cleanup;
+    }
+
+    // Since we don't have Q, we can only check R is upper triangular
+    int passed = is_upper_triangular(R, m, n, 1e-4);
+
+    // Optionally, run full QR to verify reconstruction
+    printf("  Verifying with full QR...\n");
+    ret = qr_blocked(A_copy, Q, R, m, n, false);
+    if (ret == 0)
+    {
+        passed &= check_reconstruction(A_copy, Q, R, m, n, 1e-3, "32×16");
+    }
+
+cleanup:
+    gemm_aligned_free(A);
+    gemm_aligned_free(A_copy);
+    gemm_aligned_free(Q);
+    gemm_aligned_free(R);
+
+    return passed;
+}
+
+/**
+ * @brief Test large square matrix (256×256)
+ */
+static int test_qr_large_square(void)
+{
+    printf("\n=== Testing Large Square QR (256×256) ===\n");
+
+    const uint16_t m = 256, n = 256;
+
+    printf("  Allocating %.2f MB...\n",
+           (m * n + m * m + m * n) * sizeof(float) / (1024.0 * 1024.0));
+
+    float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+    if (!A || !Q || !R)
+    {
+        printf("  ERROR: Allocation failed\n");
+        return 0;
+    }
+
+    // Initialize with well-conditioned matrix
+    printf("  Initializing matrix...\n");
+    srand(77777);
+    for (uint16_t i = 0; i < m * n; i++)
+    {
+        A[i] = ((float)(rand() % 200) - 100.0f) / 100.0f;
+    }
+
+    // Add diagonal dominance
+    for (uint16_t i = 0; i < MIN(m, n); i++)
+    {
+        A[i * n + i] += 3.0f;
+    }
+
+    printf("  Running blocked QR...\n");
+    int ret = qr_blocked(A, Q, R, m, n, false);
+
+    if (ret != 0)
+    {
+        printf("  ERROR: qr_blocked returned %d\n", ret);
+        goto cleanup;
+    }
+
+    printf("  Verifying results...\n");
+    int passed = 1;
+
+    // For large matrices, use relaxed tolerances
+    passed &= is_upper_triangular(R, m, n, 1e-3);
+    passed &= check_orthogonality(Q, m, 5e-4, "256×256");
+    passed &= check_reconstruction(A, Q, R, m, n, 1e-3, "256×256");
+
+cleanup:
+    gemm_aligned_free(A);
+    gemm_aligned_free(Q);
+    gemm_aligned_free(R);
+
+    return passed;
+}
+
+/**
+ * @brief Test workspace reuse
+ */
+static int test_workspace_reuse(void)
+{
+    printf("\n=== Testing Workspace Reuse ===\n");
+
+    const uint16_t m_max = 64, n_max = 48;
+
+    // Allocate workspace once
+    printf("  Allocating workspace (m_max=%d, n_max=%d)...\n", m_max, n_max);
+    qr_workspace *ws = qr_workspace_alloc(m_max, n_max, 0);
+    if (!ws)
+    {
+        printf("  ERROR: Workspace allocation failed\n");
+        return 0;
+    }
+
+    printf("  Workspace size: %.2f KB\n", qr_workspace_bytes(ws) / 1024.0);
+
+    int passed = 1;
+
+    // Test multiple sizes with same workspace
+    uint16_t test_sizes[][2] = {
+        {32, 16},
+        {64, 32},
+        {48, 48},
+        {64, 24}};
+
+    for (int test_idx = 0; test_idx < 4; test_idx++)
+    {
+        uint16_t m = test_sizes[test_idx][0];
+        uint16_t n = test_sizes[test_idx][1];
+
+        printf("  Testing %d×%d with reused workspace...\n", m, n);
+
+        float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+        float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+        float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+        // Initialize
+        srand(test_idx * 11111);
+        for (uint16_t i = 0; i < m * n; i++)
+        {
+            A[i] = ((float)(rand() % 100)) / 50.0f;
+        }
+
+        // Run QR with workspace
+        int ret = qr_ws_blocked(ws, A, Q, R, m, n, false);
+
+        if (ret != 0)
+        {
+            printf("    ERROR: qr_ws_blocked returned %d\n", ret);
+            passed = 0;
+            gemm_aligned_free(A);
+            gemm_aligned_free(Q);
+            gemm_aligned_free(R);
+            continue;
+        }
+
+        // Quick check
+        int test_passed = check_reconstruction(A, Q, R, m, n, 1e-3, "workspace");
+        passed &= test_passed;
+
+        gemm_aligned_free(A);
+        gemm_aligned_free(Q);
+        gemm_aligned_free(R);
+
+        if (!test_passed)
+        {
+            printf("    Test %d FAILED\n", test_idx);
+        }
+        else
+        {
+            printf("    Test %d PASSED\n", test_idx);
+        }
+    }
+
+    qr_workspace_free(ws);
+
+    return passed;
+}
+
+/**
+ * @brief Test edge cases
+ */
+static int test_edge_cases(void)
+{
+    printf("\n=== Testing Edge Cases ===\n");
+
+    int passed = 1;
+
+    // Test 1: Tiny matrix (4×4)
+    printf("  Testing 4×4 matrix...\n");
+    {
+        const uint16_t m = 4, n = 4;
+        float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+        float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+        float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+        float data[] = {
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1};
+        memcpy(A, data, sizeof(data));
+
+        int ret = qr_blocked(A, Q, R, m, n, false);
+
+        if (ret == 0)
+        {
+            passed &= check_orthogonality(Q, m, 1e-5, "4×4 identity");
+            passed &= check_reconstruction(A, Q, R, m, n, 1e-5, "4×4 identity");
+        }
+        else
+        {
+            printf("    ERROR: qr_blocked failed\n");
+            passed = 0;
+        }
+
+        gemm_aligned_free(A);
+        gemm_aligned_free(Q);
+        gemm_aligned_free(R);
+    }
+
+    // Test 2: Matrix with one large singular value
+    printf("  Testing matrix with large condition number...\n");
+    {
+        const uint16_t m = 16, n = 16;
+        float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+        float *Q = gemm_aligned_alloc(32, m * m * sizeof(float));
+        float *R = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+        memset(A, 0, m * n * sizeof(float));
+        A[0] = 1000.0f; // First singular value = 1000
+        for (uint16_t i = 1; i < MIN(m, n); i++)
+        {
+            A[i * n + i] = 1.0f; // Rest = 1
+        }
+
+        int ret = qr_blocked(A, Q, R, m, n, false);
+
+        if (ret == 0)
+        {
+            // Use relaxed tolerance for ill-conditioned matrix
+            passed &= check_reconstruction(A, Q, R, m, n, 1e-3, "ill-conditioned");
+        }
+        else
+        {
+            printf("    ERROR: qr_blocked failed\n");
+            passed = 0;
+        }
+
+        gemm_aligned_free(A);
+        gemm_aligned_free(Q);
+        gemm_aligned_free(R);
+    }
+
+    return passed;
+}
+
+/**
+ * @brief Compare against reference (for small matrices)
+ */
+static int test_vs_reference(void)
+{
+    printf("\n=== Comparing Against Gram-Schmidt Reference ===\n");
+
+    const uint16_t m = 16, n = 12;
+
+    float *A = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q_test = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R_test = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q_ref = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *R_ref = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+    // Well-conditioned random matrix
+    srand(42);
+    for (uint16_t i = 0; i < m * n; i++)
+    {
+        A[i] = ((float)(rand() % 100)) / 50.0f;
+    }
+
+    // Add diagonal dominance
+    for (uint16_t i = 0; i < MIN(m, n); i++)
+    {
+        A[i * n + i] += 2.0f;
+    }
+
+    printf("  Running blocked QR...\n");
+    int ret_test = qr_blocked(A, Q_test, R_test, m, n, false);
+
+    printf("  Running Gram-Schmidt reference...\n");
+    int ret_ref = qr_gram_schmidt_reference(A, Q_ref, R_ref, m, n);
+
+    if (ret_test != 0 || ret_ref != 0)
+    {
+        printf("  ERROR: One of the implementations failed\n");
+        goto cleanup;
+    }
+
+    // Compare R matrices (sign ambiguity is OK, we just check magnitudes)
+    printf("  Comparing R matrices...\n");
+    double r_error = 0.0;
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < n; j++)
+        {
+            double diff = fabs((double)R_test[i * n + j]) - fabs((double)R_ref[i * n + j]);
+            r_error += diff * diff;
+        }
+    }
+    r_error = sqrt(r_error);
+
+    printf("  ||abs(R_test) - abs(R_ref)||_F = %.6e\n", r_error);
+
+    int passed = (r_error < 1e-3);
+
+cleanup:
+    gemm_aligned_free(A);
+    gemm_aligned_free(Q_test);
+    gemm_aligned_free(R_test);
+    gemm_aligned_free(Q_ref);
+    gemm_aligned_free(R_ref);
+
+    return passed;
 }
 
 //==============================================================================
-// MAIN TEST SUITE
+// MAIN TEST RUNNER
 //==============================================================================
 
+int run_qr_tests(test_results_t *results)
+{
+    printf("=================================================\n");
+    printf("      BLOCKED QR DECOMPOSITION TESTS\n");
+    printf("=================================================\n");
+
+    results->total = 0;
+    results->passed = 0;
+    results->failed = 0;
+
+    // Run all tests
+    printf("\n--- Basic Functionality Tests ---\n");
+
+    results->total++;
+    if (test_qr_small_square())
+    {
+        results->passed++;
+        printf("✓ Small square test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Small square test FAILED\n");
+    }
+
+    results->total++;
+    if (test_qr_tall())
+    {
+        results->passed++;
+        printf("✓ Tall matrix test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Tall matrix test FAILED\n");
+    }
+
+    results->total++;
+    if (test_qr_wide())
+    {
+        results->passed++;
+        printf("✓ Wide matrix test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Wide matrix test FAILED\n");
+    }
+
+    results->total++;
+    if (test_qr_large_square())
+    {
+        results->passed++;
+        printf("✓ Large square test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Large square test FAILED\n");
+    }
+
+    printf("\n--- Workspace Tests ---\n");
+
+    results->total++;
+    if (test_workspace_reuse())
+    {
+        results->passed++;
+        printf("✓ Workspace reuse test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Workspace reuse test FAILED\n");
+    }
+
+    printf("\n--- Edge Case Tests ---\n");
+
+    results->total++;
+    if (test_edge_cases())
+    {
+        results->passed++;
+        printf("✓ Edge cases PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Edge cases FAILED\n");
+    }
+
+    printf("\n--- Reference Comparison ---\n");
+
+    results->total++;
+    if (test_vs_reference())
+    {
+        results->passed++;
+        printf("✓ Reference comparison PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Reference comparison FAILED\n");
+    }
+
+    printf("\n=================================================\n");
+    printf("QR Tests: %d/%d passed\n", results->passed, results->total);
+
+    if (results->passed == results->total)
+    {
+        printf("✓ ALL QR TESTS PASSED!\n");
+    }
+    else
+    {
+        printf("✗ %d QR tests FAILED\n", results->failed);
+    }
+    printf("=================================================\n");
+
+    return (results->failed == 0) ? 0 : 1;
+}
+
+//==============================================================================
+// STANDALONE MODE
+//==============================================================================
+
+#ifdef STANDALONE
 int main(void)
 {
-    printf("QR + Planned GEMM Integration Test Suite\n");
-    printf("=========================================\n\n");
-    
-    printf("1. CORRECTNESS TESTS\n");
-    printf("--------------------\n");
-    
-    int failures = 0;
-    
-    // Test different size classes to exercise all GEMM paths
-    // TINY matrices (register-only kernels)
-    failures += test_correctness_planned(8, 8, 4, "Tiny 8x8");
-    failures += test_correctness_planned(12, 12, 6, "Tiny 12x12");
-    failures += test_correctness_planned(16, 16, 8, "Tiny 16x16");
-    
-    // SMALL matrices (direct kernels)
-    failures += test_correctness_planned(32, 32, 16, "Small 32x32");
-    failures += test_correctness_planned(64, 64, 32, "Small 64x64");
-    
-    // MEDIUM matrices (single-level blocking)
-    failures += test_correctness_planned(128, 128, 32, "Medium 128x128");
-    failures += test_correctness_planned(256, 64, 32, "Medium tall 256x64");
-    
-    // LARGE matrices (full blocking)
-    failures += test_correctness_planned(512, 512, 64, "Large 512x512");
-    failures += test_correctness_planned(1024, 256, 64, "Large tall 1024x256");
-    
-    printf("\nTotal failures: %d\n\n", failures);
-    
-    printf("2. PERFORMANCE BENCHMARKS\n");
-    printf("-------------------------\n");
-    
-    // Benchmark different sizes
-    benchmark_qr(64, 64, 32, "Small square");
-    benchmark_qr(256, 256, 32, "Medium square");
-    benchmark_qr(512, 256, 64, "Tall matrix");
-    benchmark_qr(1024, 1024, 64, "Large square");
-    
-    printf("\n3. KALMAN FILTER SIZES (SPECIAL CASE)\n");
-    printf("--------------------------------------\n");
-    
-    // These sizes are critical for Kalman filters
-    benchmark_qr(4, 4, 4, "Kalman 4x4 (x,y,vx,vy)");
-    benchmark_qr(6, 6, 6, "Kalman 6x6 (with acceleration)");
-    benchmark_qr(12, 12, 6, "Kalman 12x12 (full 3D)");
-    
-    return failures;
+    test_results_t results = {0};
+    return run_qr_tests(&results);
 }
+#endif
