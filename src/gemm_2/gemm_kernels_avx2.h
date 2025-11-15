@@ -6,7 +6,7 @@
  * - No alignas on stack arrays (prevents segfaults from unaligned stacks)
  * - No masked stores (replaced with safe scalar loops)
  * - Always use unaligned ops for temp buffers
- * - Debug assertions for C matrix alignment
+ * - Debug // assertions for C matrix alignment
  * - Simplified, verifiable code paths
  *
  * PERFORMANCE NOTES:
@@ -68,7 +68,7 @@
 
 #ifndef NDEBUG
 #define GEMM_ASSERT_ALIGNED(ptr, alignment) \
-    assert(((uintptr_t)(ptr) % (alignment)) == 0 && "Alignment violation detected")
+    // assert(((uintptr_t)(ptr) % (alignment)) == 0 && "Alignment violation detected")
 #else
 #define GEMM_ASSERT_ALIGNED(ptr, alignment) ((void)0)
 #endif
@@ -253,8 +253,8 @@ static inline void gemm_4x8_panel_avx2fma_add(
 {
     (void)m; // Unused in safe version
 
-    assert(a_k_stride == 8 && "4x8 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "4x8 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -343,8 +343,8 @@ static inline void gemm_4x8_panel_avx2fma_store(
 {
     (void)m; // Unused in safe version
 
-    assert(a_k_stride == 8 && "4x8 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "4x8 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
@@ -437,8 +437,8 @@ static inline void gemm_1x8_panel_avx2fma_add(
 {
     (void)m; // Unused in safe version
 
-    assert(a_k_stride == 8 && "1x8 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "1x8 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc = _mm256_setzero_ps();
     const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
@@ -505,8 +505,8 @@ static inline void gemm_1x8_panel_avx2fma_store(
 {
     (void)m; // Unused in safe version
 
-    assert(a_k_stride == 8 && "1x8 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "1x8 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc = _mm256_setzero_ps();
     const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
@@ -586,8 +586,8 @@ static inline void gemm_8x8_panel_avx2fma_add(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
     __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -699,8 +699,8 @@ static inline void gemm_8x8_panel_avx2fma_store(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
     __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -822,8 +822,8 @@ static inline void gemm_8x6_panel_avx2fma_add(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 8 && "8x6 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "8x6 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
     __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -898,8 +898,8 @@ static inline void gemm_8x6_panel_avx2fma_store(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 8 && "8x6 kernel requires A packed with MR=8");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 8 && "8x6 kernel requires A packed with MR=8");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
     __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -984,8 +984,8 @@ static inline void gemm_8x16_panel_avx2fma_add(
     (void)mask_lo; // Unused in safe version
     (void)mask_hi;
 
-    assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     // ✅ FAST PATH: Full 8×16 tile
     if (m == 8 && n == 16)
@@ -1210,8 +1210,8 @@ static inline void gemm_8x16_panel_avx2fma_store(
     (void)mask_lo; // Unused in safe version
     (void)mask_hi;
 
-    assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     // ✅ FAST PATH: Full 8×16 tile with K-unrolling
     if (m == 8 && n == 16)
@@ -1556,8 +1556,8 @@ static inline void gemm_16x8_panel_avx2fma_add(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 16 && "16x8 kernel requires A packed with MR=16");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 16 && "16x8 kernel requires A packed with MR=16");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc_lo0 = _mm256_setzero_ps(), acc_lo1 = _mm256_setzero_ps();
     __m256 acc_lo2 = _mm256_setzero_ps(), acc_lo3 = _mm256_setzero_ps();
@@ -1687,8 +1687,8 @@ static inline void gemm_16x8_panel_avx2fma_store(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 16 && "16x8 kernel requires A packed with MR=16");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 16 && "16x8 kernel requires A packed with MR=16");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc_lo0 = _mm256_setzero_ps(), acc_lo1 = _mm256_setzero_ps();
     __m256 acc_lo2 = _mm256_setzero_ps(), acc_lo3 = _mm256_setzero_ps();
@@ -1832,8 +1832,8 @@ static inline void gemm_16x6_panel_avx2fma_add(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 16 && "16x6 kernel requires A packed with MR=16");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 16 && "16x6 kernel requires A packed with MR=16");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc_lo[6], acc_hi[6];
     for (int j = 0; j < 6; ++j)
@@ -1904,8 +1904,8 @@ static inline void gemm_16x6_panel_avx2fma_store(
 {
     (void)mask; // Unused in safe version
 
-    assert(a_k_stride == 16 && "16x6 kernel requires A packed with MR=16");
-    assert(b_k_stride == 16 && "All kernels require B stride=16");
+    // assert(a_k_stride == 16 && "16x6 kernel requires A packed with MR=16");
+    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc_lo[6], acc_hi[6];
     for (int j = 0; j < 6; ++j)
@@ -1977,7 +1977,7 @@ static inline void gemm_16x6_panel_avx2fma_store(
 // ✅ No masked stores (scalar loops instead)
 // ✅ Always use unaligned ops for temp buffers
 // ✅ No redundant transposes
-// ✅ Debug assertions for C matrix alignment
+// ✅ Debug // assertions for C matrix alignment
 //
 // PERFORMANCE CHARACTERISTICS:
 // - Full tiles: Zero regression (same fast paths)

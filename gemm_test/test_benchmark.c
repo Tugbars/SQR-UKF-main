@@ -269,7 +269,6 @@ int main(void)
     printf("────────────────────────────────────────────────────────────\n");
     bench_case(512, 512, 512, 2, 5, verify, "Large");
     bench_case(1024, 1024, 1024, 1, 3, verify, "Large");
-    //bench_case(2048, 2048, 2048, 1, 2, 0, "Large");  // Skip verify
     
     printf("\n────────────────────────────────────────────────────────────\n");
     printf(" IRREGULAR SIZES\n");
