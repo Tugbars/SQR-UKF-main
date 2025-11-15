@@ -13,6 +13,7 @@
         "gemm_static.h": "c",
         "stdio.h": "c",
         "typeinfo": "c",
-        "gemm_planning.h": "c"
+        "gemm_planning.h": "c",
+        "assert.h": "c"
     }
 }
