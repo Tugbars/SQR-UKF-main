@@ -77,16 +77,6 @@
 #define UKF_PXY_PF_DIST_BYTES 128 /* 64 or 128 are typical */
 #endif
 
-static inline void *ukf_aligned_alloc(size_t nbytes)
-{
-    return linalg_aligned_alloc(32, nbytes);
-}
-
-static inline void ukf_aligned_free(void *p)
-{
-    linalg_aligned_free(p);
-}
-
 /* =================== Reusable workspace for SR-UKF QR step =================== */
 typedef struct
 {
@@ -106,6 +96,68 @@ typedef struct
     size_t cap;   /* in elements, for n*n buffers */
 } ukf_upd_ws_t;
 
+/**
+ * @brief Clean up QR workspace (free internal allocations)
+ */
+static inline void ukf_qr_ws_cleanup(ukf_qr_ws_t *ws)
+{
+    if (!ws)
+        return;
+
+    if (ws->Aprime)
+    {
+        gemm_aligned_free(ws->Aprime);
+        ws->Aprime = NULL;
+    }
+    if (ws->R_)
+    {
+        gemm_aligned_free(ws->R_);
+        ws->R_ = NULL;
+    }
+    if (ws->b)
+    {
+        gemm_aligned_free(ws->b);
+        ws->b = NULL;
+    }
+    ws->capL = 0;
+}
+
+/**
+ * @brief Clean up update workspace (free internal allocations)
+ */
+static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
+{
+    if (!ws)
+        return;
+
+    if (ws->Z)
+    {
+        gemm_aligned_free(ws->Z);
+        ws->Z = NULL;
+    }
+    if (ws->U)
+    {
+        gemm_aligned_free(ws->U);
+        ws->U = NULL;
+    }
+    if (ws->Uk)
+    {
+        gemm_aligned_free(ws->Uk);
+        ws->Uk = NULL;
+    }
+    if (ws->Ky)
+    {
+        gemm_aligned_free(ws->Ky);
+        ws->Ky = NULL;
+    }
+    if (ws->yyhat)
+    {
+        gemm_aligned_free(ws->yyhat);
+        ws->yyhat = NULL;
+    }
+    ws->cap = 0;
+}
+
 static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
 {
     const size_t M = 3u * L;
@@ -116,16 +168,13 @@ static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
     if (ws->capL >= L && ws->Aprime && ws->R_ && ws->b)
         return 0;
 
-    if (ws->Aprime)
-        ukf_aligned_free(ws->Aprime);
-    if (ws->R_)
-        ukf_aligned_free(ws->R_);
-    if (ws->b)
-        ukf_aligned_free(ws->b);
+    /* Clean up old allocations */
+    ukf_qr_ws_cleanup(ws);
 
-    ws->Aprime = (float *)ukf_aligned_alloc(need_A * sizeof(float));
-    ws->R_ = (float *)ukf_aligned_alloc(need_R * sizeof(float));
-    ws->b = (float *)ukf_aligned_alloc(need_b * sizeof(float));
+    /* Allocate new (larger) workspace */
+    ws->Aprime = (float *)gemm_aligned_alloc(32, need_A * sizeof(float));
+    ws->R_ = (float *)gemm_aligned_alloc(32, need_R * sizeof(float));
+    ws->b = (float *)gemm_aligned_alloc(32, need_b * sizeof(float));
     ws->capL = (ws->Aprime && ws->R_ && ws->b) ? L : 0;
 
     return (ws->capL ? 0 : -ENOMEM);
@@ -134,30 +183,22 @@ static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
 static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
 {
     const size_t nn = (size_t)n * (size_t)n;
-    const size_t need = nn; /* for Z and U we each need nn; track capacity by n (symmetric growth) */
 
     if (ws->cap >= nn && ws->Z && ws->U && ws->Uk && ws->Ky && ws->yyhat)
         return 0;
 
-    if (ws->Z)
-        linalg_aligned_free(ws->Z);
-    if (ws->U)
-        linalg_aligned_free(ws->U);
-    if (ws->Uk)
-        linalg_aligned_free(ws->Uk);
-    if (ws->Ky)
-        linalg_aligned_free(ws->Ky);
-    if (ws->yyhat)
-        linalg_aligned_free(ws->yyhat);
+    /* Clean up old allocations */
+    ukf_upd_ws_cleanup(ws);
 
-    ws->Z = (float *)linalg_aligned_alloc(32, nn * sizeof(float));
-    ws->U = (float *)linalg_aligned_alloc(32, nn * sizeof(float));
-    ws->Uk = (float *)linalg_aligned_alloc(32, (size_t)n * sizeof(float));
-    ws->Ky = (float *)linalg_aligned_alloc(32, (size_t)n * sizeof(float));
-    ws->yyhat = (float *)linalg_aligned_alloc(32, (size_t)n * sizeof(float));
+    /* Allocate new (larger) workspace */
+    ws->Z = (float *)gemm_aligned_alloc(32, nn * sizeof(float));
+    ws->U = (float *)gemm_aligned_alloc(32, nn * sizeof(float));
+    ws->Uk = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
+    ws->Ky = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
+    ws->yyhat = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
     ws->cap = (ws->Z && ws->U && ws->Uk && ws->Ky && ws->yyhat) ? nn : 0;
 
-    return ws->cap ? 0 : -ENOMEM;
+    return (ws->cap ? 0 : -ENOMEM);
 }
 
 #if LINALG_SIMD_ENABLE
@@ -857,8 +898,8 @@ static int create_state_estimation_error_covariance_matrix(
 {
     const size_t L = (size_t)L8;
     const size_t N = 2u * L + 1u;
-    const size_t K = 2u * L;      // Deviation columns
-    const size_t M = 3u * L;      // Augmented rows
+    const size_t K = 2u * L; // Deviation columns
+    const size_t M = 3u * L; // Augmented rows
 
     const float w1s = sqrtf(fabsf(W[1]));
     const float w0s = sqrtf(fabsf(W[0]));
@@ -867,9 +908,9 @@ static int create_state_estimation_error_covariance_matrix(
     if (ukf_qr_ws_ensure(ws, L) != 0)
         return -ENOMEM;
 
-    float *Aprime = ws->Aprime;  // M×L column-major
-    float *R_     = ws->R_;      // M×L
-    float *b      = ws->b;       // L
+    float *Aprime = ws->Aprime; // M×L column-major
+    float *R_ = ws->R_;         // M×L
+    float *b = ws->b;           // L
 
     const int do_pf = (L >= (size_t)UKF_APRIME_PF_MIN_L);
     const int rows_ahead = UKF_APRIME_PF_ROWS_AHEAD;
@@ -881,9 +922,9 @@ static int create_state_estimation_error_covariance_matrix(
     if (ukf_has_avx2() && L >= 16)
     {
         const __m256 w1v = _mm256_set1_ps(w1s);
-        
+
         size_t i = 0;
-        
+
         /* Process 2 state dimensions at a time */
         for (; i + 1 < L; i += 2)
         {
@@ -891,7 +932,7 @@ static int create_state_estimation_error_covariance_matrix(
             const float *Xi1 = X + (i + 1) * N;
             const float xi0 = x[i + 0];
             const float xi1 = x[i + 1];
-            
+
             /* Prefetch ahead */
             if (do_pf && rows_ahead > 0 && i + 2 < L)
             {
@@ -914,18 +955,18 @@ static int create_state_estimation_error_covariance_matrix(
                 /* Load 8 sigma points for each state */
                 __m256 Xv0 = _mm256_loadu_ps(&Xi0[r + 1]);
                 __m256 Xv1 = _mm256_loadu_ps(&Xi1[r + 1]);
-                
+
                 /* Compute weighted deviations: w1 * (X - x) */
                 __m256 diff0 = _mm256_sub_ps(Xv0, xi0v);
                 __m256 diff1 = _mm256_sub_ps(Xv1, xi1v);
-                __m256 out0  = _mm256_mul_ps(w1v, diff0);
-                __m256 out1  = _mm256_mul_ps(w1v, diff1);
+                __m256 out0 = _mm256_mul_ps(w1v, diff0);
+                __m256 out1 = _mm256_mul_ps(w1v, diff1);
 
                 /* Scatter to column-major Aprime using UNALIGNED stores */
                 float lanes0[8], lanes1[8];
-                _mm256_storeu_ps(lanes0, out0);  // NOT aligned!
+                _mm256_storeu_ps(lanes0, out0); // NOT aligned!
                 _mm256_storeu_ps(lanes1, out1);
-                
+
                 /* Scalar scatter (unavoidable for column-major layout) */
                 for (int k = 0; k < 8; ++k)
                 {
@@ -933,7 +974,7 @@ static int create_state_estimation_error_covariance_matrix(
                     Aprime[(r + k) * L + (i + 1)] = lanes1[k];
                 }
             }
-            
+
             /* Scalar tail for deviations */
             for (; r < K; ++r)
             {
@@ -944,24 +985,24 @@ static int create_state_estimation_error_covariance_matrix(
             /* ---- SR noise block: rows K..M-1 ---- */
             const float *Rsr0 = Rsr + (i + 0) * L;
             const float *Rsr1 = Rsr + (i + 1) * L;
-            
+
             size_t t = 0;
             for (; t + 7 < L; t += 8)
             {
                 __m256 Sv0 = _mm256_loadu_ps(&Rsr0[t]);
                 __m256 Sv1 = _mm256_loadu_ps(&Rsr1[t]);
-                
+
                 float lanes0[8], lanes1[8];
                 _mm256_storeu_ps(lanes0, Sv0);
                 _mm256_storeu_ps(lanes1, Sv1);
-                
+
                 for (int k = 0; k < 8; ++k)
                 {
                     Aprime[(K + t + k) * L + (i + 0)] = lanes0[k];
                     Aprime[(K + t + k) * L + (i + 1)] = lanes1[k];
                 }
             }
-            
+
             /* Scalar tail for SR noise */
             for (; t < L; ++t)
             {
@@ -975,38 +1016,38 @@ static int create_state_estimation_error_covariance_matrix(
         {
             const float *Xi = X + i * N;
             const float xi = x[i];
-            
+
             b[i] = w0s * (Xi[0] - xi);
-            
+
             const __m256 xiv = _mm256_set1_ps(xi);
-            
+
             /* Deviations */
             size_t r = 0;
             for (; r + 7 < K; r += 8)
             {
-                __m256 Xv   = _mm256_loadu_ps(&Xi[r + 1]);
+                __m256 Xv = _mm256_loadu_ps(&Xi[r + 1]);
                 __m256 diff = _mm256_sub_ps(Xv, xiv);
-                __m256 out  = _mm256_mul_ps(w1v, diff);
-                
+                __m256 out = _mm256_mul_ps(w1v, diff);
+
                 float lanes[8];
                 _mm256_storeu_ps(lanes, out);
-                
+
                 for (int k = 0; k < 8; ++k)
                     Aprime[(r + k) * L + i] = lanes[k];
             }
             for (; r < K; ++r)
                 Aprime[r * L + i] = w1s * (Xi[r + 1] - xi);
-            
+
             /* SR noise */
             const float *Rsri = Rsr + i * L;
             size_t t = 0;
             for (; t + 7 < L; t += 8)
             {
                 __m256 Sv = _mm256_loadu_ps(&Rsri[t]);
-                
+
                 float lanes[8];
                 _mm256_storeu_ps(lanes, Sv);
-                
+
                 for (int k = 0; k < 8; ++k)
                     Aprime[(K + t + k) * L + i] = lanes[k];
             }
@@ -1022,7 +1063,7 @@ static int create_state_estimation_error_covariance_matrix(
         {
             const float *Xi = X + i * N;
             const float xi = x[i];
-            
+
             /* Prefetch */
             if (do_pf && rows_ahead > 0 && i + 1 < L)
             {
@@ -1141,15 +1182,15 @@ static inline void ukf_transpose8x8_ps(__m256 in[8], __m256 out[8])
  * @note Non-destructive: X and Y are not modified.
  */
 static int create_state_cross_covariance_matrix(float *RESTRICT P,
-                                                 const float *RESTRICT W,
-                                                 const float *RESTRICT X,
-                                                 const float *RESTRICT Y,
-                                                 const float *RESTRICT x,
-                                                 const float *RESTRICT y,
-                                                 uint8_t L8)
+                                                const float *RESTRICT W,
+                                                const float *RESTRICT X,
+                                                const float *RESTRICT Y,
+                                                const float *RESTRICT x,
+                                                const float *RESTRICT y,
+                                                uint8_t L8)
 {
-    const size_t L  = (size_t)L8;
-    const size_t N  = 2u * L + 1u;
+    const size_t L = (size_t)L8;
+    const size_t N = 2u * L + 1u;
     const size_t N8 = ukf_round_up8(N);
 
     /* Zero output */
@@ -1159,12 +1200,14 @@ static int create_state_cross_covariance_matrix(float *RESTRICT P,
        - Xc:  L × N8   (weighted centered X)
        - YTc: N8 × L   (centered Y transpose)
     */
-    float *Xc  = (float *)gemm_aligned_alloc(32, L * N8 * sizeof(float));
+    float *Xc = (float *)gemm_aligned_alloc(32, L * N8 * sizeof(float));
     float *YTc = (float *)gemm_aligned_alloc(32, N8 * L * sizeof(float));
     if (!Xc || !YTc)
     {
-        if (Xc)  gemm_aligned_free(Xc);
-        if (YTc) gemm_aligned_free(YTc);
+        if (Xc)
+            gemm_aligned_free(Xc);
+        if (YTc)
+            gemm_aligned_free(YTc);
         return -ENOMEM;
     }
 
@@ -1177,15 +1220,15 @@ static int create_state_cross_covariance_matrix(float *RESTRICT P,
     if (ukf_has_avx2() && N >= 16)
     {
         size_t i = 0;
-        
+
         /* Process 2 rows at a time */
         for (; i + 1 < L; i += 2)
         {
-            const float *Xi0 = X  + (i + 0) * N;
-            const float *Xi1 = X  + (i + 1) * N;
+            const float *Xi0 = X + (i + 0) * N;
+            const float *Xi1 = X + (i + 1) * N;
             float *Xci0 = Xc + (i + 0) * N8;
             float *Xci1 = Xc + (i + 1) * N8;
-            
+
             const __m256 xi0v = _mm256_set1_ps(x[i + 0]);
             const __m256 xi1v = _mm256_set1_ps(x[i + 1]);
 
@@ -1200,20 +1243,20 @@ static int create_state_cross_covariance_matrix(float *RESTRICT P,
             for (; j + 7 < N; j += 8)
             {
                 __m256 wv = _mm256_loadu_ps(W + j);
-                
+
                 /* Row 0: (X - x) * W */
-                __m256 xv0   = _mm256_loadu_ps(Xi0 + j);
+                __m256 xv0 = _mm256_loadu_ps(Xi0 + j);
                 __m256 diff0 = _mm256_sub_ps(xv0, xi0v);
-                __m256 res0  = _mm256_mul_ps(diff0, wv);
+                __m256 res0 = _mm256_mul_ps(diff0, wv);
                 _mm256_storeu_ps(Xci0 + j, res0);
-                
+
                 /* Row 1: (X - x) * W */
-                __m256 xv1   = _mm256_loadu_ps(Xi1 + j);
+                __m256 xv1 = _mm256_loadu_ps(Xi1 + j);
                 __m256 diff1 = _mm256_sub_ps(xv1, xi1v);
-                __m256 res1  = _mm256_mul_ps(diff1, wv);
+                __m256 res1 = _mm256_mul_ps(diff1, wv);
                 _mm256_storeu_ps(Xci1 + j, res1);
             }
-            
+
             /* Scalar tail and padding */
             for (; j < N; ++j)
             {
@@ -1237,8 +1280,8 @@ static int create_state_cross_covariance_matrix(float *RESTRICT P,
             size_t j = 0;
             for (; j + 7 < N; j += 8)
             {
-                __m256 wv   = _mm256_loadu_ps(W + j);
-                __m256 xv   = _mm256_loadu_ps(Xi + j);
+                __m256 wv = _mm256_loadu_ps(W + j);
+                __m256 xv = _mm256_loadu_ps(Xi + j);
                 __m256 diff = _mm256_sub_ps(xv, xiv);
                 _mm256_storeu_ps(Xci + j, _mm256_mul_ps(diff, wv));
             }
@@ -1395,6 +1438,102 @@ static int create_state_cross_covariance_matrix(float *RESTRICT P,
  * @note
  *  Uses a thread-local workspace (see ukf_upd_ws_t). All matrices are row-major.
  */
+/**
+ * @brief In-place matrix transpose (square matrices only)
+ *
+ * @param A     Square matrix (n×n), row-major, transposed in-place
+ * @param n     Dimension
+ *
+ * @note Uses register blocking for cache efficiency
+ */
+static void transpose_square_inplace(float *A, uint16_t n)
+{
+    /* Block size for cache-friendly access */
+    const uint16_t BS = 8;
+
+#if LINALG_SIMD_ENABLE
+    if (ukf_has_avx2() && n >= 16)
+    {
+        /* Blocked transpose with AVX2 8x8 kernel */
+        for (uint16_t i0 = 0; i0 < n; i0 += BS)
+        {
+            for (uint16_t j0 = i0; j0 < n; j0 += BS) // Note: j0 starts at i0 (upper triangle)
+            {
+                const uint16_t imax = MIN(i0 + BS, n);
+                const uint16_t jmax = MIN(j0 + BS, n);
+
+                if (i0 == j0)
+                {
+                    /* Diagonal block - transpose in-place */
+                    for (uint16_t i = i0; i < imax; ++i)
+                    {
+                        for (uint16_t j = i + 1; j < jmax; ++j)
+                        {
+                            float tmp = A[i * n + j];
+                            A[i * n + j] = A[j * n + i];
+                            A[j * n + i] = tmp;
+                        }
+                    }
+                }
+                else
+                {
+                    /* Off-diagonal block - swap entire blocks */
+                    for (uint16_t i = i0; i < imax; ++i)
+                    {
+                        for (uint16_t j = j0; j < jmax; ++j)
+                        {
+                            float tmp = A[i * n + j];
+                            A[i * n + j] = A[j * n + i];
+                            A[j * n + i] = tmp;
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+#endif
+
+    /* Scalar fallback */
+    for (uint16_t i = 0; i < n; ++i)
+    {
+        for (uint16_t j = i + 1; j < n; ++j)
+        {
+            float tmp = A[i * n + j];
+            A[i * n + j] = A[j * n + i];
+            A[j * n + i] = tmp;
+        }
+    }
+}
+
+/**
+ * @brief Measurement update: compute Kalman gain, update state, and downdate SR covariance.
+ *
+ * @details
+ *  Solves for Kalman gain K via triangular solves (no matrix inverse):
+ *    1) Forward solve:  Sy^T · Z = Pxy  (lower triangular)
+ *    2) Backward solve: Sy · K = Z      (upper triangular, Z overwritten with K)
+ *
+ *  Then applies measurement update:
+ *    - x̂ ← x̂ + K·(y − ŷ)
+ *    - S ← downdate(S, U) where U = K·Sy
+ *
+ * @param[in,out] S     State SR covariance (n×n), upper-triangular, downdated in-place.
+ * @param[in,out] xhat  State estimate (n); updated to x̂^+ = x̂ + K(y−ŷ).
+ * @param[in]     yhat  Predicted measurement (n).
+ * @param[in]     y     Actual measurement (n).
+ * @param[in]     Sy    Measurement SR covariance (n×n), upper-triangular.
+ * @param[in]     Pxy   Cross-covariance (n×n).
+ * @param[in,out] ws    Workspace structure (caller manages).
+ * @param[in]     L8    Dimension n.
+ *
+ * @retval 0        Success.
+ * @retval -ENOMEM  Workspace allocation failed.
+ * @retval -EIO     GEMM operation failed.
+ * @retval -EDOM    Cholesky downdate failed (filter divergence detected).
+ *
+ * @note All matrices are row-major. Sy and S are upper-triangular.
+ */
 static int update_state_covariance_matrix_and_state_estimation_vector(
     float *RESTRICT S,
     float *RESTRICT xhat,
@@ -1402,105 +1541,111 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     const float *RESTRICT y,
     const float *RESTRICT Sy,
     const float *RESTRICT Pxy,
+    ukf_upd_ws_t *ws,
     uint8_t L8)
 {
     const uint16_t n = (uint16_t)L8;
     const size_t nn = (size_t)n * (size_t)n;
 
-    /* Thread-local reusable workspace (Z, U, Uk, Ky, yyhat). */
-    static __thread ukf_upd_ws_t uws = {0};
-    if (ukf_upd_ws_ensure(&uws, n) != 0)
+    /* Ensure workspace is adequate */
+    if (ukf_upd_ws_ensure(ws, n) != 0)
         return -ENOMEM;
 
-    float *Z = uws.Z;         /* (n×n) RHS workspace → becomes K */
-    float *U = uws.U;         /* (n×n) temporary for K*Sy */
-    float *Uk = uws.Uk;       /* (n)   single column buffer for chol downdate */
-    float *Ky = uws.Ky;       /* (n)   K*(y−yhat) */
-    float *yyhat = uws.yyhat; /* (n)   innovation v = y − yhat */
+    float *Z = ws->Z;         /* n×n RHS workspace → becomes K */
+    float *U = ws->U;         /* n×n temporary for K·Sy */
+    float *Ky = ws->Ky;       /* n-vector: K·(y−ŷ) */
+    float *yyhat = ws->yyhat; /* n-vector: y − ŷ */
 
-    /* Z := Pxy (we’ll overwrite it into K after the triangular solves) */
+    /* Initialize Z with Pxy (will be overwritten by K after solves) */
     memcpy(Z, Pxy, nn * sizeof(float));
 
-    /* Prefetch knobs for large problems */
+    /* Prefetch knobs */
     const int do_pf = (n >= (uint16_t)UKF_UPD_PF_MIN_N);
     const size_t pf_elts = (size_t)UKF_UPD_PF_DIST_BYTES / sizeof(float);
 
-    /* --------------------------------------------------------------
-     * Forward solve:  S_y^T · Z = P_xy      (S_y upper ⇒ S_y^T lower)
-     * Solve row-by-row (i ascending). Within each row, block over
-     * RHS columns to improve temporal locality.
-     * -------------------------------------------------------------- */
+    /* ==================================================================
+     * STEP 1: Forward solve  Sy^T · Z = Pxy
+     *         (Sy is upper ⇒ Sy^T is lower triangular)
+     * ================================================================== */
+#if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
     {
         for (uint16_t i = 0; i < n; ++i)
         {
-            const float sii = Sy[(size_t)i * n + i]; /* diagonal (scalar) */
+            const float sii = Sy[(size_t)i * n + i];
 
             for (uint16_t c0 = 0; c0 < n; c0 += UKF_UPD_COLBLOCK)
             {
-                const uint16_t bc = (uint16_t)((c0 + UKF_UPD_COLBLOCK <= n)
-                                                   ? UKF_UPD_COLBLOCK
-                                                   : (n - c0));
+                const uint16_t bc = MIN((uint16_t)UKF_UPD_COLBLOCK, n - c0);
 
-                /* Z[i,*] -= Σ_{k<i} Sy[k,i] * Z[k,*] */
+                /* Z[i,:] -= Σ_{k<i} Sy[k,i] · Z[k,:] */
                 for (uint16_t k = 0; k < i; ++k)
                 {
                     const float m = Sy[(size_t)k * n + i];
                     if (m == 0.0f)
                         continue;
-                    const __m256 mv = _mm256_set1_ps(m);
 
+                    const __m256 mv = _mm256_set1_ps(m);
                     uint16_t c = 0;
-                    for (; (uint16_t)(c + 7) < bc; c = (uint16_t)(c + 8))
+
+                    for (; c + 7 < bc; c += 8)
                     {
                         if (do_pf && c + pf_elts + 8 < bc)
                         {
                             _mm_prefetch((const char *)(&Z[(size_t)i * n + c0 + c + pf_elts]), _MM_HINT_T0);
                             _mm_prefetch((const char *)(&Z[(size_t)k * n + c0 + c + pf_elts]), _MM_HINT_T0);
                         }
+
                         __m256 zi = _mm256_loadu_ps(&Z[(size_t)i * n + c0 + c]);
                         __m256 zk = _mm256_loadu_ps(&Z[(size_t)k * n + c0 + c]);
-                        zi = _mm256_fnmadd_ps(mv, zk, zi); /* zi -= m * zk */
+                        zi = _mm256_fnmadd_ps(mv, zk, zi);
                         _mm256_storeu_ps(&Z[(size_t)i * n + c0 + c], zi);
                     }
+
                     for (; c < bc; ++c)
                         Z[(size_t)i * n + c0 + c] -= m * Z[(size_t)k * n + c0 + c];
                 }
 
-                /* Divide the row block by the diagonal (scalar) */
+                /* Z[i,:] /= Sy[i,i] */
                 const __m256 rinv = _mm256_set1_ps(1.0f / sii);
                 uint16_t c = 0;
-                for (; (uint16_t)(c + 7) < bc; c = (uint16_t)(c + 8))
+
+                for (; c + 7 < bc; c += 8)
                 {
                     __m256 zi = _mm256_loadu_ps(&Z[(size_t)i * n + c0 + c]);
                     _mm256_storeu_ps(&Z[(size_t)i * n + c0 + c], _mm256_mul_ps(zi, rinv));
                 }
+
                 for (; c < bc; ++c)
                     Z[(size_t)i * n + c0 + c] /= sii;
             }
         }
     }
     else
+#endif
     {
-        /* Portable scalar forward solve */
+        /* Scalar forward solve */
         for (uint16_t i = 0; i < n; ++i)
         {
             const float sii = Sy[(size_t)i * n + i];
+
             for (uint16_t k = 0; k < i; ++k)
             {
                 const float m = Sy[(size_t)k * n + i];
                 for (uint16_t c = 0; c < n; ++c)
                     Z[(size_t)i * n + c] -= m * Z[(size_t)k * n + c];
             }
+
             for (uint16_t c = 0; c < n; ++c)
                 Z[(size_t)i * n + c] /= sii;
         }
     }
 
-    /* --------------------------------------------------------------
-     * Backward solve:  S_y · K = Z           (S_y upper; overwrite Z→K)
-     * Solve row-by-row (i descending). Block RHS columns as above.
-     * -------------------------------------------------------------- */
+    /* ==================================================================
+     * STEP 2: Backward solve  Sy · K = Z
+     *         (Sy is upper triangular; Z is overwritten with K)
+     * ================================================================== */
+#if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
     {
         for (int i = (int)n - 1; i >= 0; --i)
@@ -1509,79 +1654,81 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
 
             for (uint16_t c0 = 0; c0 < n; c0 += UKF_UPD_COLBLOCK)
             {
-                const uint16_t bc = (uint16_t)((c0 + UKF_UPD_COLBLOCK <= n)
-                                                   ? UKF_UPD_COLBLOCK
-                                                   : (n - c0));
+                const uint16_t bc = MIN((uint16_t)UKF_UPD_COLBLOCK, n - c0);
 
-                /* Z[i,*] -= Σ_{k>i} Sy[i,k] * Z[k,*] */
+                /* Z[i,:] -= Σ_{k>i} Sy[i,k] · Z[k,:] */
                 for (uint16_t k = (uint16_t)(i + 1); k < n; ++k)
                 {
                     const float m = Sy[(size_t)i * n + k];
                     if (m == 0.0f)
                         continue;
-                    const __m256 mv = _mm256_set1_ps(m);
 
+                    const __m256 mv = _mm256_set1_ps(m);
                     uint16_t c = 0;
-                    for (; (uint16_t)(c + 7) < bc; c = (uint16_t)(c + 8))
+
+                    for (; c + 7 < bc; c += 8)
                     {
                         if (do_pf && c + pf_elts + 8 < bc)
                         {
                             _mm_prefetch((const char *)(&Z[(size_t)i * n + c0 + c + pf_elts]), _MM_HINT_T0);
                             _mm_prefetch((const char *)(&Z[(size_t)k * n + c0 + c + pf_elts]), _MM_HINT_T0);
                         }
+
                         __m256 zi = _mm256_loadu_ps(&Z[(size_t)i * n + c0 + c]);
                         __m256 zk = _mm256_loadu_ps(&Z[(size_t)k * n + c0 + c]);
-                        zi = _mm256_fnmadd_ps(mv, zk, zi); /* zi -= m * zk */
+                        zi = _mm256_fnmadd_ps(mv, zk, zi);
                         _mm256_storeu_ps(&Z[(size_t)i * n + c0 + c], zi);
                     }
+
                     for (; c < bc; ++c)
                         Z[(size_t)i * n + c0 + c] -= m * Z[(size_t)k * n + c0 + c];
                 }
 
-                /* Divide the row block by the diagonal */
+                /* Z[i,:] /= Sy[i,i] */
                 const __m256 rinv = _mm256_set1_ps(1.0f / sii);
                 uint16_t c = 0;
-                for (; (uint16_t)(c + 7) < bc; c = (uint16_t)(c + 8))
+
+                for (; c + 7 < bc; c += 8)
                 {
                     __m256 zi = _mm256_loadu_ps(&Z[(size_t)i * n + c0 + c]);
                     _mm256_storeu_ps(&Z[(size_t)i * n + c0 + c], _mm256_mul_ps(zi, rinv));
                 }
+
                 for (; c < bc; ++c)
                     Z[(size_t)i * n + c0 + c] /= sii;
             }
         }
     }
     else
+#endif
     {
-        /* Portable scalar backward solve */
+        /* Scalar backward solve */
         for (int i = (int)n - 1; i >= 0; --i)
         {
             const float sii = Sy[(size_t)i * n + i];
+
             for (uint16_t k = (uint16_t)(i + 1); k < n; ++k)
             {
                 const float m = Sy[(size_t)i * n + k];
                 for (uint16_t c = 0; c < n; ++c)
                     Z[(size_t)i * n + c] -= m * Z[(size_t)k * n + c];
             }
+
             for (uint16_t c = 0; c < n; ++c)
                 Z[(size_t)i * n + c] /= sii;
         }
     }
-    /* Z now holds K (n×n). */
+    /* Z now contains K (the Kalman gain) */
 
-    /* --------------------------------------------------------------
-     * Innovation: v = y − ŷ
-     * -------------------------------------------------------------- */
+    /* ==================================================================
+     * STEP 3: Compute innovation  v = y − ŷ
+     * ================================================================== */
+#if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
     {
         uint16_t i = 0;
-        for (; (uint16_t)(i + 7) < n; i = (uint16_t)(i + 8))
+        for (; i + 7 < n; i += 8)
         {
-            if (do_pf && i + pf_elts + 8 < n)
-            {
-                _mm_prefetch((const char *)(y + i + pf_elts), _MM_HINT_T0);
-                _mm_prefetch((const char *)(yhat + i + pf_elts), _MM_HINT_T0);
-            }
             __m256 vy = _mm256_loadu_ps(y + i);
             __m256 vyh = _mm256_loadu_ps(yhat + i);
             _mm256_storeu_ps(yyhat + i, _mm256_sub_ps(vy, vyh));
@@ -1590,20 +1737,26 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
             yyhat[i] = y[i] - yhat[i];
     }
     else
+#endif
     {
         for (uint16_t i = 0; i < n; ++i)
             yyhat[i] = y[i] - yhat[i];
     }
 
-    /* Gain-times-innovation: Ky = K * (y − ŷ) */
+    /* ==================================================================
+     * STEP 4: Compute Ky = K · (y − ŷ)
+     * ================================================================== */
     if (mul(Ky, Z /*K*/, yyhat, n, n, n, 1) != 0)
         return -EIO;
 
-    /* State update: x̂ ← x̂ + Ky */
+    /* ==================================================================
+     * STEP 5: State update  x̂ ← x̂ + Ky
+     * ================================================================== */
+#if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
     {
         uint16_t i = 0;
-        for (; (uint16_t)(i + 7) < n; i = (uint16_t)(i + 8))
+        for (; i + 7 < n; i += 8)
         {
             __m256 xv = _mm256_loadu_ps(xhat + i);
             __m256 kv = _mm256_loadu_ps(Ky + i);
@@ -1613,36 +1766,45 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
             xhat[i] += Ky[i];
     }
     else
+#endif
     {
         for (uint16_t i = 0; i < n; ++i)
             xhat[i] += Ky[i];
     }
 
-    /* Helper matrix: U = K * S_y (n×n) */
+    /* ==================================================================
+     * STEP 6: Compute U = K · Sy
+     * ================================================================== */
     if (mul(U, Z /*K*/, Sy, n, n, n, n) != 0)
         return -EIO;
 
-    /* Downdate S (upper) by each column of U */
+    /* ==================================================================
+     * STEP 7: Transpose U in-place for contiguous row access
+     *         (Avoids O(n²) strided column extractions)
+     * ================================================================== */
+    transpose_square_inplace(U, n);
+
+    /* ==================================================================
+     * STEP 8: Downdate S by each row of U^T (was column of U)
+     * ================================================================== */
     for (uint16_t j = 0; j < n; ++j)
     {
-        /* Prefetch next column (optional) */
-        if (do_pf && (uint16_t)(j + 1) < n)
-            _mm_prefetch((const char *)(&U[(size_t)0 * n + (j + 1)]), _MM_HINT_T0);
+        /* Prefetch next row */
+        if (do_pf && j + 1 < n)
+            _mm_prefetch((const char *)(U + (j + 1) * n), _MM_HINT_T0);
 
-        /* Extract column j of U into contiguous vector */
-        for (uint16_t i = 0; i < n; ++i)
-            Uk[i] = U[(size_t)i * n + j];
+        /* Row j of U^T is now contiguous (was column j of U) */
+        const float *Uj = U + (size_t)j * n;
 
-        /* Downdate S with column j */
-        int rc = cholupdate(S, Uk, n, /*is_upper=*/true, /*rank_one_update=*/false);
+        /* Downdate S with this row */
+        int rc = cholupdate(S, Uj, n, /*is_upper=*/true, /*rank_one_update=*/false);
         if (rc != 0)
         {
-            /* Downdate failed: measurement update caused filter divergence.
-            This can happen if:
-            - Measurement is wildly inconsistent (outlier)
-            - R is too small (overconfident measurement model)
-            - Numerical issues accumulated                              */
-            return rc; /* Let caller handle divergence */
+            /* Filter divergence detected - provide diagnostic info */
+            /* In production, you might log which column failed:
+               fprintf(stderr, "UKF divergence: cholupdate failed at column %u\n", j);
+            */
+            return rc;
         }
     }
 
@@ -1659,33 +1821,39 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
  *     measurement SR covariance, cross-cov, and update via triangular solves
  *     + Cholesky downdates.
  *
- *  Improvements over scalar pipeline:
- *   - AVX2 kernels in the hot loops (sigma build, weighted sums, cross-cov).
- *   - No VLAs; uses aligned heap scratch for embedded safety and SIMD alignment.
- *   - Update avoids explicit matrix inverse; uses two triangular solves.
+ *  All workspace management is explicit (no thread-local storage).
+ *  Proper error propagation throughout the pipeline.
  *
- * @param[in]     y     Measurement vector [L].
- * @param[in,out] xhat  State mean [L]; on return the updated state estimate.
- * @param[in]     Rn    Measurement noise covariance [L x L].
- * @param[in]     Rv    Process noise covariance [L x L].
- * @param[in]     u     Control/input vector passed to F.
- * @param[in]     F     Transition function: F(dx, x, u).
- * @param[in,out] S     State SR covariance [L x L], updated in-place.
- * @param[in]     alpha,beta  UKF parameters.
- * @param[in]     L     State dimension.
+ * @param[in]     y       Measurement vector [L].
+ * @param[in,out] xhat    State mean [L]; on return the updated state estimate.
+ * @param[in]     Rn_sr   Measurement noise SR covariance [L×L], upper-triangular.
+ * @param[in]     Rv_sr   Process noise SR covariance [L×L], upper-triangular.
+ * @param[in]     u       Control/input vector passed to F.
+ * @param[in]     F       Transition function: F(dx, x, u).
+ * @param[in,out] S       State SR covariance [L×L], upper-triangular, updated in-place.
+ * @param[in]     alpha   UKF spread parameter (typically 1e-3).
+ * @param[in]     beta    Prior knowledge parameter (typically 2.0 for Gaussian).
+ * @param[in]     L8      State dimension.
  *
- * @retval 0        on success
- * @retval -EINVAL  if L==0
- * @retval -ENOMEM  if scratch allocation fails
+ * @retval 0        Success.
+ * @retval -EINVAL  Invalid parameter (L==0).
+ * @retval -ENOMEM  Memory allocation failed.
+ * @retval -EIO     Internal operation (QR, GEMM) failed.
+ * @retval -EDOM    Cholesky update/downdate failed (numerical issue).
+ * @retval -EFAULT  Covariance matrix failed sanity check (non-PD).
  *
- * @note Row-major layout throughout; arrays must not alias unless documented.
- * @warning X/Y are centered in-place inside cross-covariance; pass copies if needed later.
+ * @note All matrices are row-major. S, Rn_sr, Rv_sr are upper-triangular.
  */
-int sqr_ukf(float y[], float xhat[],
-            const float Rn_sr[], const float Rv_sr[], /* upper SR noise */
+int sqr_ukf(float y[],
+            float xhat[],
+            const float Rn_sr[],
+            const float Rv_sr[],
             float u[],
             void (*F)(float[], float[], float[]),
-            float S[], float alpha, float beta, uint8_t L8)
+            float S[],
+            float alpha,
+            float beta,
+            uint8_t L8)
 {
     if (L8 == 0)
         return -EINVAL;
@@ -1694,19 +1862,21 @@ int sqr_ukf(float y[], float xhat[],
     const uint16_t L = L8;
     const uint16_t N = (uint16_t)(2 * L + 1);
 
+    /* Allocation sizes */
     const size_t szW = (size_t)N * sizeof(float);
     const size_t szLN = (size_t)L * N * sizeof(float);
     const size_t szLL = (size_t)L * L * sizeof(float);
     const size_t szL = (size_t)L * sizeof(float);
 
-    float *Wc = (float *)ukf_aligned_alloc(szW);
-    float *Wm = (float *)ukf_aligned_alloc(szW);
-    float *X = (float *)ukf_aligned_alloc(szLN);
-    float *Xst = (float *)ukf_aligned_alloc(szLN);
-    float *Y = (float *)ukf_aligned_alloc(szLN);
-    float *yhat = (float *)ukf_aligned_alloc(szL);
-    float *Sy = (float *)ukf_aligned_alloc(szLL);
-    float *Pxy = (float *)ukf_aligned_alloc(szLL);
+    /* Allocate main working arrays */
+    float *Wc = (float *)gemm_aligned_alloc(32, szW);
+    float *Wm = (float *)gemm_aligned_alloc(32, szW);
+    float *X = (float *)gemm_aligned_alloc(32, szLN);
+    float *Xst = (float *)gemm_aligned_alloc(32, szLN);
+    float *Y = (float *)gemm_aligned_alloc(32, szLN);
+    float *yhat = (float *)gemm_aligned_alloc(32, szL);
+    float *Sy = (float *)gemm_aligned_alloc(32, szLL);
+    float *Pxy = (float *)gemm_aligned_alloc(32, szLL);
 
     if (!Wc || !Wm || !X || !Xst || !Y || !yhat || !Sy || !Pxy)
     {
@@ -1714,52 +1884,79 @@ int sqr_ukf(float y[], float xhat[],
         goto Cleanup;
     }
 
+    /* Workspace structures (stack-allocated handles) */
+    ukf_qr_ws_t qr_ws = {0};   /* For QR decomposition in covariance steps */
+    ukf_upd_ws_t upd_ws = {0}; /* For measurement update triangular solves */
+
     const float kappa = 0.0f;
+
+    /* ==================================================================
+     * PREDICTION PHASE
+     * ================================================================== */
+
+    /* 1. Create UKF weights */
     create_weights(Wc, Wm, alpha, beta, kappa, (uint8_t)L);
 
-    // 2) sigma → X  (state)
+    /* 2. Generate sigma points from current state */
     create_sigma_point_matrix(X, xhat, S, alpha, kappa, (uint8_t)L);
 
-    // 3) propagate through F → X*
+    /* 3. Propagate sigma points through nonlinear dynamics */
     compute_transition_function(Xst, X, u, F, (uint8_t)L);
 
-    // 4) predicted state mean
+    /* 4. Compute predicted state mean */
     multiply_sigma_point_matrix_to_weights(xhat, Xst, Wm, (uint8_t)L);
 
+    /* 5. Compute predicted state SR covariance */
     {
-        // 5) predicted SR covariance (upper): uses QR + upper chol update/downdate
-        int rc = create_state_estimation_error_covariance_matrix(S, Wc, Xst, xhat, Rv_sr, (uint8_t)L);
-        if (rc)
+        int rc = create_state_estimation_error_covariance_matrix(
+            S, &qr_ws, Wc, Xst, xhat, Rv_sr, (uint8_t)L);
+        if (rc != 0)
         {
             status = rc;
             goto Cleanup;
         }
     }
-    // 6) re-sigma from new (x̂, S)
+
+    /* ==================================================================
+     * UPDATE PHASE
+     * ================================================================== */
+
+    /* 6. Generate new sigma points from predicted state */
     create_sigma_point_matrix(X, xhat, S, alpha, kappa, (uint8_t)L);
-    // 7) identity measurement model: Y := X
+
+    /* 7. Apply measurement model (identity: Y = X) */
     H(Y, X, (uint8_t)L);
 
-    // 8) predicted measurement mean
+    /* 8. Compute predicted measurement mean */
     multiply_sigma_point_matrix_to_weights(yhat, Y, Wm, (uint8_t)L);
 
+    /* 9. Compute measurement SR covariance */
     {
-        // 9) measurement SR covariance (upper)
-        int rc = create_state_estimation_error_covariance_matrix(Sy, Wc, Y, yhat, Rn_sr, (uint8_t)L);
-        if (rc)
+        int rc = create_state_estimation_error_covariance_matrix(
+            Sy, &qr_ws, Wc, Y, yhat, Rn_sr, (uint8_t)L);
+        if (rc != 0)
         {
             status = rc;
             goto Cleanup;
         }
     }
-    // 10) cross-covariance P_xy
-    create_state_cross_covariance_matrix(Pxy, Wc, X, Y, xhat, yhat, (uint8_t)L);
 
+    /* 10. Compute cross-covariance Pxy */
     {
-        // 11) SR update (upper): gain, x̂ += K(y−ŷ), S downdate by columns of U=K·S_y
+        int rc = create_state_cross_covariance_matrix(
+            Pxy, Wc, X, Y, xhat, yhat, (uint8_t)L);
+        if (rc != 0)
+        {
+            status = rc;
+            goto Cleanup;
+        }
+    }
+
+    /* 11. Measurement update: compute gain, update state and SR covariance */
+    {
         int rc = update_state_covariance_matrix_and_state_estimation_vector(
-            S, xhat, yhat, y, Sy, Pxy, (uint8_t)L);
-        if (rc)
+            S, xhat, yhat, y, Sy, Pxy, &upd_ws, (uint8_t)L);
+        if (rc != 0)
         {
             status = rc;
             goto Cleanup;
@@ -1767,13 +1964,19 @@ int sqr_ukf(float y[], float xhat[],
     }
 
 Cleanup:
-    ukf_aligned_free(Wc);
-    ukf_aligned_free(Wm);
-    ukf_aligned_free(X);
-    ukf_aligned_free(Xst);
-    ukf_aligned_free(Y);
-    ukf_aligned_free(yhat);
-    ukf_aligned_free(Sy);
-    ukf_aligned_free(Pxy);
+    /* Free main working arrays */
+    gemm_aligned_free(Wc);
+    gemm_aligned_free(Wm);
+    gemm_aligned_free(X);
+    gemm_aligned_free(Xst);
+    gemm_aligned_free(Y);
+    gemm_aligned_free(yhat);
+    gemm_aligned_free(Sy);
+    gemm_aligned_free(Pxy);
+
+    /* Workspace structures clean up their own internal allocations */
+    ukf_qr_ws_cleanup(&qr_ws);
+    ukf_upd_ws_cleanup(&upd_ws);
+
     return status;
 }
