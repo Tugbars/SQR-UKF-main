@@ -3,7 +3,6 @@
 #include <string.h>
 #include <math.h>
 #include <stdint.h>
-#include "linalg_simd.h"
 
 /* define to 1 if you want the 8-way batching; keep 0 by default */
 #ifndef SQR_UKF_ENABLE_BATCH8
