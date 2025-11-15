@@ -12,6 +12,7 @@
         "stdlib.h": "c",
         "gemm_static.h": "c",
         "stdio.h": "c",
-        "typeinfo": "c"
+        "typeinfo": "c",
+        "gemm_planning.h": "c"
     }
 }
