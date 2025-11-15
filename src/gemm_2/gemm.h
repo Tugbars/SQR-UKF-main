@@ -41,18 +41,6 @@ typedef enum {
 //==============================================================================
 
 /**
- * @brief Get current static pool size limit
- * @return Maximum dimension supported by static pool
- */
-int gemm_get_static_limit(void);
-
-/**
- * @brief Check if dimensions fit in static pool
- * @return 1 if fits, 0 otherwise
- */
-int gemm_fits_static(size_t M, size_t K, size_t N);
-
-/**
  * @brief Query workspace size needed for dynamic allocation
  * @return Bytes required for workspace
  */
@@ -81,21 +69,6 @@ size_t gemm_workspace_query(size_t M, size_t K, size_t N);
  * @return 0 on success, negative error code on failure
  */
 int gemm_auto(
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
-    size_t M, size_t K, size_t N,
-    float alpha, float beta);
-
-/**
- * @brief GEMM with explicit static pool (zero allocation)
- * 
- * Forces use of thread-local static pool.
- * Returns error if dimensions exceed static pool limit.
- * 
- * @return 0 on success, GEMM_ERR_STATIC_TOO_LARGE if too large
- */
-int gemm_static(
     float * restrict C,
     const float * restrict A,
     const float * restrict B,
@@ -235,38 +208,6 @@ int kalman_update_simple(
     const float * restrict H,
     size_t n, size_t m);
 
-//==============================================================================
-// UTILITY FUNCTIONS
-//==============================================================================
-
-/**
- * @brief Allocate aligned memory
- * @param alignment Alignment in bytes (must be power of 2)
- * @param size Number of bytes to allocate
- * @return Pointer to aligned memory, or NULL on failure
- */
-void* gemm_aligned_alloc(size_t alignment, size_t size);
-
-/**
- * @brief Free aligned memory
- * @param ptr Pointer returned by gemm_aligned_alloc
- */
-void gemm_aligned_free(void* ptr);
-
-/**
- * @brief Initialize thread-local static pool
- * 
- * Called automatically on first use, but can be called explicitly
- * to avoid latency on first GEMM call.
- */
-void gemm_static_init(void);
-
-/**
- * @brief Get error string for error code
- * @param error Error code
- * @return Human-readable error message
- */
-const char* gemm_strerror(gemm_error_t error);
 
 #ifdef __cplusplus
 }
