@@ -27,8 +27,7 @@
 #include <errno.h>
 #include <immintrin.h>
 #include "linalg_simd.h" // linalg_has_avx2(), linalg_aligned_alloc/free, LINALG_DEFAULT_ALIGNMENT
-#include "../gemm/gemm.h"  
-
+#include "../gemm/gemm.h"
 
 #ifndef LUP_NB
 #define LUP_NB 128 // panel/block size (try 96–160)
@@ -40,17 +39,19 @@ _Static_assert(LINALG_DEFAULT_ALIGNMENT >= 32, "Need 32B alignment for AVX2 load
 // WORKSPACE IMPLEMENTATION
 //==============================================================================
 
-struct lup_workspace {
+struct lup_workspace
+{
     void *buffer;
     size_t size;
     int owns_memory;
-    gemm_workspace_t *gemm_ws;  // Embedded GEMM workspace
+    gemm_workspace_t *gemm_ws; // Embedded GEMM workspace
 };
 
 size_t lup_workspace_query(uint16_t n)
 {
-    if (n == 0) return 0;
-    
+    if (n == 0)
+        return 0;
+
     // LUP needs GEMM workspace for trailing updates
     // Worst case: n×n GEMM
     return gemm_workspace_query(n, n, n) + 64;
@@ -59,59 +60,66 @@ size_t lup_workspace_query(uint16_t n)
 lup_workspace_t *lup_workspace_create(size_t size)
 {
     lup_workspace_t *ws = malloc(sizeof(*ws));
-    if (!ws) return NULL;
-    
+    if (!ws)
+        return NULL;
+
     ws->buffer = linalg_aligned_alloc(LINALG_DEFAULT_ALIGNMENT, size);
-    if (!ws->buffer) {
+    if (!ws->buffer)
+    {
         free(ws);
         return NULL;
     }
-    
+
     ws->size = size;
     ws->owns_memory = 1;
-    
+
     // Initialize embedded GEMM workspace
     ws->gemm_ws = gemm_workspace_init(ws->buffer, size);
-    if (!ws->gemm_ws) {
+    if (!ws->gemm_ws)
+    {
         linalg_aligned_free(ws->buffer);
         free(ws);
         return NULL;
     }
-    
+
     return ws;
 }
 
 lup_workspace_t *lup_workspace_init(void *buffer, size_t size)
 {
-    if (!buffer) return NULL;
-    
+    if (!buffer)
+        return NULL;
+
     lup_workspace_t *ws = malloc(sizeof(*ws));
-    if (!ws) return NULL;
-    
+    if (!ws)
+        return NULL;
+
     ws->buffer = buffer;
     ws->size = size;
     ws->owns_memory = 0;
-    
+
     // Initialize embedded GEMM workspace from same buffer
     ws->gemm_ws = gemm_workspace_init(buffer, size);
-    if (!ws->gemm_ws) {
+    if (!ws->gemm_ws)
+    {
         free(ws);
         return NULL;
     }
-    
+
     return ws;
 }
 
 void lup_workspace_destroy(lup_workspace_t *ws)
 {
-    if (!ws) return;
-    
+    if (!ws)
+        return;
+
     if (ws->gemm_ws)
         gemm_workspace_destroy(ws->gemm_ws);
-    
+
     if (ws->owns_memory)
         linalg_aligned_free(ws->buffer);
-    
+
     free(ws);
 }
 
@@ -205,30 +213,43 @@ static int panel_lu_unblocked(float *RESTRICT A, uint16_t n,
 /* ---------- Small TRSM on the panel (scalar) ---------- */
 
 /* U12 := L11^{-1} * U12, where L11 is ib×ib unit-lower; U12 is ib×nc (rows k..k+ib-1, cols c0..). */
-static inline void trsm_left_unit_lower_on_U12(float *RESTRICT A, uint16_t n,
+static inline void trsm_left_unit_lower_on_U12(float *restrict A, uint16_t n,
                                                uint16_t k, uint16_t ib,
                                                uint16_t c0, uint16_t nc)
 {
     for (uint16_t r = 0; r < ib; ++r)
     {
-        float *Ur = A + (size_t)(k + r) * n + c0; /* row vector of U12 */
+        float *Ur = A + (size_t)(k + r) * n + c0;
+
         for (uint16_t t = 0; t < r; ++t)
         {
             float lij = A[(size_t)(k + r) * n + (k + t)];
-            if (lij != 0.0f)
+            if (lij == 0.0f)
+                continue;
+
+            const float *Ut = A + (size_t)(k + t) * n + c0;
+
+            // ✅ VECTORIZED: Ur -= lij * Ut
+            __m256 vlij = _mm256_set1_ps(lij);
+            uint16_t j = 0;
+
+            for (; j + 7 < nc; j += 8)
             {
-                const float *Ut = A + (size_t)(k + t) * n + c0;
-                for (uint16_t j = 0; j < nc; ++j)
-                    Ur[j] -= lij * Ut[j];
+                __m256 ur = _mm256_loadu_ps(&Ur[j]);
+                __m256 ut = _mm256_loadu_ps(&Ut[j]);
+                ur = _mm256_fnmadd_ps(vlij, ut, ur);
+                _mm256_storeu_ps(&Ur[j], ur);
             }
+
+            for (; j < nc; ++j)
+                Ur[j] -= lij * Ut[j];
         }
-        /* unit diag → no divide */
     }
 }
 
 /* L21 := L21 * U11^{-1}, where U11 is ib×ib upper (non-unit); L21 is m2×ib (rows r0.., cols k..k+ib-1).
    Right-side TRSM: process columns c=ib-1..0. */
-static inline int trsm_right_upper_on_L21(float *RESTRICT A, uint16_t n,
+static inline int trsm_right_upper_on_L21(float *restrict A, uint16_t n,
                                           uint16_t r0, uint16_t m2,
                                           uint16_t k, uint16_t ib)
 {
@@ -236,7 +257,8 @@ static inline int trsm_right_upper_on_L21(float *RESTRICT A, uint16_t n,
     {
         uint16_t c = (uint16_t)cc;
         float ucc = A[(size_t)(k + c) * n + (k + c)];
-        /* relative guard */
+
+        // Singularity check (unchanged)
         float scale = 0.0f;
         const float *Urow = A + (size_t)(k + c) * n;
         for (uint16_t t = c; t < ib; ++t)
@@ -250,22 +272,65 @@ static inline int trsm_right_upper_on_L21(float *RESTRICT A, uint16_t n,
             return -ENOTSUP;
 
         float inv = 1.0f / ucc;
+        __m256 vinv = _mm256_set1_ps(inv);
 
-        /* divide column c of L21 by U11(c,c) */
-        for (uint16_t r = 0; r < m2; ++r)
+        // ✅ VECTORIZED: Divide column c by ucc
+        uint16_t r = 0;
+        for (; r + 7 < m2; r += 8)
+        {
+            size_t base = (size_t)(r0 + r) * n + (k + c);
+            __m256 vals = _mm256_setr_ps(
+                A[base + 0 * n], A[base + 1 * n], A[base + 2 * n], A[base + 3 * n],
+                A[base + 4 * n], A[base + 5 * n], A[base + 6 * n], A[base + 7 * n]);
+            vals = _mm256_mul_ps(vals, vinv);
+
+            // Scatter back
+            float tmp[8];
+            _mm256_storeu_ps(tmp, vals);
+            for (int i = 0; i < 8; ++i)
+                A[base + i * n] = tmp[i];
+        }
+
+        for (; r < m2; ++r)
             A[(size_t)(r0 + r) * n + (k + c)] *= inv;
 
-        /* update: for t = 0..c-1:  L21[:,t] -= L21[:,c] * U11(t,c) */
+        // Update (vectorized similarly)
         for (int tt = 0; tt < cc; ++tt)
         {
             uint16_t t = (uint16_t)tt;
             float u_tc = A[(size_t)(k + t) * n + (k + c)];
             if (u_tc == 0.0f)
                 continue;
-            for (uint16_t r = 0; r < m2; ++r)
+
+            __m256 vu_tc = _mm256_set1_ps(u_tc);
+            r = 0;
+
+            for (; r + 7 < m2; r += 8)
             {
-                float *L_r_t = &A[(size_t)(r0 + r) * n + (k + t)];
-                *L_r_t -= A[(size_t)(r0 + r) * n + (k + c)] * u_tc;
+                // Load L21[:,c] and L21[:,t] (strided)
+                size_t base_c = (size_t)(r0 + r) * n + (k + c);
+                size_t base_t = (size_t)(r0 + r) * n + (k + t);
+
+                __m256 L_c = _mm256_setr_ps(
+                    A[base_c + 0 * n], A[base_c + 1 * n], A[base_c + 2 * n], A[base_c + 3 * n],
+                    A[base_c + 4 * n], A[base_c + 5 * n], A[base_c + 6 * n], A[base_c + 7 * n]);
+                __m256 L_t = _mm256_setr_ps(
+                    A[base_t + 0 * n], A[base_t + 1 * n], A[base_t + 2 * n], A[base_t + 3 * n],
+                    A[base_t + 4 * n], A[base_t + 5 * n], A[base_t + 6 * n], A[base_t + 7 * n]);
+
+                L_t = _mm256_fnmadd_ps(L_c, vu_tc, L_t);
+
+                // Scatter back
+                float tmp[8];
+                _mm256_storeu_ps(tmp, L_t);
+                for (int i = 0; i < 8; ++i)
+                    A[base_t + i * n] = tmp[i];
+            }
+
+            for (; r < m2; ++r)
+            {
+                A[(size_t)(r0 + r) * n + (k + t)] -=
+                    A[(size_t)(r0 + r) * n + (k + c)] * u_tc;
             }
         }
     }
@@ -275,41 +340,43 @@ static inline int trsm_right_upper_on_L21(float *RESTRICT A, uint16_t n,
 int lup_ws(const float *restrict A, float *restrict LU, uint8_t *restrict P,
            uint16_t n, lup_workspace_t *ws)
 {
-    if (n == 0) return -EINVAL;
-    if (!ws || !ws->gemm_ws) return -EINVAL;
-    
+    if (n == 0)
+        return -EINVAL;
+    if (!ws || !ws->gemm_ws)
+        return -EINVAL;
+
     // Validate workspace size
     size_t required = lup_workspace_query(n);
     if (ws->size < required)
         return -ENOSPC;
-    
+
     // Copy input if needed
     if (A != LU)
         memcpy(LU, A, (size_t)n * n * sizeof(float));
-    
+
     // Initialize permutation
     for (uint16_t i = 0; i < n; ++i)
         P[i] = (uint8_t)i;
-    
+
     const uint16_t NB = (uint16_t)LUP_NB;
-    
+
     for (uint16_t k = 0; k < n; k = (uint16_t)(k + NB))
     {
         uint16_t ib = (uint16_t)((k + NB <= n) ? NB : (n - k));
         uint16_t nc = (uint16_t)(n - (k + ib)); // columns to right
         uint16_t m2 = (uint16_t)(n - (k + ib)); // rows below
-        
+
         // 1) Panel factorization (unblocked LU with pivoting)
         int rc = panel_lu_unblocked(LU, n, k, ib, P);
         if (rc)
             return rc;
-        
+
         // 2) U12 = L11^{-1} * U12 (unit-lower TRSM)
         if (nc)
         {
             trsm_left_unit_lower_on_U12(LU, n, k, ib, (uint16_t)(k + ib), nc);
         }
-        
+
         // 3) L21 = L21 * U11^{-1} (upper TRSM)
         if (m2)
         {
@@ -317,24 +384,24 @@ int lup_ws(const float *restrict A, float *restrict LU, uint8_t *restrict P,
             if (rc)
                 return rc;
         }
-        
+
         // 4) Trailing update: A22 -= L21 * U12 (GEMM)
         if (m2 && nc)
         {
             const float *L21 = LU + (size_t)(k + ib) * n + k;
             const float *U12 = LU + (size_t)k * n + (k + ib);
             float *A22 = LU + (size_t)(k + ib) * n + (k + ib);
-            
+
             // Use embedded GEMM workspace
             rc = gemm_ws(A22, L21, U12, m2, ib, nc,
-                        1.0f,   // alpha
-                        -1.0f,  // beta (C -= A*B)
-                        ws->gemm_ws);
+                         1.0f,  // alpha
+                         -1.0f, // beta (C -= A*B)
+                         ws->gemm_ws);
             if (rc)
                 return rc;
         }
     }
-    
+
     return 0;
 }
 
@@ -346,10 +413,10 @@ int lup(const float *RESTRICT A, float *RESTRICT LU, uint8_t *P, uint16_t n)
     lup_workspace_t *ws = lup_workspace_create(ws_size);
     if (!ws)
         return -ENOMEM;
-    
+
     // Call lup_ws (does all the work)
     int rc = lup_ws(A, LU, P, n, ws);
-    
+
     // Cleanup
     lup_workspace_destroy(ws);
     return rc;
