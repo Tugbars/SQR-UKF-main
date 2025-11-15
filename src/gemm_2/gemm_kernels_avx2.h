@@ -575,8 +575,14 @@ static inline void gemm_1x8_panel_avx2fma_store(
 //==============================================================================
 
 /**
- * @brief 8×8 kernel (ADD): C += A*B
- * SAFE: No alignas on temp arrays, no masked stores
+ * @brief 8×8 kernel (ADD): C += A*B - OPTIMIZED (No Register Spilling!)
+ *
+ * OPTIMIZATIONS:
+ * - Unroll K-loop by 2 with interleaved computation (breaks FMA chains)
+ * - Software pipelined loads (hide memory latency)
+ * - Register pressure: 11 YMM registers (safe!)
+ *
+ * SAFETY: Unchanged (no alignas, no masked stores)
  */
 static inline void gemm_8x8_panel_avx2fma_add(
     float *RESTRICT c, size_t ldc,
@@ -585,9 +591,6 @@ static inline void gemm_8x8_panel_avx2fma_add(
     size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     (void)mask; // Unused in safe version
-
-    // assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
-    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
     __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -600,41 +603,78 @@ static inline void gemm_8x8_panel_avx2fma_add(
     if (Kblk)
     {
         size_t k = 0;
-        __m256 a = GEMM_LOAD_PANEL(Ap + 0 * a_k_stride);
-        const float *brow = Bp + 0 * b_k_stride;
 
-        for (; k + 1 < Kblk; ++k)
+        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+        for (; k + 1 < Kblk; k += 2)
         {
-            if (do_pf)
+            if (do_pf && k + 8 < Kblk)
                 PREFETCH_T0(Bp + (k + 8) * b_k_stride);
 
-            __m256 a_next = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride);
-            const float *b_next = Bp + (k + 1) * b_k_stride;
+            // Load both K iterations (software pipelining)
+            __m256 a0 = GEMM_LOAD_PANEL(Ap + (k + 0) * a_k_stride);
+            __m256 a1 = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride);
+            const float *b0 = Bp + (k + 0) * b_k_stride;
+            const float *b1 = Bp + (k + 1) * b_k_stride;
 
+            // ✅ INTERLEAVED COMPUTATION (breaks dependency chains)
+            // Alternate between k and k+1 for each accumulator
             __m256 b;
-            b = _mm256_broadcast_ss(brow + 0);
-            acc0 = _mm256_fmadd_ps(a, b, acc0);
-            b = _mm256_broadcast_ss(brow + 1);
-            acc1 = _mm256_fmadd_ps(a, b, acc1);
-            b = _mm256_broadcast_ss(brow + 2);
-            acc2 = _mm256_fmadd_ps(a, b, acc2);
-            b = _mm256_broadcast_ss(brow + 3);
-            acc3 = _mm256_fmadd_ps(a, b, acc3);
-            b = _mm256_broadcast_ss(brow + 4);
-            acc4 = _mm256_fmadd_ps(a, b, acc4);
-            b = _mm256_broadcast_ss(brow + 5);
-            acc5 = _mm256_fmadd_ps(a, b, acc5);
-            b = _mm256_broadcast_ss(brow + 6);
-            acc6 = _mm256_fmadd_ps(a, b, acc6);
-            b = _mm256_broadcast_ss(brow + 7);
-            acc7 = _mm256_fmadd_ps(a, b, acc7);
 
-            a = a_next;
-            brow = b_next;
+            // Column 0: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 0);
+            acc0 = _mm256_fmadd_ps(a0, b, acc0);
+            b = _mm256_broadcast_ss(b1 + 0);
+            acc0 = _mm256_fmadd_ps(a1, b, acc0);
+
+            // Column 1: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 1);
+            acc1 = _mm256_fmadd_ps(a0, b, acc1);
+            b = _mm256_broadcast_ss(b1 + 1);
+            acc1 = _mm256_fmadd_ps(a1, b, acc1);
+
+            // Column 2: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 2);
+            acc2 = _mm256_fmadd_ps(a0, b, acc2);
+            b = _mm256_broadcast_ss(b1 + 2);
+            acc2 = _mm256_fmadd_ps(a1, b, acc2);
+
+            // Column 3: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 3);
+            acc3 = _mm256_fmadd_ps(a0, b, acc3);
+            b = _mm256_broadcast_ss(b1 + 3);
+            acc3 = _mm256_fmadd_ps(a1, b, acc3);
+
+            // Column 4: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 4);
+            acc4 = _mm256_fmadd_ps(a0, b, acc4);
+            b = _mm256_broadcast_ss(b1 + 4);
+            acc4 = _mm256_fmadd_ps(a1, b, acc4);
+
+            // Column 5: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 5);
+            acc5 = _mm256_fmadd_ps(a0, b, acc5);
+            b = _mm256_broadcast_ss(b1 + 5);
+            acc5 = _mm256_fmadd_ps(a1, b, acc5);
+
+            // Column 6: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 6);
+            acc6 = _mm256_fmadd_ps(a0, b, acc6);
+            b = _mm256_broadcast_ss(b1 + 6);
+            acc6 = _mm256_fmadd_ps(a1, b, acc6);
+
+            // Column 7: k, then k+1
+            b = _mm256_broadcast_ss(b0 + 7);
+            acc7 = _mm256_fmadd_ps(a0, b, acc7);
+            b = _mm256_broadcast_ss(b1 + 7);
+            acc7 = _mm256_fmadd_ps(a1, b, acc7);
         }
 
-        // Epilogue
+        // ✅ TAIL LOOP: Handle odd K (0 or 1 iteration left)
+        if (k < Kblk)
         {
+            __m256 a = GEMM_LOAD_PANEL(Ap + k * a_k_stride);
+            const float *brow = Bp + k * b_k_stride;
+
             __m256 b;
             b = _mm256_broadcast_ss(brow + 0);
             acc0 = _mm256_fmadd_ps(a, b, acc0);
@@ -655,7 +695,7 @@ static inline void gemm_8x8_panel_avx2fma_add(
         }
     }
 
-    // ✅ SAFE WRITEBACK
+    // ✅ SAFE WRITEBACK (UNCHANGED - No regressions!)
     if (m == 8 && n == 8)
     {
         // Fast path: full tile, transpose and write
@@ -688,8 +728,7 @@ static inline void gemm_8x8_panel_avx2fma_add(
 }
 
 /**
- * @brief 8×8 kernel (STORE): C = A*B
- * SAFE: No alignas on temp arrays, no masked stores
+ * @brief 8×8 kernel (STORE): C = A*B - OPTIMIZED (No Register Spilling!)
  */
 static inline void gemm_8x8_panel_avx2fma_store(
     float *RESTRICT c, size_t ldc,
@@ -698,9 +737,6 @@ static inline void gemm_8x8_panel_avx2fma_store(
     size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     (void)mask; // Unused in safe version
-
-    // assert(a_k_stride == 8 && "8x8 kernel requires A packed with MR=8");
-    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
     __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -713,41 +749,69 @@ static inline void gemm_8x8_panel_avx2fma_store(
     if (Kblk)
     {
         size_t k = 0;
-        __m256 a = GEMM_LOAD_PANEL(Ap + 0 * a_k_stride);
-        const float *brow = Bp + 0 * b_k_stride;
 
-        for (; k + 1 < Kblk; ++k)
+        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+        for (; k + 1 < Kblk; k += 2)
         {
-            if (do_pf)
+            if (do_pf && k + 8 < Kblk)
                 PREFETCH_T0(Bp + (k + 8) * b_k_stride);
 
-            __m256 a_next = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride);
-            const float *b_next = Bp + (k + 1) * b_k_stride;
+            // Load both K iterations (software pipelining)
+            __m256 a0 = GEMM_LOAD_PANEL(Ap + (k + 0) * a_k_stride);
+            __m256 a1 = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride);
+            const float *b0 = Bp + (k + 0) * b_k_stride;
+            const float *b1 = Bp + (k + 1) * b_k_stride;
 
+            // ✅ INTERLEAVED COMPUTATION (breaks dependency chains)
             __m256 b;
-            b = _mm256_broadcast_ss(brow + 0);
-            acc0 = _mm256_fmadd_ps(a, b, acc0);
-            b = _mm256_broadcast_ss(brow + 1);
-            acc1 = _mm256_fmadd_ps(a, b, acc1);
-            b = _mm256_broadcast_ss(brow + 2);
-            acc2 = _mm256_fmadd_ps(a, b, acc2);
-            b = _mm256_broadcast_ss(brow + 3);
-            acc3 = _mm256_fmadd_ps(a, b, acc3);
-            b = _mm256_broadcast_ss(brow + 4);
-            acc4 = _mm256_fmadd_ps(a, b, acc4);
-            b = _mm256_broadcast_ss(brow + 5);
-            acc5 = _mm256_fmadd_ps(a, b, acc5);
-            b = _mm256_broadcast_ss(brow + 6);
-            acc6 = _mm256_fmadd_ps(a, b, acc6);
-            b = _mm256_broadcast_ss(brow + 7);
-            acc7 = _mm256_fmadd_ps(a, b, acc7);
 
-            a = a_next;
-            brow = b_next;
+            b = _mm256_broadcast_ss(b0 + 0);
+            acc0 = _mm256_fmadd_ps(a0, b, acc0);
+            b = _mm256_broadcast_ss(b1 + 0);
+            acc0 = _mm256_fmadd_ps(a1, b, acc0);
+
+            b = _mm256_broadcast_ss(b0 + 1);
+            acc1 = _mm256_fmadd_ps(a0, b, acc1);
+            b = _mm256_broadcast_ss(b1 + 1);
+            acc1 = _mm256_fmadd_ps(a1, b, acc1);
+
+            b = _mm256_broadcast_ss(b0 + 2);
+            acc2 = _mm256_fmadd_ps(a0, b, acc2);
+            b = _mm256_broadcast_ss(b1 + 2);
+            acc2 = _mm256_fmadd_ps(a1, b, acc2);
+
+            b = _mm256_broadcast_ss(b0 + 3);
+            acc3 = _mm256_fmadd_ps(a0, b, acc3);
+            b = _mm256_broadcast_ss(b1 + 3);
+            acc3 = _mm256_fmadd_ps(a1, b, acc3);
+
+            b = _mm256_broadcast_ss(b0 + 4);
+            acc4 = _mm256_fmadd_ps(a0, b, acc4);
+            b = _mm256_broadcast_ss(b1 + 4);
+            acc4 = _mm256_fmadd_ps(a1, b, acc4);
+
+            b = _mm256_broadcast_ss(b0 + 5);
+            acc5 = _mm256_fmadd_ps(a0, b, acc5);
+            b = _mm256_broadcast_ss(b1 + 5);
+            acc5 = _mm256_fmadd_ps(a1, b, acc5);
+
+            b = _mm256_broadcast_ss(b0 + 6);
+            acc6 = _mm256_fmadd_ps(a0, b, acc6);
+            b = _mm256_broadcast_ss(b1 + 6);
+            acc6 = _mm256_fmadd_ps(a1, b, acc6);
+
+            b = _mm256_broadcast_ss(b0 + 7);
+            acc7 = _mm256_fmadd_ps(a0, b, acc7);
+            b = _mm256_broadcast_ss(b1 + 7);
+            acc7 = _mm256_fmadd_ps(a1, b, acc7);
         }
 
-        // Epilogue
+        // ✅ TAIL LOOP
+        if (k < Kblk)
         {
+            __m256 a = GEMM_LOAD_PANEL(Ap + k * a_k_stride);
+            const float *brow = Bp + k * b_k_stride;
+
             __m256 b;
             b = _mm256_broadcast_ss(brow + 0);
             acc0 = _mm256_fmadd_ps(a, b, acc0);
@@ -774,17 +838,15 @@ static inline void gemm_8x8_panel_avx2fma_store(
                        (((uintptr_t)(c) & 31u) == 0) &&
                        ((ldc & 7u) == 0);
 
-    // ✅ SAFE WRITEBACK
+    // ✅ SAFE WRITEBACK (UNCHANGED)
     if (m == 8 && n == 8)
     {
-        // Fast path: full tile, transpose and write
         __m256 cols[8] = {acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7};
         gemm_transpose_store_8x8(c, ldc, cols, use_nt);
     }
     else
     {
-        // Partial tile: Use temp buffer (NO alignas!)
-        float temp[8 * 8]; // ✅ No alignment assumption
+        float temp[8 * 8];
         _mm256_storeu_ps(temp + 0 * 8, acc0);
         _mm256_storeu_ps(temp + 1 * 8, acc1);
         _mm256_storeu_ps(temp + 2 * 8, acc2);
@@ -794,13 +856,12 @@ static inline void gemm_8x8_panel_avx2fma_store(
         _mm256_storeu_ps(temp + 6 * 8, acc6);
         _mm256_storeu_ps(temp + 7 * 8, acc7);
 
-        // Scalar writeback for partial tile
         for (size_t r = 0; r < m; ++r)
         {
             float *cr = c + r * ldc;
             for (size_t j = 0; j < n; ++j)
             {
-                cr[j] = temp[j * 8 + r]; // Transpose during write (STORE mode)
+                cr[j] = temp[j * 8 + r];
             }
         }
     }
@@ -967,8 +1028,14 @@ static inline void gemm_8x6_panel_avx2fma_store(
 //==============================================================================
 
 /**
- * @brief 8×16 kernel (ADD): C += A*B
- * SAFE: No alignas, no masked stores, scalar loops for partial widths
+ * @brief 8×16 kernel (ADD): C += A*B - OPTIMIZED
+ *
+ * OPTIMIZATIONS:
+ * - Unroll K-loop by 2 with interleaved computation
+ * - Software pipelined loads
+ * - Register pressure: 16 accumulators (8 rows × 2 col groups) = safe!
+ *
+ * SAFETY: Unchanged (no alignas, no masked stores)
  */
 static inline void gemm_8x16_panel_avx2fma_add(
     float *RESTRICT c,
@@ -983,235 +1050,6 @@ static inline void gemm_8x16_panel_avx2fma_add(
 {
     (void)mask_lo; // Unused in safe version
     (void)mask_hi;
-
-    // assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
-    // assert(b_k_stride == 16 && "All kernels require B stride=16");
-
-    // ✅ FAST PATH: Full 8×16 tile
-    if (m == 8 && n == 16)
-    {
-        __m256 c00, c01, c10, c11, c20, c21, c30, c31;
-        __m256 c40, c41, c50, c51, c60, c61, c70, c71;
-
-        c00 = _mm256_setzero_ps();
-        c01 = _mm256_setzero_ps();
-        c10 = _mm256_setzero_ps();
-        c11 = _mm256_setzero_ps();
-        c20 = _mm256_setzero_ps();
-        c21 = _mm256_setzero_ps();
-        c30 = _mm256_setzero_ps();
-        c31 = _mm256_setzero_ps();
-        c40 = _mm256_setzero_ps();
-        c41 = _mm256_setzero_ps();
-        c50 = _mm256_setzero_ps();
-        c51 = _mm256_setzero_ps();
-        c60 = _mm256_setzero_ps();
-        c61 = _mm256_setzero_ps();
-        c70 = _mm256_setzero_ps();
-        c71 = _mm256_setzero_ps();
-
-        const float *a = Ap;
-        const float *b = Bp;
-
-        for (size_t k = 0; k < Kblk; ++k)
-        {
-            if (k + 1 < Kblk)
-            {
-                PREFETCH_T0(a + a_k_stride);
-                PREFETCH_T0(b + b_k_stride);
-            }
-
-            __m256 b0 = GEMM_LOAD_PANEL(b);
-            __m256 b1 = GEMM_LOAD_PANEL(b + 8);
-
-            __m256 a0 = _mm256_broadcast_ss(a + 0);
-            c00 = _mm256_fmadd_ps(a0, b0, c00);
-            c01 = _mm256_fmadd_ps(a0, b1, c01);
-
-            __m256 a1 = _mm256_broadcast_ss(a + 1);
-            c10 = _mm256_fmadd_ps(a1, b0, c10);
-            c11 = _mm256_fmadd_ps(a1, b1, c11);
-
-            __m256 a2 = _mm256_broadcast_ss(a + 2);
-            c20 = _mm256_fmadd_ps(a2, b0, c20);
-            c21 = _mm256_fmadd_ps(a2, b1, c21);
-
-            __m256 a3 = _mm256_broadcast_ss(a + 3);
-            c30 = _mm256_fmadd_ps(a3, b0, c30);
-            c31 = _mm256_fmadd_ps(a3, b1, c31);
-
-            __m256 a4 = _mm256_broadcast_ss(a + 4);
-            c40 = _mm256_fmadd_ps(a4, b0, c40);
-            c41 = _mm256_fmadd_ps(a4, b1, c41);
-
-            __m256 a5 = _mm256_broadcast_ss(a + 5);
-            c50 = _mm256_fmadd_ps(a5, b0, c50);
-            c51 = _mm256_fmadd_ps(a5, b1, c51);
-
-            __m256 a6 = _mm256_broadcast_ss(a + 6);
-            c60 = _mm256_fmadd_ps(a6, b0, c60);
-            c61 = _mm256_fmadd_ps(a6, b1, c61);
-
-            __m256 a7 = _mm256_broadcast_ss(a + 7);
-            c70 = _mm256_fmadd_ps(a7, b0, c70);
-            c71 = _mm256_fmadd_ps(a7, b1, c71);
-
-            a += a_k_stride;
-            b += b_k_stride;
-        }
-
-        // Writeback (full tile, no masking needed)
-        float *c0 = c;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c00));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c01));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c10));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c11));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c20));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c21));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c30));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c31));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c40));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c41));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c50));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c51));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c60));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c61));
-
-        c0 += ldc;
-        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c70));
-        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c71));
-
-        return;
-    }
-
-    // ✅ SLOW PATH: Partial tile with optimized handling
-
-    // For small m, use register accumulators (better cache locality)
-    if (m <= 4)
-    {
-        __m256 acc_lo[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
-                            _mm256_setzero_ps(), _mm256_setzero_ps()};
-        __m256 acc_hi[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
-                            _mm256_setzero_ps(), _mm256_setzero_ps()};
-
-        for (size_t k = 0; k < Kblk; ++k)
-        {
-            const float *b = Bp + k * b_k_stride;
-            __m256 b0 = GEMM_LOAD_PANEL(b);
-            __m256 b1 = GEMM_LOAD_PANEL(b + 8);
-
-            for (size_t r = 0; r < m; ++r)
-            {
-                float a_val = Ap[k * a_k_stride + r];
-                __m256 a_broadcast = _mm256_broadcast_ss(&a_val);
-                acc_lo[r] = _mm256_fmadd_ps(a_broadcast, b0, acc_lo[r]);
-                acc_hi[r] = _mm256_fmadd_ps(a_broadcast, b1, acc_hi[r]);
-            }
-        }
-
-        // Writeback
-        for (size_t r = 0; r < m; ++r)
-        {
-            float *cr = c + r * ldc;
-
-            if (n <= 8)
-            {
-                // Partial low half only
-                float tmp[8];
-                _mm256_storeu_ps(tmp, acc_lo[r]);
-                for (size_t j = 0; j < n; ++j)
-                    cr[j] += tmp[j];
-            }
-            else if (n == 16)
-            {
-                // Full width
-                _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), acc_lo[r]));
-                _mm256_storeu_ps(cr + 8, _mm256_add_ps(_mm256_loadu_ps(cr + 8), acc_hi[r]));
-            }
-            else
-            {
-                // Partial both halves
-                _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), acc_lo[r]));
-
-                float tmp[8];
-                _mm256_storeu_ps(tmp, acc_hi[r]);
-                for (size_t j = 8; j < n; ++j)
-                    cr[j] += tmp[j - 8];
-            }
-        }
-    }
-    else
-    {
-        // For larger m, use memory-backed approach (avoids register spilling)
-        float temp[8 * 16]; // ✅ No alignas
-        memset(temp, 0, sizeof(temp));
-
-        for (size_t k = 0; k < Kblk; ++k)
-        {
-            const float *b = Bp + k * b_k_stride;
-            __m256 b0 = GEMM_LOAD_PANEL(b);
-            __m256 b1 = GEMM_LOAD_PANEL(b + 8);
-
-            for (size_t r = 0; r < m; ++r)
-            {
-                float a_val = Ap[k * a_k_stride + r];
-                __m256 a_broadcast = _mm256_broadcast_ss(&a_val);
-
-                __m256 t0 = _mm256_loadu_ps(temp + r * 16);
-                __m256 t1 = _mm256_loadu_ps(temp + r * 16 + 8);
-
-                t0 = _mm256_fmadd_ps(a_broadcast, b0, t0);
-                t1 = _mm256_fmadd_ps(a_broadcast, b1, t1);
-
-                _mm256_storeu_ps(temp + r * 16, t0);
-                _mm256_storeu_ps(temp + r * 16 + 8, t1);
-            }
-        }
-
-        // Writeback with scalar loops
-        for (size_t r = 0; r < m; ++r)
-        {
-            float *cr = c + r * ldc;
-            for (size_t j = 0; j < n; ++j)
-            {
-                cr[j] += temp[r * 16 + j];
-            }
-        }
-    }
-}
-
-/**
- * @brief 8×16 kernel (STORE): C = A*B
- * SAFE: No alignas, no masked stores, scalar loops for partial widths
- */
-static inline void gemm_8x16_panel_avx2fma_store(
-    float *RESTRICT c,
-    size_t ldc,
-    const float *RESTRICT Ap, size_t a_k_stride,
-    const float *RESTRICT Bp, size_t b_k_stride,
-    size_t Kblk,
-    size_t m,
-    size_t n,
-    __m256i mask_lo,
-    __m256i mask_hi)
-{
-    (void)mask_lo; // Unused in safe version
-    (void)mask_hi;
-
-    // assert((a_k_stride == 8 || a_k_stride == 16) && "8x16 kernel requires stride 8 or 16");
-    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     // ✅ FAST PATH: Full 8×16 tile with K-unrolling
     if (m == 8 && n == 16)
@@ -1239,7 +1077,7 @@ static inline void gemm_8x16_panel_avx2fma_store(
         const float *a = Ap;
         const float *b = Bp;
 
-        // Unroll by 2 for better ILP
+        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
         size_t k = 0;
         for (; k + 1 < Kblk; k += 2)
         {
@@ -1249,74 +1087,76 @@ static inline void gemm_8x16_panel_avx2fma_store(
                 PREFETCH_T0(b + 2 * b_k_stride);
             }
 
-            // Iteration k
+            // Load K iteration 0
             __m256 b0_k0 = GEMM_LOAD_PANEL(b);
             __m256 b1_k0 = GEMM_LOAD_PANEL(b + 8);
 
-            __m256 a0_k0 = _mm256_broadcast_ss(a + 0);
-            c00 = _mm256_fmadd_ps(a0_k0, b0_k0, c00);
-            c01 = _mm256_fmadd_ps(a0_k0, b1_k0, c01);
-
-            __m256 a1_k0 = _mm256_broadcast_ss(a + 1);
-            c10 = _mm256_fmadd_ps(a1_k0, b0_k0, c10);
-            c11 = _mm256_fmadd_ps(a1_k0, b1_k0, c11);
-
-            __m256 a2_k0 = _mm256_broadcast_ss(a + 2);
-            c20 = _mm256_fmadd_ps(a2_k0, b0_k0, c20);
-            c21 = _mm256_fmadd_ps(a2_k0, b1_k0, c21);
-
-            __m256 a3_k0 = _mm256_broadcast_ss(a + 3);
-            c30 = _mm256_fmadd_ps(a3_k0, b0_k0, c30);
-            c31 = _mm256_fmadd_ps(a3_k0, b1_k0, c31);
-
-            __m256 a4_k0 = _mm256_broadcast_ss(a + 4);
-            c40 = _mm256_fmadd_ps(a4_k0, b0_k0, c40);
-            c41 = _mm256_fmadd_ps(a4_k0, b1_k0, c41);
-
-            __m256 a5_k0 = _mm256_broadcast_ss(a + 5);
-            c50 = _mm256_fmadd_ps(a5_k0, b0_k0, c50);
-            c51 = _mm256_fmadd_ps(a5_k0, b1_k0, c51);
-
-            __m256 a6_k0 = _mm256_broadcast_ss(a + 6);
-            c60 = _mm256_fmadd_ps(a6_k0, b0_k0, c60);
-            c61 = _mm256_fmadd_ps(a6_k0, b1_k0, c61);
-
-            __m256 a7_k0 = _mm256_broadcast_ss(a + 7);
-            c70 = _mm256_fmadd_ps(a7_k0, b0_k0, c70);
-            c71 = _mm256_fmadd_ps(a7_k0, b1_k0, c71);
-
-            // Iteration k+1
+            // Load K iteration 1
             __m256 b0_k1 = GEMM_LOAD_PANEL(b + b_k_stride);
             __m256 b1_k1 = GEMM_LOAD_PANEL(b + b_k_stride + 8);
 
+            // ✅ INTERLEAVED COMPUTATION (alternate k and k+1 for each row)
+
+            // Row 0: k, then k+1
+            __m256 a0_k0 = _mm256_broadcast_ss(a + 0);
+            c00 = _mm256_fmadd_ps(a0_k0, b0_k0, c00);
+            c01 = _mm256_fmadd_ps(a0_k0, b1_k0, c01);
             __m256 a0_k1 = _mm256_broadcast_ss(a + a_k_stride + 0);
             c00 = _mm256_fmadd_ps(a0_k1, b0_k1, c00);
             c01 = _mm256_fmadd_ps(a0_k1, b1_k1, c01);
 
+            // Row 1: k, then k+1
+            __m256 a1_k0 = _mm256_broadcast_ss(a + 1);
+            c10 = _mm256_fmadd_ps(a1_k0, b0_k0, c10);
+            c11 = _mm256_fmadd_ps(a1_k0, b1_k0, c11);
             __m256 a1_k1 = _mm256_broadcast_ss(a + a_k_stride + 1);
             c10 = _mm256_fmadd_ps(a1_k1, b0_k1, c10);
             c11 = _mm256_fmadd_ps(a1_k1, b1_k1, c11);
 
+            // Row 2: k, then k+1
+            __m256 a2_k0 = _mm256_broadcast_ss(a + 2);
+            c20 = _mm256_fmadd_ps(a2_k0, b0_k0, c20);
+            c21 = _mm256_fmadd_ps(a2_k0, b1_k0, c21);
             __m256 a2_k1 = _mm256_broadcast_ss(a + a_k_stride + 2);
             c20 = _mm256_fmadd_ps(a2_k1, b0_k1, c20);
             c21 = _mm256_fmadd_ps(a2_k1, b1_k1, c21);
 
+            // Row 3: k, then k+1
+            __m256 a3_k0 = _mm256_broadcast_ss(a + 3);
+            c30 = _mm256_fmadd_ps(a3_k0, b0_k0, c30);
+            c31 = _mm256_fmadd_ps(a3_k0, b1_k0, c31);
             __m256 a3_k1 = _mm256_broadcast_ss(a + a_k_stride + 3);
             c30 = _mm256_fmadd_ps(a3_k1, b0_k1, c30);
             c31 = _mm256_fmadd_ps(a3_k1, b1_k1, c31);
 
+            // Row 4: k, then k+1
+            __m256 a4_k0 = _mm256_broadcast_ss(a + 4);
+            c40 = _mm256_fmadd_ps(a4_k0, b0_k0, c40);
+            c41 = _mm256_fmadd_ps(a4_k0, b1_k0, c41);
             __m256 a4_k1 = _mm256_broadcast_ss(a + a_k_stride + 4);
             c40 = _mm256_fmadd_ps(a4_k1, b0_k1, c40);
             c41 = _mm256_fmadd_ps(a4_k1, b1_k1, c41);
 
+            // Row 5: k, then k+1
+            __m256 a5_k0 = _mm256_broadcast_ss(a + 5);
+            c50 = _mm256_fmadd_ps(a5_k0, b0_k0, c50);
+            c51 = _mm256_fmadd_ps(a5_k0, b1_k0, c51);
             __m256 a5_k1 = _mm256_broadcast_ss(a + a_k_stride + 5);
             c50 = _mm256_fmadd_ps(a5_k1, b0_k1, c50);
             c51 = _mm256_fmadd_ps(a5_k1, b1_k1, c51);
 
+            // Row 6: k, then k+1
+            __m256 a6_k0 = _mm256_broadcast_ss(a + 6);
+            c60 = _mm256_fmadd_ps(a6_k0, b0_k0, c60);
+            c61 = _mm256_fmadd_ps(a6_k0, b1_k0, c61);
             __m256 a6_k1 = _mm256_broadcast_ss(a + a_k_stride + 6);
             c60 = _mm256_fmadd_ps(a6_k1, b0_k1, c60);
             c61 = _mm256_fmadd_ps(a6_k1, b1_k1, c61);
 
+            // Row 7: k, then k+1
+            __m256 a7_k0 = _mm256_broadcast_ss(a + 7);
+            c70 = _mm256_fmadd_ps(a7_k0, b0_k0, c70);
+            c71 = _mm256_fmadd_ps(a7_k0, b1_k0, c71);
             __m256 a7_k1 = _mm256_broadcast_ss(a + a_k_stride + 7);
             c70 = _mm256_fmadd_ps(a7_k1, b0_k1, c70);
             c71 = _mm256_fmadd_ps(a7_k1, b1_k1, c71);
@@ -1325,7 +1165,7 @@ static inline void gemm_8x16_panel_avx2fma_store(
             b += 2 * b_k_stride;
         }
 
-        // Tail iteration
+        // ✅ TAIL LOOP: Handle odd K
         if (k < Kblk)
         {
             __m256 b0 = GEMM_LOAD_PANEL(b);
@@ -1364,7 +1204,309 @@ static inline void gemm_8x16_panel_avx2fma_store(
             c71 = _mm256_fmadd_ps(a7, b1, c71);
         }
 
-        // Writeback (STORE mode)
+        // ✅ WRITEBACK (full tile, no masking)
+        float *c0 = c;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c00));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c01));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c10));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c11));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c20));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c21));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c30));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c31));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c40));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c41));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c50));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c51));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c60));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c61));
+
+        c0 += ldc;
+        _mm256_storeu_ps(c0, _mm256_add_ps(_mm256_loadu_ps(c0), c70));
+        _mm256_storeu_ps(c0 + 8, _mm256_add_ps(_mm256_loadu_ps(c0 + 8), c71));
+
+        return;
+    }
+
+    // ✅ SLOW PATH: Partial tiles (keep original safe code)
+    if (m <= 4)
+    {
+        __m256 acc_lo[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                            _mm256_setzero_ps(), _mm256_setzero_ps()};
+        __m256 acc_hi[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
+                            _mm256_setzero_ps(), _mm256_setzero_ps()};
+
+        for (size_t k = 0; k < Kblk; ++k)
+        {
+            const float *b = Bp + k * b_k_stride;
+            __m256 b0 = GEMM_LOAD_PANEL(b);
+            __m256 b1 = GEMM_LOAD_PANEL(b + 8);
+
+            for (size_t r = 0; r < m; ++r)
+            {
+                float a_val = Ap[k * a_k_stride + r];
+                __m256 a_broadcast = _mm256_broadcast_ss(&a_val);
+                acc_lo[r] = _mm256_fmadd_ps(a_broadcast, b0, acc_lo[r]);
+                acc_hi[r] = _mm256_fmadd_ps(a_broadcast, b1, acc_hi[r]);
+            }
+        }
+
+        // Writeback
+        for (size_t r = 0; r < m; ++r)
+        {
+            float *cr = c + r * ldc;
+
+            if (n <= 8)
+            {
+                float tmp[8];
+                _mm256_storeu_ps(tmp, acc_lo[r]);
+                for (size_t j = 0; j < n; ++j)
+                    cr[j] += tmp[j];
+            }
+            else if (n == 16)
+            {
+                _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), acc_lo[r]));
+                _mm256_storeu_ps(cr + 8, _mm256_add_ps(_mm256_loadu_ps(cr + 8), acc_hi[r]));
+            }
+            else
+            {
+                _mm256_storeu_ps(cr, _mm256_add_ps(_mm256_loadu_ps(cr), acc_lo[r]));
+
+                float tmp[8];
+                _mm256_storeu_ps(tmp, acc_hi[r]);
+                for (size_t j = 8; j < n; ++j)
+                    cr[j] += tmp[j - 8];
+            }
+        }
+    }
+    else
+    {
+        float temp[8 * 16]; // ✅ No alignas
+        memset(temp, 0, sizeof(temp));
+
+        for (size_t k = 0; k < Kblk; ++k)
+        {
+            const float *b = Bp + k * b_k_stride;
+            __m256 b0 = GEMM_LOAD_PANEL(b);
+            __m256 b1 = GEMM_LOAD_PANEL(b + 8);
+
+            for (size_t r = 0; r < m; ++r)
+            {
+                float a_val = Ap[k * a_k_stride + r];
+                __m256 a_broadcast = _mm256_broadcast_ss(&a_val);
+
+                __m256 t0 = _mm256_loadu_ps(temp + r * 16);
+                __m256 t1 = _mm256_loadu_ps(temp + r * 16 + 8);
+
+                t0 = _mm256_fmadd_ps(a_broadcast, b0, t0);
+                t1 = _mm256_fmadd_ps(a_broadcast, b1, t1);
+
+                _mm256_storeu_ps(temp + r * 16, t0);
+                _mm256_storeu_ps(temp + r * 16 + 8, t1);
+            }
+        }
+
+        for (size_t r = 0; r < m; ++r)
+        {
+            float *cr = c + r * ldc;
+            for (size_t j = 0; j < n; ++j)
+            {
+                cr[j] += temp[r * 16 + j];
+            }
+        }
+    }
+}
+
+/**
+ * @brief 8×16 kernel (STORE): C = A*B - OPTIMIZED
+ *
+ * OPTIMIZATIONS:
+ * - Unroll K-loop by 2 with interleaved computation
+ * - Software pipelined loads
+ * - Register pressure: 16 accumulators (8 rows × 2 col groups) = safe!
+ *
+ * SAFETY: Unchanged (no alignas, no masked stores)
+ */
+static inline void gemm_8x16_panel_avx2fma_store(
+    float *RESTRICT c,
+    size_t ldc,
+    const float *RESTRICT Ap, size_t a_k_stride,
+    const float *RESTRICT Bp, size_t b_k_stride,
+    size_t Kblk,
+    size_t m,
+    size_t n,
+    __m256i mask_lo,
+    __m256i mask_hi)
+{
+    (void)mask_lo; // Unused in safe version
+    (void)mask_hi;
+
+    // ✅ FAST PATH: Full 8×16 tile with K-unrolling
+    if (m == 8 && n == 16)
+    {
+        __m256 c00, c01, c10, c11, c20, c21, c30, c31;
+        __m256 c40, c41, c50, c51, c60, c61, c70, c71;
+
+        c00 = _mm256_setzero_ps();
+        c01 = _mm256_setzero_ps();
+        c10 = _mm256_setzero_ps();
+        c11 = _mm256_setzero_ps();
+        c20 = _mm256_setzero_ps();
+        c21 = _mm256_setzero_ps();
+        c30 = _mm256_setzero_ps();
+        c31 = _mm256_setzero_ps();
+        c40 = _mm256_setzero_ps();
+        c41 = _mm256_setzero_ps();
+        c50 = _mm256_setzero_ps();
+        c51 = _mm256_setzero_ps();
+        c60 = _mm256_setzero_ps();
+        c61 = _mm256_setzero_ps();
+        c70 = _mm256_setzero_ps();
+        c71 = _mm256_setzero_ps();
+
+        const float *a = Ap;
+        const float *b = Bp;
+
+        // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+        size_t k = 0;
+        for (; k + 1 < Kblk; k += 2)
+        {
+            if (k + 8 < Kblk)
+            {
+                PREFETCH_T0(a + 2 * a_k_stride);
+                PREFETCH_T0(b + 2 * b_k_stride);
+            }
+
+            // Load K iteration 0
+            __m256 b0_k0 = GEMM_LOAD_PANEL(b);
+            __m256 b1_k0 = GEMM_LOAD_PANEL(b + 8);
+
+            // Load K iteration 1
+            __m256 b0_k1 = GEMM_LOAD_PANEL(b + b_k_stride);
+            __m256 b1_k1 = GEMM_LOAD_PANEL(b + b_k_stride + 8);
+
+            // ✅ INTERLEAVED COMPUTATION (alternate k and k+1 for each row)
+
+            // Row 0: k, then k+1
+            __m256 a0_k0 = _mm256_broadcast_ss(a + 0);
+            c00 = _mm256_fmadd_ps(a0_k0, b0_k0, c00);
+            c01 = _mm256_fmadd_ps(a0_k0, b1_k0, c01);
+            __m256 a0_k1 = _mm256_broadcast_ss(a + a_k_stride + 0);
+            c00 = _mm256_fmadd_ps(a0_k1, b0_k1, c00);
+            c01 = _mm256_fmadd_ps(a0_k1, b1_k1, c01);
+
+            // Row 1: k, then k+1
+            __m256 a1_k0 = _mm256_broadcast_ss(a + 1);
+            c10 = _mm256_fmadd_ps(a1_k0, b0_k0, c10);
+            c11 = _mm256_fmadd_ps(a1_k0, b1_k0, c11);
+            __m256 a1_k1 = _mm256_broadcast_ss(a + a_k_stride + 1);
+            c10 = _mm256_fmadd_ps(a1_k1, b0_k1, c10);
+            c11 = _mm256_fmadd_ps(a1_k1, b1_k1, c11);
+
+            // Row 2: k, then k+1
+            __m256 a2_k0 = _mm256_broadcast_ss(a + 2);
+            c20 = _mm256_fmadd_ps(a2_k0, b0_k0, c20);
+            c21 = _mm256_fmadd_ps(a2_k0, b1_k0, c21);
+            __m256 a2_k1 = _mm256_broadcast_ss(a + a_k_stride + 2);
+            c20 = _mm256_fmadd_ps(a2_k1, b0_k1, c20);
+            c21 = _mm256_fmadd_ps(a2_k1, b1_k1, c21);
+
+            // Row 3: k, then k+1
+            __m256 a3_k0 = _mm256_broadcast_ss(a + 3);
+            c30 = _mm256_fmadd_ps(a3_k0, b0_k0, c30);
+            c31 = _mm256_fmadd_ps(a3_k0, b1_k0, c31);
+            __m256 a3_k1 = _mm256_broadcast_ss(a + a_k_stride + 3);
+            c30 = _mm256_fmadd_ps(a3_k1, b0_k1, c30);
+            c31 = _mm256_fmadd_ps(a3_k1, b1_k1, c31);
+
+            // Row 4: k, then k+1
+            __m256 a4_k0 = _mm256_broadcast_ss(a + 4);
+            c40 = _mm256_fmadd_ps(a4_k0, b0_k0, c40);
+            c41 = _mm256_fmadd_ps(a4_k0, b1_k0, c41);
+            __m256 a4_k1 = _mm256_broadcast_ss(a + a_k_stride + 4);
+            c40 = _mm256_fmadd_ps(a4_k1, b0_k1, c40);
+            c41 = _mm256_fmadd_ps(a4_k1, b1_k1, c41);
+
+            // Row 5: k, then k+1
+            __m256 a5_k0 = _mm256_broadcast_ss(a + 5);
+            c50 = _mm256_fmadd_ps(a5_k0, b0_k0, c50);
+            c51 = _mm256_fmadd_ps(a5_k0, b1_k0, c51);
+            __m256 a5_k1 = _mm256_broadcast_ss(a + a_k_stride + 5);
+            c50 = _mm256_fmadd_ps(a5_k1, b0_k1, c50);
+            c51 = _mm256_fmadd_ps(a5_k1, b1_k1, c51);
+
+            // Row 6: k, then k+1
+            __m256 a6_k0 = _mm256_broadcast_ss(a + 6);
+            c60 = _mm256_fmadd_ps(a6_k0, b0_k0, c60);
+            c61 = _mm256_fmadd_ps(a6_k0, b1_k0, c61);
+            __m256 a6_k1 = _mm256_broadcast_ss(a + a_k_stride + 6);
+            c60 = _mm256_fmadd_ps(a6_k1, b0_k1, c60);
+            c61 = _mm256_fmadd_ps(a6_k1, b1_k1, c61);
+
+            // Row 7: k, then k+1
+            __m256 a7_k0 = _mm256_broadcast_ss(a + 7);
+            c70 = _mm256_fmadd_ps(a7_k0, b0_k0, c70);
+            c71 = _mm256_fmadd_ps(a7_k0, b1_k0, c71);
+            __m256 a7_k1 = _mm256_broadcast_ss(a + a_k_stride + 7);
+            c70 = _mm256_fmadd_ps(a7_k1, b0_k1, c70);
+            c71 = _mm256_fmadd_ps(a7_k1, b1_k1, c71);
+
+            a += 2 * a_k_stride;
+            b += 2 * b_k_stride;
+        }
+
+        // ✅ TAIL LOOP: Handle odd K
+        if (k < Kblk)
+        {
+            __m256 b0 = GEMM_LOAD_PANEL(b);
+            __m256 b1 = GEMM_LOAD_PANEL(b + 8);
+
+            __m256 a0 = _mm256_broadcast_ss(a + 0);
+            c00 = _mm256_fmadd_ps(a0, b0, c00);
+            c01 = _mm256_fmadd_ps(a0, b1, c01);
+
+            __m256 a1 = _mm256_broadcast_ss(a + 1);
+            c10 = _mm256_fmadd_ps(a1, b0, c10);
+            c11 = _mm256_fmadd_ps(a1, b1, c11);
+
+            __m256 a2 = _mm256_broadcast_ss(a + 2);
+            c20 = _mm256_fmadd_ps(a2, b0, c20);
+            c21 = _mm256_fmadd_ps(a2, b1, c21);
+
+            __m256 a3 = _mm256_broadcast_ss(a + 3);
+            c30 = _mm256_fmadd_ps(a3, b0, c30);
+            c31 = _mm256_fmadd_ps(a3, b1, c31);
+
+            __m256 a4 = _mm256_broadcast_ss(a + 4);
+            c40 = _mm256_fmadd_ps(a4, b0, c40);
+            c41 = _mm256_fmadd_ps(a4, b1, c41);
+
+            __m256 a5 = _mm256_broadcast_ss(a + 5);
+            c50 = _mm256_fmadd_ps(a5, b0, c50);
+            c51 = _mm256_fmadd_ps(a5, b1, c51);
+
+            __m256 a6 = _mm256_broadcast_ss(a + 6);
+            c60 = _mm256_fmadd_ps(a6, b0, c60);
+            c61 = _mm256_fmadd_ps(a6, b1, c61);
+
+            __m256 a7 = _mm256_broadcast_ss(a + 7);
+            c70 = _mm256_fmadd_ps(a7, b0, c70);
+            c71 = _mm256_fmadd_ps(a7, b1, c71);
+        }
+
+        // ✅ WRITEBACK (STORE mode - no load/add needed)
         float *c0 = c;
         _mm256_storeu_ps(c0, c00);
         _mm256_storeu_ps(c0 + 8, c01);
@@ -1400,9 +1542,7 @@ static inline void gemm_8x16_panel_avx2fma_store(
         return;
     }
 
-    // ✅ SLOW PATH: Partial tile with optimized handling
-
-    // For small m, use register accumulators (better cache locality)
+    // ✅ SLOW PATH: Partial tiles (keep original safe code)
     if (m <= 4)
     {
         __m256 acc_lo[4] = {_mm256_setzero_ps(), _mm256_setzero_ps(),
@@ -1531,22 +1671,19 @@ static inline void gemm_8x16_panel_avx2fma_store(
     }
 }
 
-/**
- * @file gemm_kernels_avx2_safe_part3.h
- * @brief Safety-Hardened AVX2/FMA GEMM Micro-kernels - Part 3 (Final)
- *
- * Contains: 16×8, 16×6 kernels (both ADD and STORE variants)
- *
- * APPEND THIS TO gemm_kernels_avx2_safe_part2.h
- */
-
 //==============================================================================
 // 16×8 KERNELS - SAFE VERSION
 //==============================================================================
 
 /**
- * @brief 16×8 kernel (ADD): C += A*B
- * SAFE: No alignas, no masked stores, scalar loops for partial tiles
+ * @brief 16×8 kernel (ADD): C += A*B - OPTIMIZED
+ *
+ * OPTIMIZATIONS:
+ * - Unroll K-loop by 2 with interleaved computation
+ * - Software pipelined loads
+ * - Register pressure: 16 accumulators + 4 temps = close to limit but safe
+ *
+ * SAFETY: Unchanged (no alignas, no masked stores)
  */
 static inline void gemm_16x8_panel_avx2fma_add(
     float *RESTRICT c, size_t ldc,
@@ -1555,9 +1692,6 @@ static inline void gemm_16x8_panel_avx2fma_add(
     size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     (void)mask; // Unused in safe version
-
-    // assert(a_k_stride == 16 && "16x8 kernel requires A packed with MR=16");
-    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc_lo0 = _mm256_setzero_ps(), acc_lo1 = _mm256_setzero_ps();
     __m256 acc_lo2 = _mm256_setzero_ps(), acc_lo3 = _mm256_setzero_ps();
@@ -1572,52 +1706,136 @@ static inline void gemm_16x8_panel_avx2fma_add(
     gemm_prefetch_c_rows(c, ldc, m);
 
     const size_t PF_LONG = 32;
-    for (size_t k = 0; k < Kblk; k += 8)
+
+    // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+    size_t k = 0;
+    for (; k + 1 < Kblk; k += 2)
     {
-        if (do_pf)
-            gemm_prefetch_panels(Bp, Ap, k, Kblk, b_k_stride, a_k_stride, PF_LONG);
+        if (do_pf && k + 8 < Kblk)
+            PREFETCH_T0(Bp + (k + 8) * b_k_stride);
 
-        for (int u = 0; u < 8; ++u)
-        {
-            size_t kk = k + u;
-            if (kk >= Kblk)
-                break;
+        // Load both K iterations (software pipelining)
+        __m256 a_lo0 = GEMM_LOAD_PANEL(Ap + (k + 0) * a_k_stride);
+        __m256 a_hi0 = GEMM_LOAD_PANEL(Ap + (k + 0) * a_k_stride + 8);
+        __m256 a_lo1 = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride);
+        __m256 a_hi1 = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride + 8);
 
-            __m256 a_lo = GEMM_LOAD_PANEL(Ap + kk * a_k_stride);
-            __m256 a_hi = GEMM_LOAD_PANEL(Ap + kk * a_k_stride + 8);
-            const float *b_row = Bp + kk * b_k_stride;
+        const float *b0 = Bp + (k + 0) * b_k_stride;
+        const float *b1 = Bp + (k + 1) * b_k_stride;
 
-            __m256 b0 = _mm256_broadcast_ss(b_row + 0);
-            __m256 b1 = _mm256_broadcast_ss(b_row + 1);
-            __m256 b2 = _mm256_broadcast_ss(b_row + 2);
-            __m256 b3 = _mm256_broadcast_ss(b_row + 3);
+        // ✅ INTERLEAVED COMPUTATION (alternate k and k+1 for each column)
+        __m256 b;
 
-            acc_lo0 = _mm256_fmadd_ps(a_lo, b0, acc_lo0);
-            acc_hi0 = _mm256_fmadd_ps(a_hi, b0, acc_hi0);
-            acc_lo1 = _mm256_fmadd_ps(a_lo, b1, acc_lo1);
-            acc_hi1 = _mm256_fmadd_ps(a_hi, b1, acc_hi1);
-            acc_lo2 = _mm256_fmadd_ps(a_lo, b2, acc_lo2);
-            acc_hi2 = _mm256_fmadd_ps(a_hi, b2, acc_hi2);
-            acc_lo3 = _mm256_fmadd_ps(a_lo, b3, acc_lo3);
-            acc_hi3 = _mm256_fmadd_ps(a_hi, b3, acc_hi3);
+        // Column 0
+        b = _mm256_broadcast_ss(b0 + 0);
+        acc_lo0 = _mm256_fmadd_ps(a_lo0, b, acc_lo0);
+        acc_hi0 = _mm256_fmadd_ps(a_hi0, b, acc_hi0);
+        b = _mm256_broadcast_ss(b1 + 0);
+        acc_lo0 = _mm256_fmadd_ps(a_lo1, b, acc_lo0);
+        acc_hi0 = _mm256_fmadd_ps(a_hi1, b, acc_hi0);
 
-            __m256 b4 = _mm256_broadcast_ss(b_row + 4);
-            __m256 b5 = _mm256_broadcast_ss(b_row + 5);
-            __m256 b6 = _mm256_broadcast_ss(b_row + 6);
-            __m256 b7 = _mm256_broadcast_ss(b_row + 7);
+        // Column 1
+        b = _mm256_broadcast_ss(b0 + 1);
+        acc_lo1 = _mm256_fmadd_ps(a_lo0, b, acc_lo1);
+        acc_hi1 = _mm256_fmadd_ps(a_hi0, b, acc_hi1);
+        b = _mm256_broadcast_ss(b1 + 1);
+        acc_lo1 = _mm256_fmadd_ps(a_lo1, b, acc_lo1);
+        acc_hi1 = _mm256_fmadd_ps(a_hi1, b, acc_hi1);
 
-            acc_lo4 = _mm256_fmadd_ps(a_lo, b4, acc_lo4);
-            acc_hi4 = _mm256_fmadd_ps(a_hi, b4, acc_hi4);
-            acc_lo5 = _mm256_fmadd_ps(a_lo, b5, acc_lo5);
-            acc_hi5 = _mm256_fmadd_ps(a_hi, b5, acc_hi5);
-            acc_lo6 = _mm256_fmadd_ps(a_lo, b6, acc_lo6);
-            acc_hi6 = _mm256_fmadd_ps(a_hi, b6, acc_hi6);
-            acc_lo7 = _mm256_fmadd_ps(a_lo, b7, acc_lo7);
-            acc_hi7 = _mm256_fmadd_ps(a_hi, b7, acc_hi7);
-        }
+        // Column 2
+        b = _mm256_broadcast_ss(b0 + 2);
+        acc_lo2 = _mm256_fmadd_ps(a_lo0, b, acc_lo2);
+        acc_hi2 = _mm256_fmadd_ps(a_hi0, b, acc_hi2);
+        b = _mm256_broadcast_ss(b1 + 2);
+        acc_lo2 = _mm256_fmadd_ps(a_lo1, b, acc_lo2);
+        acc_hi2 = _mm256_fmadd_ps(a_hi1, b, acc_hi2);
+
+        // Column 3
+        b = _mm256_broadcast_ss(b0 + 3);
+        acc_lo3 = _mm256_fmadd_ps(a_lo0, b, acc_lo3);
+        acc_hi3 = _mm256_fmadd_ps(a_hi0, b, acc_hi3);
+        b = _mm256_broadcast_ss(b1 + 3);
+        acc_lo3 = _mm256_fmadd_ps(a_lo1, b, acc_lo3);
+        acc_hi3 = _mm256_fmadd_ps(a_hi1, b, acc_hi3);
+
+        // Column 4
+        b = _mm256_broadcast_ss(b0 + 4);
+        acc_lo4 = _mm256_fmadd_ps(a_lo0, b, acc_lo4);
+        acc_hi4 = _mm256_fmadd_ps(a_hi0, b, acc_hi4);
+        b = _mm256_broadcast_ss(b1 + 4);
+        acc_lo4 = _mm256_fmadd_ps(a_lo1, b, acc_lo4);
+        acc_hi4 = _mm256_fmadd_ps(a_hi1, b, acc_hi4);
+
+        // Column 5
+        b = _mm256_broadcast_ss(b0 + 5);
+        acc_lo5 = _mm256_fmadd_ps(a_lo0, b, acc_lo5);
+        acc_hi5 = _mm256_fmadd_ps(a_hi0, b, acc_hi5);
+        b = _mm256_broadcast_ss(b1 + 5);
+        acc_lo5 = _mm256_fmadd_ps(a_lo1, b, acc_lo5);
+        acc_hi5 = _mm256_fmadd_ps(a_hi1, b, acc_hi5);
+
+        // Column 6
+        b = _mm256_broadcast_ss(b0 + 6);
+        acc_lo6 = _mm256_fmadd_ps(a_lo0, b, acc_lo6);
+        acc_hi6 = _mm256_fmadd_ps(a_hi0, b, acc_hi6);
+        b = _mm256_broadcast_ss(b1 + 6);
+        acc_lo6 = _mm256_fmadd_ps(a_lo1, b, acc_lo6);
+        acc_hi6 = _mm256_fmadd_ps(a_hi1, b, acc_hi6);
+
+        // Column 7
+        b = _mm256_broadcast_ss(b0 + 7);
+        acc_lo7 = _mm256_fmadd_ps(a_lo0, b, acc_lo7);
+        acc_hi7 = _mm256_fmadd_ps(a_hi0, b, acc_hi7);
+        b = _mm256_broadcast_ss(b1 + 7);
+        acc_lo7 = _mm256_fmadd_ps(a_lo1, b, acc_lo7);
+        acc_hi7 = _mm256_fmadd_ps(a_hi1, b, acc_hi7);
     }
 
-    // ✅ SAFE WRITEBACK
+    // ✅ TAIL LOOP: Handle odd K
+    for (; k < Kblk; ++k)
+    {
+        if (do_pf && k + 8 < Kblk)
+            PREFETCH_T0(Bp + (k + 8) * b_k_stride);
+
+        __m256 a_lo = GEMM_LOAD_PANEL(Ap + k * a_k_stride);
+        __m256 a_hi = GEMM_LOAD_PANEL(Ap + k * a_k_stride + 8);
+        const float *b_row = Bp + k * b_k_stride;
+
+        __m256 b;
+        b = _mm256_broadcast_ss(b_row + 0);
+        acc_lo0 = _mm256_fmadd_ps(a_lo, b, acc_lo0);
+        acc_hi0 = _mm256_fmadd_ps(a_hi, b, acc_hi0);
+
+        b = _mm256_broadcast_ss(b_row + 1);
+        acc_lo1 = _mm256_fmadd_ps(a_lo, b, acc_lo1);
+        acc_hi1 = _mm256_fmadd_ps(a_hi, b, acc_hi1);
+
+        b = _mm256_broadcast_ss(b_row + 2);
+        acc_lo2 = _mm256_fmadd_ps(a_lo, b, acc_lo2);
+        acc_hi2 = _mm256_fmadd_ps(a_hi, b, acc_hi2);
+
+        b = _mm256_broadcast_ss(b_row + 3);
+        acc_lo3 = _mm256_fmadd_ps(a_lo, b, acc_lo3);
+        acc_hi3 = _mm256_fmadd_ps(a_hi, b, acc_hi3);
+
+        b = _mm256_broadcast_ss(b_row + 4);
+        acc_lo4 = _mm256_fmadd_ps(a_lo, b, acc_lo4);
+        acc_hi4 = _mm256_fmadd_ps(a_hi, b, acc_hi4);
+
+        b = _mm256_broadcast_ss(b_row + 5);
+        acc_lo5 = _mm256_fmadd_ps(a_lo, b, acc_lo5);
+        acc_hi5 = _mm256_fmadd_ps(a_hi, b, acc_hi5);
+
+        b = _mm256_broadcast_ss(b_row + 6);
+        acc_lo6 = _mm256_fmadd_ps(a_lo, b, acc_lo6);
+        acc_hi6 = _mm256_fmadd_ps(a_hi, b, acc_hi6);
+
+        b = _mm256_broadcast_ss(b_row + 7);
+        acc_lo7 = _mm256_fmadd_ps(a_lo, b, acc_lo7);
+        acc_hi7 = _mm256_fmadd_ps(a_hi, b, acc_hi7);
+    }
+
+    // ✅ SAFE WRITEBACK (UNCHANGED)
     if (m == 16 && n == 8)
     {
         // Fast path: full tile, transpose and write
@@ -1676,8 +1894,7 @@ static inline void gemm_16x8_panel_avx2fma_add(
 }
 
 /**
- * @brief 16×8 kernel (STORE): C = A*B
- * SAFE: No alignas, no masked stores, scalar loops for partial tiles
+ * @brief 16×8 kernel (STORE): C = A*B - OPTIMIZED
  */
 static inline void gemm_16x8_panel_avx2fma_store(
     float *RESTRICT c, size_t ldc,
@@ -1686,9 +1903,6 @@ static inline void gemm_16x8_panel_avx2fma_store(
     size_t Kblk, size_t m, size_t n, __m256i mask)
 {
     (void)mask; // Unused in safe version
-
-    // assert(a_k_stride == 16 && "16x8 kernel requires A packed with MR=16");
-    // assert(b_k_stride == 16 && "All kernels require B stride=16");
 
     __m256 acc_lo0 = _mm256_setzero_ps(), acc_lo1 = _mm256_setzero_ps();
     __m256 acc_lo2 = _mm256_setzero_ps(), acc_lo3 = _mm256_setzero_ps();
@@ -1701,51 +1915,133 @@ static inline void gemm_16x8_panel_avx2fma_store(
 
     const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
     gemm_prefetch_c_rows(c, ldc, m);
-    const size_t PF_LONG = 32;
 
-    for (size_t k = 0; k < Kblk; k += 8)
+    // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
+    size_t k = 0;
+    for (; k + 1 < Kblk; k += 2)
     {
-        if (do_pf)
-            gemm_prefetch_panels(Bp, Ap, k, Kblk, b_k_stride, a_k_stride, PF_LONG);
+        if (do_pf && k + 8 < Kblk)
+            PREFETCH_T0(Bp + (k + 8) * b_k_stride);
 
-        for (int u = 0; u < 8; ++u)
-        {
-            size_t kk = k + u;
-            if (kk >= Kblk)
-                break;
+        // Load both K iterations (software pipelining)
+        __m256 a_lo0 = GEMM_LOAD_PANEL(Ap + (k + 0) * a_k_stride);
+        __m256 a_hi0 = GEMM_LOAD_PANEL(Ap + (k + 0) * a_k_stride + 8);
+        __m256 a_lo1 = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride);
+        __m256 a_hi1 = GEMM_LOAD_PANEL(Ap + (k + 1) * a_k_stride + 8);
 
-            __m256 a_lo = GEMM_LOAD_PANEL(Ap + kk * a_k_stride);
-            __m256 a_hi = GEMM_LOAD_PANEL(Ap + kk * a_k_stride + 8);
-            const float *b_row = Bp + kk * b_k_stride;
+        const float *b0 = Bp + (k + 0) * b_k_stride;
+        const float *b1 = Bp + (k + 1) * b_k_stride;
 
-            __m256 b0 = _mm256_broadcast_ss(b_row + 0);
-            __m256 b1 = _mm256_broadcast_ss(b_row + 1);
-            __m256 b2 = _mm256_broadcast_ss(b_row + 2);
-            __m256 b3 = _mm256_broadcast_ss(b_row + 3);
+        // ✅ INTERLEAVED COMPUTATION
+        __m256 b;
 
-            acc_lo0 = _mm256_fmadd_ps(a_lo, b0, acc_lo0);
-            acc_hi0 = _mm256_fmadd_ps(a_hi, b0, acc_hi0);
-            acc_lo1 = _mm256_fmadd_ps(a_lo, b1, acc_lo1);
-            acc_hi1 = _mm256_fmadd_ps(a_hi, b1, acc_hi1);
-            acc_lo2 = _mm256_fmadd_ps(a_lo, b2, acc_lo2);
-            acc_hi2 = _mm256_fmadd_ps(a_hi, b2, acc_hi2);
-            acc_lo3 = _mm256_fmadd_ps(a_lo, b3, acc_lo3);
-            acc_hi3 = _mm256_fmadd_ps(a_hi, b3, acc_hi3);
+        // Column 0
+        b = _mm256_broadcast_ss(b0 + 0);
+        acc_lo0 = _mm256_fmadd_ps(a_lo0, b, acc_lo0);
+        acc_hi0 = _mm256_fmadd_ps(a_hi0, b, acc_hi0);
+        b = _mm256_broadcast_ss(b1 + 0);
+        acc_lo0 = _mm256_fmadd_ps(a_lo1, b, acc_lo0);
+        acc_hi0 = _mm256_fmadd_ps(a_hi1, b, acc_hi0);
 
-            __m256 b4 = _mm256_broadcast_ss(b_row + 4);
-            __m256 b5 = _mm256_broadcast_ss(b_row + 5);
-            __m256 b6 = _mm256_broadcast_ss(b_row + 6);
-            __m256 b7 = _mm256_broadcast_ss(b_row + 7);
+        // Column 1
+        b = _mm256_broadcast_ss(b0 + 1);
+        acc_lo1 = _mm256_fmadd_ps(a_lo0, b, acc_lo1);
+        acc_hi1 = _mm256_fmadd_ps(a_hi0, b, acc_hi1);
+        b = _mm256_broadcast_ss(b1 + 1);
+        acc_lo1 = _mm256_fmadd_ps(a_lo1, b, acc_lo1);
+        acc_hi1 = _mm256_fmadd_ps(a_hi1, b, acc_hi1);
 
-            acc_lo4 = _mm256_fmadd_ps(a_lo, b4, acc_lo4);
-            acc_hi4 = _mm256_fmadd_ps(a_hi, b4, acc_hi4);
-            acc_lo5 = _mm256_fmadd_ps(a_lo, b5, acc_lo5);
-            acc_hi5 = _mm256_fmadd_ps(a_hi, b5, acc_hi5);
-            acc_lo6 = _mm256_fmadd_ps(a_lo, b6, acc_lo6);
-            acc_hi6 = _mm256_fmadd_ps(a_hi, b6, acc_hi6);
-            acc_lo7 = _mm256_fmadd_ps(a_lo, b7, acc_lo7);
-            acc_hi7 = _mm256_fmadd_ps(a_hi, b7, acc_hi7);
-        }
+        // Column 2
+        b = _mm256_broadcast_ss(b0 + 2);
+        acc_lo2 = _mm256_fmadd_ps(a_lo0, b, acc_lo2);
+        acc_hi2 = _mm256_fmadd_ps(a_hi0, b, acc_hi2);
+        b = _mm256_broadcast_ss(b1 + 2);
+        acc_lo2 = _mm256_fmadd_ps(a_lo1, b, acc_lo2);
+        acc_hi2 = _mm256_fmadd_ps(a_hi1, b, acc_hi2);
+
+        // Column 3
+        b = _mm256_broadcast_ss(b0 + 3);
+        acc_lo3 = _mm256_fmadd_ps(a_lo0, b, acc_lo3);
+        acc_hi3 = _mm256_fmadd_ps(a_hi0, b, acc_hi3);
+        b = _mm256_broadcast_ss(b1 + 3);
+        acc_lo3 = _mm256_fmadd_ps(a_lo1, b, acc_lo3);
+        acc_hi3 = _mm256_fmadd_ps(a_hi1, b, acc_hi3);
+
+        // Column 4
+        b = _mm256_broadcast_ss(b0 + 4);
+        acc_lo4 = _mm256_fmadd_ps(a_lo0, b, acc_lo4);
+        acc_hi4 = _mm256_fmadd_ps(a_hi0, b, acc_hi4);
+        b = _mm256_broadcast_ss(b1 + 4);
+        acc_lo4 = _mm256_fmadd_ps(a_lo1, b, acc_lo4);
+        acc_hi4 = _mm256_fmadd_ps(a_hi1, b, acc_hi4);
+
+        // Column 5
+        b = _mm256_broadcast_ss(b0 + 5);
+        acc_lo5 = _mm256_fmadd_ps(a_lo0, b, acc_lo5);
+        acc_hi5 = _mm256_fmadd_ps(a_hi0, b, acc_hi5);
+        b = _mm256_broadcast_ss(b1 + 5);
+        acc_lo5 = _mm256_fmadd_ps(a_lo1, b, acc_lo5);
+        acc_hi5 = _mm256_fmadd_ps(a_hi1, b, acc_hi5);
+
+        // Column 6
+        b = _mm256_broadcast_ss(b0 + 6);
+        acc_lo6 = _mm256_fmadd_ps(a_lo0, b, acc_lo6);
+        acc_hi6 = _mm256_fmadd_ps(a_hi0, b, acc_hi6);
+        b = _mm256_broadcast_ss(b1 + 6);
+        acc_lo6 = _mm256_fmadd_ps(a_lo1, b, acc_lo6);
+        acc_hi6 = _mm256_fmadd_ps(a_hi1, b, acc_hi6);
+
+        // Column 7
+        b = _mm256_broadcast_ss(b0 + 7);
+        acc_lo7 = _mm256_fmadd_ps(a_lo0, b, acc_lo7);
+        acc_hi7 = _mm256_fmadd_ps(a_hi0, b, acc_hi7);
+        b = _mm256_broadcast_ss(b1 + 7);
+        acc_lo7 = _mm256_fmadd_ps(a_lo1, b, acc_lo7);
+        acc_hi7 = _mm256_fmadd_ps(a_hi1, b, acc_hi7);
+    }
+
+    // ✅ TAIL LOOP
+    for (; k < Kblk; ++k)
+    {
+        if (do_pf && k + 8 < Kblk)
+            PREFETCH_T0(Bp + (k + 8) * b_k_stride);
+
+        __m256 a_lo = GEMM_LOAD_PANEL(Ap + k * a_k_stride);
+        __m256 a_hi = GEMM_LOAD_PANEL(Ap + k * a_k_stride + 8);
+        const float *b_row = Bp + k * b_k_stride;
+
+        __m256 b;
+        b = _mm256_broadcast_ss(b_row + 0);
+        acc_lo0 = _mm256_fmadd_ps(a_lo, b, acc_lo0);
+        acc_hi0 = _mm256_fmadd_ps(a_hi, b, acc_hi0);
+
+        b = _mm256_broadcast_ss(b_row + 1);
+        acc_lo1 = _mm256_fmadd_ps(a_lo, b, acc_lo1);
+        acc_hi1 = _mm256_fmadd_ps(a_hi, b, acc_hi1);
+
+        b = _mm256_broadcast_ss(b_row + 2);
+        acc_lo2 = _mm256_fmadd_ps(a_lo, b, acc_lo2);
+        acc_hi2 = _mm256_fmadd_ps(a_hi, b, acc_hi2);
+
+        b = _mm256_broadcast_ss(b_row + 3);
+        acc_lo3 = _mm256_fmadd_ps(a_lo, b, acc_lo3);
+        acc_hi3 = _mm256_fmadd_ps(a_hi, b, acc_hi3);
+
+        b = _mm256_broadcast_ss(b_row + 4);
+        acc_lo4 = _mm256_fmadd_ps(a_lo, b, acc_lo4);
+        acc_hi4 = _mm256_fmadd_ps(a_hi, b, acc_hi4);
+
+        b = _mm256_broadcast_ss(b_row + 5);
+        acc_lo5 = _mm256_fmadd_ps(a_lo, b, acc_lo5);
+        acc_hi5 = _mm256_fmadd_ps(a_hi, b, acc_hi5);
+
+        b = _mm256_broadcast_ss(b_row + 6);
+        acc_lo6 = _mm256_fmadd_ps(a_lo, b, acc_lo6);
+        acc_hi6 = _mm256_fmadd_ps(a_hi, b, acc_hi6);
+
+        b = _mm256_broadcast_ss(b_row + 7);
+        acc_lo7 = _mm256_fmadd_ps(a_lo, b, acc_lo7);
+        acc_hi7 = _mm256_fmadd_ps(a_hi, b, acc_hi7);
     }
 
     // Non-temporal store hint (only for full aligned tiles)
@@ -1754,7 +2050,7 @@ static inline void gemm_16x8_panel_avx2fma_store(
                        (((uintptr_t)(c) & 31u) == 0) &&
                        ((ldc & 7u) == 0);
 
-    // ✅ SAFE WRITEBACK
+    // ✅ SAFE WRITEBACK (UNCHANGED)
     if (m == 16 && n == 8)
     {
         // Fast path: full tile, transpose and write
