@@ -32,6 +32,41 @@ static void build_T_matrix(const float *Y, const float *tau, float *T,
 
 #define GEMM_CALL gemm_dynamic
 
+// Simple reference GEMM that handles row-major layout correctly
+// C = alpha * A * B + beta * C
+// A is m×k, B is k×n, C is m×n, all row-major with tight packing
+static int gemm_reference(float *C, const float *A, const float *B,
+                          size_t m, size_t k, size_t n,
+                          float alpha, float beta)
+{
+    // First scale C by beta
+    if (beta == 0.0f) {
+        memset(C, 0, m * n * sizeof(float));
+    } else if (beta != 1.0f) {
+        for (size_t i = 0; i < m * n; i++) {
+            C[i] *= beta;
+        }
+    }
+    
+    // Then add alpha * A * B
+    for (size_t i = 0; i < m; i++) {
+        for (size_t j = 0; j < n; j++) {
+            double sum = 0.0;
+            for (size_t p = 0; p < k; p++) {
+                sum += (double)A[i * k + p] * (double)B[p * n + j];
+            }
+            C[i * n + j] += alpha * (float)sum;
+        }
+    }
+    
+    return 0;
+}
+
+// Replace your GEMM_CALL macro with this:
+//#undef GEMM_CALL
+//#define GEMM_CALL gemm_reference
+
+
 //==============================================================================
 // GEMM PLAN MANAGEMENT
 //==============================================================================
@@ -418,6 +453,33 @@ static int apply_block_reflector_strided(
     return 0;
 }
 
+static void debug_matrix_check(const char* label, const float* M, 
+                               uint16_t rows, uint16_t cols, uint16_t k_block)
+{
+    printf("\n[DEBUG %s] Block k=%d\n", label, k_block);
+    
+    // Check diagonal elements
+    printf("  Diagonal: ");
+    for (uint16_t i = 0; i < MIN(4, MIN(rows, cols)); ++i) {
+        printf("%.4f ", M[i * cols + i]);
+    }
+    printf("\n");
+    
+    // Compute Frobenius norm of different regions
+    double norm_total = 0.0, norm_upper = 0.0, norm_lower = 0.0;
+    for (uint16_t i = 0; i < rows; ++i) {
+        for (uint16_t j = 0; j < cols; ++j) {
+            double val = M[i * cols + j];
+            norm_total += val * val;
+            if (i <= j) norm_upper += val * val;
+            else norm_lower += val * val;
+        }
+    }
+    
+    printf("  Norms: total=%.4f, upper=%.4f, lower=%.4f\n", 
+           sqrt(norm_total), sqrt(norm_upper), sqrt(norm_lower));
+}
+
 //==============================================================================
 // MAIN BLOCKED QR - CLEANED UP
 //==============================================================================
@@ -490,9 +552,12 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
             if (ret != 0)
                 return ret;
         }
-
+         // ✅ ADD DEBUG HERE - After this block's factorization is complete
+        debug_matrix_check("After factorization", A, m, n, k);
         block_count++;
     }
+
+    
 
     // ========================================================================
     // PHASE 2: EXTRACT R
@@ -505,77 +570,73 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
         }
     }
 
-    // ========================================================================
-    // PHASE 3: FORM Q - WITH CONSISTENT YT DIMENSIONS
-    // ========================================================================
-    if (!only_R && Q)
-    {
-        // Initialize Q = I
-        memset(Q, 0, (size_t)m * m * sizeof(float));
-        for (uint16_t i = 0; i < m; ++i)
-        {
-            Q[i * m + i] = 1.0f;
-        }
+    // ✅ FIXED CODE (Phase 3 in qr_ws_blocked_inplace)
+if (!only_R && Q) {
+    // Initialize Q = I
+    memset(Q, 0, (size_t)m * m * sizeof(float));
+    for (uint16_t i = 0; i < m; ++i) Q[i * m + i] = 1.0f;
 
-        // Apply blocks in reverse order
-        for (int blk = block_count - 1; blk >= 0; blk--)
-        {
-            uint16_t k = blk * ws->ib;
-            uint16_t block_size = MIN(ws->ib, kmax - k);
-            uint16_t rows_below = m - k;
-
-            // Clear workspace
-            memset(ws->Y, 0, ws->m_max * ws->ib * sizeof(float));
-            memset(ws->YT, 0, ws->ib * ws->m_max * sizeof(float));
-
-            // Retrieve Y and T
-            size_t y_offset = blk * ws->Y_block_stride;
-            size_t t_offset = blk * ws->T_block_stride;
-
-            memcpy(ws->Y, &ws->Y_stored[y_offset],
-                   rows_below * block_size * sizeof(float));
-            memcpy(ws->T, &ws->T_stored[t_offset],
-                   block_size * block_size * sizeof(float));
-
-            // Build Y_full: shift Y down by k rows
-            float *Y_full = ws->Z_temp;
-            memset(Y_full, 0, m * block_size * sizeof(float));
-
-            for (uint16_t i = 0; i < rows_below; ++i)
-            {
-                for (uint16_t j = 0; j < block_size; ++j)
-                {
-                    Y_full[(k + i) * block_size + j] = ws->Y[i * block_size + j];
-                }
-            }
-
-            // ✅ CRITICAL FIX: Build YT as TRUE transpose of Y_full with k-shift
-            memset(ws->YT, 0, block_size * m * sizeof(float));
-            for (uint16_t i = 0; i < block_size; ++i)
-            {
-                for (uint16_t j = 0; j < rows_below; ++j)
-                {
-                    uint16_t global_row = k + j; // ← THE KEY FIX: Add k offset!
-                    ws->YT[i * m + global_row] = ws->Y[j * block_size + i];
-                }
-            }
-
-            // Now Y_full and YT are true transposes
-            int ret = apply_block_reflector_clean(
-                Q,          // Apply to all of Q (tight packing, stride=m)
-                Y_full,     // Y with k-shift [m × block_size]
-                ws->T,      // T matrix [block_size × block_size]
-                m,          // All rows
-                m,          // All columns (stride matches!)
-                block_size, // Number of reflectors
-                ws->Z,      // Workspace
-                ws->Y,      // Can reuse as workspace
-                ws->YT);    // YT with k-shift, true transpose of Y_full
-
-            if (ret != 0)
-                return ret;
-        }
+    // ✅ DEBUG 1: Right after Q initialization
+    printf("Q after init (should be identity):\n");
+    for (int i = 0; i < MIN(4, m); i++) {
+        printf("  Q[%d,%d] = %.4f\n", i, i, Q[i * m + i]);
     }
+    
+    
+    // Apply blocks in reverse order
+    for (int blk = block_count - 1; blk >= 0; blk--) {
+        uint16_t k = blk * ws->ib;
+        uint16_t block_size = MIN(ws->ib, kmax - k);
+        uint16_t rows_below = m - k;
+
+        printf("\nApplying block %d (k=%d, block_size=%d):\n", blk, k, block_size);
+        printf("  Q diagonal before: ");
+        for (int i = k; i < MIN(k+4, m); i++) {
+            printf("%.4f ", Q[i * m + i]);
+        }
+        printf("\n");
+        
+        // Retrieve stored Y and T
+        size_t y_offset = blk * ws->Y_block_stride;
+        size_t t_offset = blk * ws->T_block_stride;
+        float *Y_src = &ws->Y_stored[y_offset];
+        float *T_src = &ws->T_stored[t_offset];
+        
+        // ✅ Build Y_full in ws->Y (correct dimensions: m_max×ib)
+        float *Y_full = ws->Y;
+        memset(Y_full, 0, m * block_size * sizeof(float));
+        for (uint16_t i = 0; i < rows_below; ++i) {
+            for (uint16_t j = 0; j < block_size; ++j) {
+                Y_full[(k + i) * block_size + j] = Y_src[i * block_size + j];
+            }
+        }
+        
+        // ✅ Copy T to workspace (small, fast)
+        memcpy(ws->T, T_src, block_size * block_size * sizeof(float));
+        
+        // ✅ Use CORRECT buffers with proper dimensions
+        int ret = apply_block_reflector_clean(
+            Q,             // C: m×m
+            Y_full,        // Y: m×block_size
+            ws->T,         // T: block_size×block_size
+            m, m, block_size,
+            ws->Z,         // Z: ib×m (workspace)
+            ws->Z_temp,    // ✅ Z_temp: ib×m (CORRECT BUFFER!)
+            ws->YT);       // YT: ib×m (function will overwrite)
+        
+        if (ret != 0) return ret;
+        
+         // ✅ DEBUG 3: After applying block reflector
+        printf("  Q diagonal after: ");
+        for (int i = k; i < MIN(k+4, m); i++) {
+            printf("%.4f ", Q[i * m + i]);
+        }
+        printf("\n");
+
+         // ✅ ADD DEBUG HERE - After applying this block to Q
+        debug_matrix_check("After Q block", Q, m, m, k);
+    }
+}
 
     return 0;
 }

@@ -517,6 +517,106 @@ cleanup:
     return passed;
 }
 
+int test_tiny_qr() {
+    const uint16_t m = 4, n = 4;
+    float A[16] = {
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+        9, 10, 11, 12,
+        13, 14, 15, 16
+    };
+    
+    float Q[16], R[16];
+    
+    printf("\n=== TINY 4x4 TEST ===\n");
+    printf("Original A:\n");
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            printf("%6.2f ", A[i * 4 + j]);
+        }
+        printf("\n");
+    }
+    
+    int ret = qr_blocked(A, Q, R, m, n, false);
+    
+    printf("\nR:\n");
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            printf("%6.2f ", R[i * 4 + j]);
+        }
+        printf("\n");
+    }
+    
+    printf("\nQ:\n");
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            printf("%6.2f ", Q[i * 4 + j]);
+        }
+        printf("\n");
+    }
+    
+    // Check Q*R
+    printf("\nQ*R (should match original A):\n");
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            float sum = 0;
+            for (int k = 0; k < 4; k++) {
+                sum += Q[i * 4 + k] * R[k * 4 + j];
+            }
+            printf("%6.2f ", sum);
+        }
+        printf("\n");
+    }
+
+    int passed = 1;
+    return passed;
+}
+
+int test_two_block_qr() {
+    const uint16_t m = 8, n = 8;  // Force 2 blocks with ib=4
+    
+    float A[64];
+    for (int i = 0; i < 64; i++) {
+        A[i] = (float)(i + 1);  // Simple 1-64 pattern
+    }
+    
+    float Q[64], R[64];
+    
+    // Force block size to 4 to get exactly 2 blocks
+    qr_workspace *ws = qr_workspace_alloc_ex(m, n, 4, true);
+    
+    printf("\n=== TWO BLOCK TEST (8x8, ib=4) ===\n");
+    
+    int ret = qr_ws_blocked(ws, A, Q, R, m, n, false);
+    
+    // Check reconstruction
+    float QR[64];
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            float sum = 0;
+            for (int k = 0; k < 8; k++) {
+                sum += Q[i * 8 + k] * R[k * 8 + j];
+            }
+            QR[i * 8 + j] = sum;
+        }
+    }
+    
+    // Compute error
+    float error = 0, norm = 0;
+    for (int i = 0; i < 64; i++) {
+        float orig = (float)(i + 1);
+        error += (QR[i] - orig) * (QR[i] - orig);
+        norm += orig * orig;
+    }
+    
+    printf("Reconstruction error: %.6f\n", sqrt(error/norm));
+    
+    qr_workspace_free(ws);
+
+    int passed = 1;
+    return passed;
+}
+
 /**
  * @brief Test large square matrix (256×256)
  */
@@ -871,7 +971,34 @@ int run_qr_tests(test_results_t *results)
         printf("✗ Large square test FAILED\n");
     }
 
-    printf("\n--- Workspace Tests ---\n");
+    results->total++;
+    if (test_tiny_qr())
+    {
+        results->passed++;
+        printf("✓ tiny qr test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Large square test FAILED\n");
+    }
+
+    
+    results->total++;
+    if (test_two_block_qr())
+    {
+        results->passed++;
+        printf("✓ two block qr test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Large square test FAILED\n");
+    }
+
+
+
+    //printf("\n--- Workspace Tests ---\n");
 
     //results->total++;
     //if (test_workspace_reuse())
