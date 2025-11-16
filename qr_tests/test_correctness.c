@@ -572,20 +572,22 @@ int test_tiny_qr() {
     return passed;
 }
 
-int test_two_block_qr() {
-    const uint16_t m = 8, n = 8;  // Force 2 blocks with ib=4
+int test_single_block_8x8() {
+    printf("\n=== SINGLE BLOCK TEST (8x8, ib=8) ===\n");
     
+    const uint16_t m = 8, n = 8;
     float A[64];
     for (int i = 0; i < 64; i++) {
-        A[i] = (float)(i + 1);  // Simple 1-64 pattern
+        A[i] = (float)(i + 1);
     }
+    
+    float A_orig[64];
+    memcpy(A_orig, A, sizeof(A));
     
     float Q[64], R[64];
     
-    // Force block size to 4 to get exactly 2 blocks
-    qr_workspace *ws = qr_workspace_alloc_ex(m, n, 4, true);
-    
-    printf("\n=== TWO BLOCK TEST (8x8, ib=4) ===\n");
+    // Force single block
+    qr_workspace *ws = qr_workspace_alloc_ex(m, n, 8, true);
     
     int ret = qr_ws_blocked(ws, A, Q, R, m, n, false);
     
@@ -601,19 +603,118 @@ int test_two_block_qr() {
         }
     }
     
+    float error = 0, norm = 0;
+    for (int i = 0; i < 64; i++) {
+        error += (QR[i] - A_orig[i]) * (QR[i] - A_orig[i]);
+        norm += A_orig[i] * A_orig[i];
+    }
+    
+    double rel_error = sqrt(error/norm);
+    printf("Reconstruction error: %.6f\n", rel_error);
+    
+    qr_workspace_free(ws);
+    
+    int passed = (rel_error < 1e-4);
+    return passed;
+}
+
+int test_two_block_qr() {
+    const uint16_t m = 8, n = 8;
+    
+    float A[64];
+    for (int i = 0; i < 64; i++) {
+        A[i] = (float)(i + 1);
+    }
+    
+    // Save original
+    float A_orig[64];
+    memcpy(A_orig, A, sizeof(A));
+    
+    float Q[64], R[64];
+    
+    qr_workspace *ws = qr_workspace_alloc_ex(m, n, 4, true);
+    
+    printf("\n=== TWO BLOCK TEST (8x8, ib=4) ===\n");
+    
+    // Print A before
+    printf("A before factorization:\n");
+    for (int i = 0; i < 4; i++) {
+        printf("  ");
+        for (int j = 0; j < 8; j++) {
+            printf("%6.2f ", A[i * 8 + j]);
+        }
+        printf("\n");
+    }
+    
+    int ret = qr_ws_blocked(ws, A, Q, R, m, n, false);
+
+     
+    // ✅ ADD THIS HERE - FULL R MATRIX
+    printf("\nFULL R after factorization (all 8 rows):\n");
+    for (int i = 0; i < 8; i++) {
+        printf("  ");
+        for (int j = 0; j < 8; j++) {
+            printf("%6.2f ", R[i * 8 + j]);
+        }
+        printf("\n");
+    }
+    
+    // Print R after (should match A's upper triangle approximately)
+    printf("\nR after factorization:\n");
+    for (int i = 0; i < 4; i++) {
+        printf("  ");
+        for (int j = 0; j < 8; j++) {
+            printf("%6.2f ", R[i * 8 + j]);
+        }
+        printf("\n");
+    }
+    
+    // Check reconstruction
+    float QR[64];
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 8; j++) {
+            float sum = 0;
+            for (int k = 0; k < 8; k++) {
+                sum += (Q[i * 8 + k] * R[k * 8 + j]);
+            }
+            QR[i * 8 + j] = sum;
+        }
+    }
+    
+    printf("\nQ*R (should match original A):\n");
+    for (int i = 0; i < 4; i++) {
+        printf("  ");
+        for (int j = 0; j < 8; j++) {
+            printf("%6.2f ", QR[i * 8 + j]);
+        }
+        printf("\n");
+    }
+    
+    printf("\nA_orig:\n");
+    for (int i = 0; i < 4; i++) {
+        printf("  ");
+        for (int j = 0; j < 8; j++) {
+            printf("%6.2f ", A_orig[i * 8 + j]);
+        }
+        printf("\n");
+    }
+    
     // Compute error
     float error = 0, norm = 0;
     for (int i = 0; i < 64; i++) {
-        float orig = (float)(i + 1);
-        error += (QR[i] - orig) * (QR[i] - orig);
-        norm += orig * orig;
+        error += (QR[i] - A_orig[i]) * (QR[i] - A_orig[i]);
+        norm += A_orig[i] * A_orig[i];
     }
     
-    printf("Reconstruction error: %.6f\n", sqrt(error/norm));
+    double rel_error = sqrt(error/norm);
+    printf("\nReconstruction error: %.6f\n", rel_error);
     
     qr_workspace_free(ws);
 
-    int passed = 1;
+    int passed = (rel_error < 1e-4);
+    if (!passed) {
+        printf("✗ FAILED: Error %.6f exceeds tolerance 1e-4\n", rel_error);
+    }
     return passed;
 }
 
@@ -980,9 +1081,20 @@ int run_qr_tests(test_results_t *results)
     else
     {
         results->failed++;
-        printf("✗ Large square test FAILED\n");
+        printf("✗  tiny qr test FAILED\n");
     }
-
+    // test_single_block_8x8
+      results->total++;
+    if (test_single_block_8x8())
+    {
+        results->passed++;
+        printf("✓ test_single_block_8x8 test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ test_single_block_8x8  test FAILED\n");
+    }
     
     results->total++;
     if (test_two_block_qr())
