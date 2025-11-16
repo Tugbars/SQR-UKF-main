@@ -32,41 +32,6 @@ static void build_T_matrix(const float *Y, const float *tau, float *T,
 
 #define GEMM_CALL gemm_dynamic
 
-// Simple reference GEMM that handles row-major layout correctly
-// C = alpha * A * B + beta * C
-// A is m×k, B is k×n, C is m×n, all row-major with tight packing
-static int gemm_reference(float *C, const float *A, const float *B,
-                          size_t m, size_t k, size_t n,
-                          float alpha, float beta)
-{
-    // First scale C by beta
-    if (beta == 0.0f) {
-        memset(C, 0, m * n * sizeof(float));
-    } else if (beta != 1.0f) {
-        for (size_t i = 0; i < m * n; i++) {
-            C[i] *= beta;
-        }
-    }
-    
-    // Then add alpha * A * B
-    for (size_t i = 0; i < m; i++) {
-        for (size_t j = 0; j < n; j++) {
-            double sum = 0.0;
-            for (size_t p = 0; p < k; p++) {
-                sum += (double)A[i * k + p] * (double)B[p * n + j];
-            }
-            C[i * n + j] += alpha * (float)sum;
-        }
-    }
-    
-    return 0;
-}
-
-// Replace your GEMM_CALL macro with this:
-//#undef GEMM_CALL
-//#define GEMM_CALL gemm_reference
-
-
 //==============================================================================
 // GEMM PLAN MANAGEMENT
 //==============================================================================
@@ -453,30 +418,35 @@ static int apply_block_reflector_strided(
     return 0;
 }
 
-static void debug_matrix_check(const char* label, const float* M, 
+static void debug_matrix_check(const char *label, const float *M,
                                uint16_t rows, uint16_t cols, uint16_t k_block)
 {
     printf("\n[DEBUG %s] Block k=%d\n", label, k_block);
-    
+
     // Check diagonal elements
     printf("  Diagonal: ");
-    for (uint16_t i = 0; i < MIN(4, MIN(rows, cols)); ++i) {
+    for (uint16_t i = 0; i < MIN(4, MIN(rows, cols)); ++i)
+    {
         printf("%.4f ", M[i * cols + i]);
     }
     printf("\n");
-    
+
     // Compute Frobenius norm of different regions
     double norm_total = 0.0, norm_upper = 0.0, norm_lower = 0.0;
-    for (uint16_t i = 0; i < rows; ++i) {
-        for (uint16_t j = 0; j < cols; ++j) {
+    for (uint16_t i = 0; i < rows; ++i)
+    {
+        for (uint16_t j = 0; j < cols; ++j)
+        {
             double val = M[i * cols + j];
             norm_total += val * val;
-            if (i <= j) norm_upper += val * val;
-            else norm_lower += val * val;
+            if (i <= j)
+                norm_upper += val * val;
+            else
+                norm_lower += val * val;
         }
     }
-    
-    printf("  Norms: total=%.4f, upper=%.4f, lower=%.4f\n", 
+
+    printf("  Norms: total=%.4f, upper=%.4f, lower=%.4f\n",
            sqrt(norm_total), sqrt(norm_upper), sqrt(norm_lower));
 }
 
@@ -552,12 +522,10 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
             if (ret != 0)
                 return ret;
         }
-         // ✅ ADD DEBUG HERE - After this block's factorization is complete
+        // ✅ ADD DEBUG HERE - After this block's factorization is complete
         debug_matrix_check("After factorization", A, m, n, k);
         block_count++;
     }
-
-    
 
     // ========================================================================
     // PHASE 2: EXTRACT R
@@ -570,73 +538,267 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
         }
     }
 
-    // ✅ FIXED CODE (Phase 3 in qr_ws_blocked_inplace)
-if (!only_R && Q) {
-    // Initialize Q = I
-    memset(Q, 0, (size_t)m * m * sizeof(float));
-    for (uint16_t i = 0; i < m; ++i) Q[i * m + i] = 1.0f;
+    // ========================================================================
+    // PHASE 3: FORM Q (with extensive diagnostics)
+    // ========================================================================
+    if (!only_R && Q)
+    {
+        // Initialize Q = I
+        memset(Q, 0, (size_t)m * m * sizeof(float));
+        for (uint16_t i = 0; i < m; ++i)
+            Q[i * m + i] = 1.0f;
 
-    // ✅ DEBUG 1: Right after Q initialization
-    printf("Q after init (should be identity):\n");
-    for (int i = 0; i < MIN(4, m); i++) {
-        printf("  Q[%d,%d] = %.4f\n", i, i, Q[i * m + i]);
-    }
-    
-    
-    // Apply blocks in reverse order
-    for (int blk = block_count - 1; blk >= 0; blk--) {
-        uint16_t k = blk * ws->ib;
-        uint16_t block_size = MIN(ws->ib, kmax - k);
-        uint16_t rows_below = m - k;
+        printf("\n╔════════════════════════════════════════════════╗\n");
+        printf("║         Q FORMATION DIAGNOSTICS                ║\n");
+        printf("╚════════════════════════════════════════════════╝\n");
+        printf("Matrix: %dx%d, block_size=%d, num_blocks=%d\n\n",
+               m, m, ws->ib, block_count);
 
-        printf("\nApplying block %d (k=%d, block_size=%d):\n", blk, k, block_size);
-        printf("  Q diagonal before: ");
-        for (int i = k; i < MIN(k+4, m); i++) {
-            printf("%.4f ", Q[i * m + i]);
-        }
-        printf("\n");
-        
-        // Retrieve stored Y and T
-        size_t y_offset = blk * ws->Y_block_stride;
-        size_t t_offset = blk * ws->T_block_stride;
-        float *Y_src = &ws->Y_stored[y_offset];
-        float *T_src = &ws->T_stored[t_offset];
-        
-        // ✅ Build Y_full in ws->Y (correct dimensions: m_max×ib)
-        float *Y_full = ws->Y;
-        memset(Y_full, 0, m * block_size * sizeof(float));
-        for (uint16_t i = 0; i < rows_below; ++i) {
-            for (uint16_t j = 0; j < block_size; ++j) {
-                Y_full[(k + i) * block_size + j] = Y_src[i * block_size + j];
+        // Apply blocks in reverse order
+        for (int blk = block_count - 1; blk >= 0; blk--)
+        {
+            uint16_t k = blk * ws->ib;
+            uint16_t block_size = MIN(ws->ib, kmax - k);
+            uint16_t rows_below = m - k;
+
+            printf("┌─── BLOCK %d (k=%d, size=%d, rows_below=%d) ───┐\n",
+                   blk, k, block_size, rows_below);
+
+            // ============================================================
+            // STEP 1: Retrieve stored Y and T
+            // ============================================================
+            size_t y_offset = blk * ws->Y_block_stride;
+            size_t t_offset = blk * ws->T_block_stride;
+            float *Y_src = &ws->Y_stored[y_offset];
+            float *T_src = &ws->T_stored[t_offset];
+
+            printf("│ 1. RETRIEVED STORAGE:\n");
+            printf("│    Y_src dimensions: %d×%d (rows_below×block_size)\n",
+                   rows_below, block_size);
+            printf("│    Y_src[0,0:min(4,size)] = ");
+            for (int j = 0; j < MIN(4, block_size); j++)
+            {
+                printf("%.4f ", Y_src[j]);
             }
-        }
-        
-        // ✅ Copy T to workspace (small, fast)
-        memcpy(ws->T, T_src, block_size * block_size * sizeof(float));
-        
-        // ✅ Use CORRECT buffers with proper dimensions
-        int ret = apply_block_reflector_clean(
-            Q,             // C: m×m
-            Y_full,        // Y: m×block_size
-            ws->T,         // T: block_size×block_size
-            m, m, block_size,
-            ws->Z,         // Z: ib×m (workspace)
-            ws->Z_temp,    // ✅ Z_temp: ib×m (CORRECT BUFFER!)
-            ws->YT);       // YT: ib×m (function will overwrite)
-        
-        if (ret != 0) return ret;
-        
-         // ✅ DEBUG 3: After applying block reflector
-        printf("  Q diagonal after: ");
-        for (int i = k; i < MIN(k+4, m); i++) {
-            printf("%.4f ", Q[i * m + i]);
-        }
-        printf("\n");
+            printf("\n");
+            printf("│    Y_src[1,0:min(4,size)] = ");
+            for (int j = 0; j < MIN(4, block_size); j++)
+            {
+                printf("%.4f ", Y_src[block_size + j]);
+            }
+            printf("\n");
 
-         // ✅ ADD DEBUG HERE - After applying this block to Q
-        debug_matrix_check("After Q block", Q, m, m, k);
+            printf("│    T[0:min(4,size),0] = ");
+            for (int i = 0; i < MIN(4, block_size); i++)
+            {
+                printf("%.4f ", T_src[i * block_size]);
+            }
+            printf("\n");
+
+            // ============================================================
+            // STEP 2: Build Y_full (extend to m×block_size)
+            // ============================================================
+            float *Y_full = ws->Y;
+            memset(Y_full, 0, m * block_size * sizeof(float));
+
+            for (uint16_t i = 0; i < rows_below; ++i)
+            {
+                for (uint16_t j = 0; j < block_size; ++j)
+                {
+                    Y_full[(k + i) * block_size + j] = Y_src[i * block_size + j];
+                }
+            }
+
+            printf("│ 2. BUILT Y_full (m×block_size = %d×%d):\n", m, block_size);
+            printf("│    Y_full[k,0] (should be 1.0) = %.6f\n",
+                   Y_full[k * block_size + 0]);
+            if (k + 1 < m)
+            {
+                printf("│    Y_full[k+1,0] = %.6f\n",
+                       Y_full[(k + 1) * block_size + 0]);
+            }
+
+            // Check Householder vector norms
+            for (int col = 0; col < MIN(2, block_size); col++)
+            {
+                double norm_sq = 0.0;
+                for (uint16_t r = k; r < m; r++)
+                {
+                    double val = Y_full[r * block_size + col];
+                    norm_sq += val * val;
+                }
+                printf("│    ||Y_full[k:m,%d]||² = %.6f (expect ~1-2 for Householder)\n",
+                       col, norm_sq);
+            }
+
+            // ============================================================
+            // STEP 3: Copy T matrix
+            // ============================================================
+            memcpy(ws->T, T_src, block_size * block_size * sizeof(float));
+
+            printf("│ 3. COPIED T matrix:\n");
+            printf("│    T[0,0] (should be tau[0]) = %.6f\n", ws->T[0]);
+            if (block_size > 1)
+            {
+                printf("│    T[1,1] (should be tau[1]) = %.6f\n",
+                       ws->T[block_size + 1]);
+            }
+
+            // ============================================================
+            // STEP 4: Check Q BEFORE applying reflector
+            // ============================================================
+            printf("│ 4. Q BEFORE applying reflector:\n");
+            printf("│    Q[%d,%d] = %.6f\n", k, k, Q[k * m + k]);
+            if (k + 1 < m)
+            {
+                printf("│    Q[%d,%d] = %.6f\n", k + 1, k + 1, Q[(k + 1) * m + (k + 1)]);
+            }
+            printf("│    Q[0,0] = %.6f\n", Q[0]);
+
+            // Compute norm of Q before
+            double q_norm_before = 0.0;
+            for (int i = 0; i < m; i++)
+            {
+                for (int j = 0; j < m; j++)
+                {
+                    double val = Q[i * m + j];
+                    q_norm_before += val * val;
+                }
+            }
+            printf("│    ||Q||_F before = %.6f (should be %.6f)\n",
+                   sqrt(q_norm_before), sqrt((double)m));
+
+            // ============================================================
+            // STEP 5: Apply block reflector
+            // ============================================================
+            int ret = apply_block_reflector_clean(
+                Q,      // C: m×m
+                Y_full, // Y: m×block_size
+                ws->T,  // T: block_size×block_size
+                m, m, block_size,
+                ws->Z,      // Z: ib×m (workspace)
+                ws->Z_temp, // Z_temp: ib×m
+                ws->YT);    // YT: ib×m
+
+            if (ret != 0)
+            {
+                printf("│ ✗ ERROR: apply_block_reflector returned %d\n", ret);
+                return ret;
+            }
+
+            // ============================================================
+            // STEP 6: Check Q AFTER applying reflector
+            // ============================================================
+            printf("│ 5. Q AFTER applying reflector:\n");
+            printf("│    Q[%d,%d] = %.6f (changed: %+.6f)\n",
+                   k, k, Q[k * m + k], Q[k * m + k] - (blk == block_count - 1 ? 1.0f : 0.0f));
+            if (k + 1 < m)
+            {
+                printf("│    Q[%d,%d] = %.6f\n", k + 1, k + 1, Q[(k + 1) * m + (k + 1)]);
+            }
+            printf("│    Q[0,0] = %.6f (should change for all blocks!)\n", Q[0]);
+
+            // Compute norm of Q after
+            double q_norm_after = 0.0;
+            for (int i = 0; i < m; i++)
+            {
+                for (int j = 0; j < m; j++)
+                {
+                    double val = Q[i * m + j];
+                    q_norm_after += val * val;
+                }
+            }
+            printf("│    ||Q||_F after = %.6f (should stay %.6f)\n",
+                   sqrt(q_norm_after), sqrt((double)m));
+
+            // ============================================================
+            // STEP 7: Verify orthogonality change
+            // ============================================================
+            // Check if Q[k,:] changed significantly
+            double row_change = 0.0;
+            for (int j = 0; j < m; j++)
+            {
+                double expected = (j == k && blk == block_count - 1) ? 1.0 : 0.0;
+                double actual = Q[k * m + j];
+                row_change += (actual - expected) * (actual - expected);
+            }
+            printf("│    Q[%d,:] change = %.6f (should be significant)\n",
+                   k, sqrt(row_change));
+
+            // Check if Q[0,:] changed (critical test!)
+            double row0_change = 0.0;
+            for (int j = 0; j < m; j++)
+            {
+                double expected = (j == 0 && blk == block_count - 1) ? 1.0 : 0.0;
+                double actual = Q[0 * m + j];
+                row0_change += (actual - expected) * (actual - expected);
+            }
+            printf("│    Q[0,:] change = %.6f (MUST be >0 for all blocks!)\n",
+                   sqrt(row0_change));
+
+            if (sqrt(row0_change) < 1e-6 && k > 0)
+            {
+                printf("│ ⚠ WARNING: Q[0,:] didn't change! Block not applied correctly.\n");
+            }
+
+            printf("└────────────────────────────────────────────────┘\n\n");
+        }
+
+        printf("╔════════════════════════════════════════════════╗\n");
+        printf("║         FINAL Q VERIFICATION                   ║\n");
+        printf("╚════════════════════════════════════════════════╝\n");
+
+        // Final orthogonality check
+        float *QTQ = gemm_aligned_alloc(32, m * m * sizeof(float));
+        if (QTQ)
+        {
+            float *QT = gemm_aligned_alloc(32, m * m * sizeof(float));
+            if (QT)
+            {
+                // Transpose Q
+                for (int i = 0; i < m; i++)
+                {
+                    for (int j = 0; j < m; j++)
+                    {
+                        QT[i * m + j] = Q[j * m + i];
+                    }
+                }
+
+                // Compute Q^T * Q
+                gemm_auto(QTQ, QT, Q, m, m, m, 1.0f, 0.0f);
+
+                // Check diagonal and off-diagonal
+                double max_diag_err = 0.0, max_offdiag = 0.0;
+                for (int i = 0; i < m; i++)
+                {
+                    for (int j = 0; j < m; j++)
+                    {
+                        double val = QTQ[i * m + j];
+                        double expected = (i == j) ? 1.0 : 0.0;
+                        double err = fabs(val - expected);
+
+                        if (i == j)
+                        {
+                            if (err > max_diag_err)
+                                max_diag_err = err;
+                        }
+                        else
+                        {
+                            if (fabs(val) > max_offdiag)
+                                max_offdiag = fabs(val);
+                        }
+                    }
+                }
+
+                printf("Q^T * Q:\n");
+                printf("  Max diagonal error: %.6e\n", max_diag_err);
+                printf("  Max off-diagonal:   %.6e\n", max_offdiag);
+
+                gemm_aligned_free(QT);
+            }
+            gemm_aligned_free(QTQ);
+        }
     }
-}
 
     return 0;
 }
