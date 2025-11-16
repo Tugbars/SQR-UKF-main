@@ -236,28 +236,142 @@ static void compute_householder_clean(float *restrict x, uint16_t m,
     x[0] = 1.0f;
 }
 
+
+#ifdef __AVX2__
 /**
- * @brief Apply Householder reflector to matrix - clean version
+ * @brief AVX2-optimized Householder with 2-way unrolling (no spilling)
  */
+static void apply_householder_avx2(float *restrict C, uint16_t m, uint16_t n,
+                                   uint16_t ldc, const float *restrict v, float tau)
+{
+    if (tau == 0.0f)
+        return;
+
+    uint16_t j = 0;
+    for (; j + 7 < n; j += 8)
+    {
+        // Step 1: Compute dot product with 2-way unrolling
+        __m256d dot_acc_lo = _mm256_setzero_pd();
+        __m256d dot_acc_hi = _mm256_setzero_pd();
+        
+        uint16_t i = 0;
+        for (; i + 1 < m; i += 2)
+        {
+            // Prefetch
+            if (i + 8 < m)
+                _mm_prefetch((const char*)(&C[(i + 8) * ldc + j]), _MM_HINT_T0);
+            
+            // Iteration 0
+            __m256 c_row = _mm256_loadu_ps(&C[i * ldc + j]);
+            __m128 c_lo = _mm256_castps256_ps128(c_row);
+            __m128 c_hi = _mm256_extractf128_ps(c_row, 1);
+            __m256d c_lo_d = _mm256_cvtps_pd(c_lo);
+            __m256d c_hi_d = _mm256_cvtps_pd(c_hi);
+            __m256d v_d = _mm256_set1_pd((double)v[i]);
+            dot_acc_lo = _mm256_fmadd_pd(v_d, c_lo_d, dot_acc_lo);
+            dot_acc_hi = _mm256_fmadd_pd(v_d, c_hi_d, dot_acc_hi);
+            
+            // Iteration 1 (reuses same temp registers)
+            c_row = _mm256_loadu_ps(&C[(i + 1) * ldc + j]);
+            c_lo = _mm256_castps256_ps128(c_row);
+            c_hi = _mm256_extractf128_ps(c_row, 1);
+            c_lo_d = _mm256_cvtps_pd(c_lo);
+            c_hi_d = _mm256_cvtps_pd(c_hi);
+            v_d = _mm256_set1_pd((double)v[i + 1]);
+            dot_acc_lo = _mm256_fmadd_pd(v_d, c_lo_d, dot_acc_lo);
+            dot_acc_hi = _mm256_fmadd_pd(v_d, c_hi_d, dot_acc_hi);
+        }
+        
+        // Tail
+        for (; i < m; ++i)
+        {
+            __m256 c_row = _mm256_loadu_ps(&C[i * ldc + j]);
+            __m128 c_lo = _mm256_castps256_ps128(c_row);
+            __m128 c_hi = _mm256_extractf128_ps(c_row, 1);
+            __m256d c_lo_d = _mm256_cvtps_pd(c_lo);
+            __m256d c_hi_d = _mm256_cvtps_pd(c_hi);
+            __m256d v_d = _mm256_set1_pd((double)v[i]);
+            dot_acc_lo = _mm256_fmadd_pd(v_d, c_lo_d, dot_acc_lo);
+            dot_acc_hi = _mm256_fmadd_pd(v_d, c_hi_d, dot_acc_hi);
+        }
+        
+        // Convert and scale
+        __m128 dot_lo_f = _mm256_cvtpd_ps(dot_acc_lo);
+        __m128 dot_hi_f = _mm256_cvtpd_ps(dot_acc_hi);
+        __m256 dot_f = _mm256_insertf128_ps(_mm256_castps128_ps256(dot_lo_f), dot_hi_f, 1);
+        __m256 tau_dot = _mm256_mul_ps(_mm256_set1_ps(tau), dot_f);
+        
+        // Step 2: Update with 2-way unrolling
+        i = 0;
+        for (; i + 1 < m; i += 2)
+        {
+            // Iteration 0
+            __m256 v_bc = _mm256_set1_ps(v[i]);
+            __m256 c_r = _mm256_loadu_ps(&C[i * ldc + j]);
+            __m256 upd = _mm256_fnmadd_ps(v_bc, tau_dot, c_r);
+            _mm256_storeu_ps(&C[i * ldc + j], upd);
+            
+            // Iteration 1
+            v_bc = _mm256_set1_ps(v[i + 1]);
+            c_r = _mm256_loadu_ps(&C[(i + 1) * ldc + j]);
+            upd = _mm256_fnmadd_ps(v_bc, tau_dot, c_r);
+            _mm256_storeu_ps(&C[(i + 1) * ldc + j], upd);
+        }
+        
+        // Tail
+        for (; i < m; ++i)
+        {
+            __m256 v_bc = _mm256_set1_ps(v[i]);
+            __m256 c_r = _mm256_loadu_ps(&C[i * ldc + j]);
+            __m256 upd = _mm256_fnmadd_ps(v_bc, tau_dot, c_r);
+            _mm256_storeu_ps(&C[i * ldc + j], upd);
+        }
+    }
+    
+    // Scalar tail
+    for (; j < n; ++j)
+    {
+        double dot = 0.0;
+        for (uint16_t i = 0; i < m; ++i)
+        {
+            dot += (double)v[i] * (double)C[i * ldc + j];
+        }
+        
+        float tau_dot = tau * (float)dot;
+        for (uint16_t i = 0; i < m; ++i)
+        {
+            C[i * ldc + j] -= v[i] * tau_dot;
+        }
+    }
+}
+#endif
+
 static void apply_householder_clean(float *restrict C, uint16_t m, uint16_t n,
                                     uint16_t ldc, const float *restrict v, float tau)
 {
+#ifdef __AVX2__
+    if (n >= 8)
+    {
+        apply_householder_avx2(C, m, n, ldc, v, tau);
+        return;
+    }
+#endif
+
     if (tau == 0.0f)
         return;
 
     for (uint16_t j = 0; j < n; ++j)
     {
-        // Compute v^T * C[:,j]
         double dot = 0.0;
         for (uint16_t i = 0; i < m; ++i)
         {
             dot += (double)v[i] * (double)C[i * ldc + j];
         }
 
-        // Update C[:,j] -= tau * v * dot
+        float tau_dot = tau * (float)dot;
         for (uint16_t i = 0; i < m; ++i)
         {
-            C[i * ldc + j] -= tau * v[i] * (float)dot;
+            C[i * ldc + j] -= v[i] * tau_dot;
         }
     }
 }
@@ -324,6 +438,7 @@ static void panel_factor_clean(
         }
     }
 }
+
 
 //==============================================================================
 // BUILD T MATRIX (keep existing implementation)
@@ -703,7 +818,6 @@ int qr_blocked(const float *A, float *Q, float *R,
     return ret;
 }
 
-// [Include all the workspace allocation/free functions unchanged]
 
 //==============================================================================
 // WORKSPACE ALLOCATION (FIXED: Z/Z_temp sized for max(m_max, n_max))

@@ -725,7 +725,7 @@ static int test_qr_large_square(void)
 {
     printf("\n=== Testing Large Square QR (256×256) ===\n");
 
-    const uint16_t m = 256, n = 256;
+    const uint16_t m = 512, n = 512;
 
     printf("  Allocating %.2f MB...\n",
            (m * n + m * m + m * n) * sizeof(float) / (1024.0 * 1024.0));
