@@ -46,8 +46,8 @@ static int naive_gemm(float *C, const float *A, const float *B,
     if (!C || !A || !B)
         return -1;
 
-    printf("    [NAIVE_GEMM] C[%d×%d] = %.2f*A[%d×%d]*B[%d×%d] + %.2f*C\n",
-           m, n, alpha, m, k, k, n, beta);
+    //printf("    [NAIVE_GEMM] C[%d×%d] = %.2f*A[%d×%d]*B[%d×%d] + %.2f*C\n",
+    //       m, n, alpha, m, k, k, n, beta);
 
     // Step 1: Scale existing C by beta
     if (beta == 0.0f)
