@@ -12,7 +12,7 @@ message(STATUS "=== SQR-UKF Root Configuration ===")
 # ============================================================================
 
 option(BUILD_GEMM_TESTS "Build GEMM test suite" ON)
-option(BUILD_QR_TESTS "Build QR test suite" OFF)
+option(BUILD_QR_TESTS "Build QR test suite" ON)
 
 # ============================================================================
 # CONDITIONAL SUBDIRECTORIES

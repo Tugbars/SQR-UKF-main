@@ -16,8 +16,9 @@
  */
 
 #include "qr.h"
-#include "../gemm/gemm.h"
-#include "../gemm/gemm_planning.h"
+#include "gemm.h"
+#include "gemm_planning.h"
+#include "gemm_utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -26,29 +27,6 @@
 #include <assert.h>
 #include <immintrin.h>
 
-#if defined(_WIN32)
-#include <malloc.h>
-static inline void *portable_aligned_alloc(size_t alignment, size_t size)
-{
-    return _aligned_malloc(size, alignment);
-}
-static inline void portable_aligned_free(void *ptr)
-{
-    _aligned_free(ptr);
-}
-#else
-static inline void *portable_aligned_alloc(size_t alignment, size_t size)
-{
-    void *ptr = NULL;
-    if (posix_memalign(&ptr, alignment, size) != 0)
-        ptr = NULL;
-    return ptr;
-}
-static inline void portable_aligned_free(void *ptr)
-{
-    free(ptr);
-}
-#endif
 
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -1061,12 +1039,12 @@ qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
     ws->tau = (float *)malloc(mn * sizeof(float));
     ws->tmp = (float *)malloc(m_max * sizeof(float));
     ws->work = (float *)malloc(m_max * sizeof(float));
-    ws->T = (float *)portable_aligned_alloc(32, ws->ib * ws->ib * sizeof(float));
-    ws->Cpack = (float *)portable_aligned_alloc(32, (size_t)m_max * n_max * sizeof(float));
-    ws->Y = (float *)portable_aligned_alloc(32, (size_t)m_max * ws->ib * sizeof(float));
-    ws->YT = (float *)portable_aligned_alloc(32, (size_t)ws->ib * m_max * sizeof(float));
-    ws->Z = (float *)portable_aligned_alloc(32, (size_t)ws->ib * n_max * sizeof(float));
-    ws->Z_temp = (float *)portable_aligned_alloc(32, (size_t)ws->ib * n_max * sizeof(float));
+    ws->T = (float *)gemm_aligned_alloc(32, ws->ib * ws->ib * sizeof(float));
+    ws->Cpack = (float *)gemm_aligned_alloc(32, (size_t)m_max * n_max * sizeof(float));
+    ws->Y = (float *)gemm_aligned_alloc(32, (size_t)m_max * ws->ib * sizeof(float));
+    ws->YT = (float *)gemm_aligned_alloc(32, (size_t)ws->ib * m_max * sizeof(float));
+    ws->Z = (float *)gemm_aligned_alloc(32, (size_t)ws->ib * n_max * sizeof(float));
+    ws->Z_temp = (float *)gemm_aligned_alloc(32, (size_t)ws->ib * n_max * sizeof(float));
     ws->vn1 = (float *)malloc(n_max * sizeof(float));
     ws->vn2 = (float *)malloc(n_max * sizeof(float));
 
@@ -1081,9 +1059,9 @@ qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
     // Correct storage layout: [num_blocks][rows][cols]
     if (store_reflectors)
     {
-        ws->Y_stored = (float *)portable_aligned_alloc(32,
+        ws->Y_stored = (float *)gemm_aligned_alloc(32,
                                                        ws->num_blocks * ws->Y_block_stride * sizeof(float));
-        ws->T_stored = (float *)portable_aligned_alloc(32,
+        ws->T_stored = (float *)gemm_aligned_alloc(32,
                                                        ws->num_blocks * ws->T_block_stride * sizeof(float));
         bytes += ws->num_blocks * ws->Y_block_stride * sizeof(float);
         bytes += ws->num_blocks * ws->T_block_stride * sizeof(float);
@@ -1142,14 +1120,14 @@ void qr_workspace_free(qr_workspace *ws)
     free(ws->tau);
     free(ws->tmp);
     free(ws->work);
-    portable_aligned_free(ws->T);
-    portable_aligned_free(ws->Cpack);
-    portable_aligned_free(ws->Y);
-    portable_aligned_free(ws->YT);
-    portable_aligned_free(ws->Z);
-    portable_aligned_free(ws->Z_temp);
-    portable_aligned_free(ws->Y_stored);
-    portable_aligned_free(ws->T_stored);
+    gemm_aligned_free(ws->T);
+    gemm_aligned_free(ws->Cpack);
+    gemm_aligned_free(ws->Y);
+    gemm_aligned_free(ws->YT);
+    gemm_aligned_free(ws->Z);
+    gemm_aligned_free(ws->Z_temp);
+    gemm_aligned_free(ws->Y_stored);
+    gemm_aligned_free(ws->T_stored);
     free(ws->vn1);
     free(ws->vn2);
     free(ws);
