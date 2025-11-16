@@ -5,8 +5,25 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-typedef struct qr_gemm_plans qr_gemm_plans_t;
+// Forward declare gemm_plan_t (from GEMM library)
+typedef struct gemm_plan gemm_plan_t;
 
+/**
+ * @brief Pre-created GEMM plans for QR operations
+ */
+typedef struct
+{
+    gemm_plan_t *plan_yt_c; // Y^T * C  [ib × m] × [m × n] = [ib × n]
+    gemm_plan_t *plan_t_z;  // T * Z    [ib × ib] × [ib × n] = [ib × n]
+    gemm_plan_t *plan_y_z;  // Y * Z    [m × ib] × [ib × n] = [m × n]
+    uint16_t plan_m;        // Exact dimensions
+    uint16_t plan_n;
+    uint16_t plan_ib;
+} qr_gemm_plans_t;
+
+/**
+ * @brief QR workspace with pre-allocated buffers and GEMM plans
+ */
 typedef struct
 {
     uint16_t m_max;
@@ -40,10 +57,31 @@ typedef struct
 } qr_workspace;
 
 /**
+ * @brief Create workspace with default settings (stores reflectors)
+ */
+qr_workspace *qr_workspace_alloc(uint16_t m_max, uint16_t n_max, uint16_t ib);
+
+/**
  * @brief Create workspace with reflector storage control
  */
 qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
                                     uint16_t ib, bool store_reflectors);
+
+/**
+ * @brief Free workspace
+ */
+void qr_workspace_free(qr_workspace *ws);
+
+/**
+ * @brief Get workspace memory footprint
+ */
+size_t qr_workspace_bytes(const qr_workspace *ws);
+
+/**
+ * @brief Workspace-based QR (uses pre-allocated workspace)
+ */
+int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
+                  uint16_t m, uint16_t n, bool only_R);
 
 /**
  * @brief In-place blocked QR (requires 32-byte aligned A)

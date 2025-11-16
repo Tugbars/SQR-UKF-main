@@ -14,9 +14,9 @@
  */
 
 #include "test_common.h"
-#include "../linalg/qr.h"
-#include "../gemm/gemm.h"
-#include "../gemm/gemm_utils.h"
+#include "qr.h"
+#include "gemm.h"
+#include "gemm_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -167,19 +167,33 @@ static int check_orthogonality(const float *Q, uint16_t m, double tol,
 {
     printf("  Checking orthogonality (Q^T * Q = I)...\n");
 
-    // Compute Q^T * Q using GEMM
+    // ✅ FIXED: Create Q^T explicitly
+    float *QT = gemm_aligned_alloc(32, m * m * sizeof(float));
     float *QTQ = gemm_aligned_alloc(32, m * m * sizeof(float));
-    if (!QTQ)
+    
+    if (!QT || !QTQ)
     {
         printf("    ERROR: Allocation failed\n");
+        gemm_aligned_free(QT);
+        gemm_aligned_free(QTQ);
         return 0;
     }
 
+    // Transpose Q
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < m; j++)
+        {
+            QT[i * m + j] = Q[j * m + i];
+        }
+    }
+
     // QTQ = Q^T * Q  (m×m = m×m * m×m)
-    int ret = gemm_auto(QTQ, Q, Q, m, m, m, 1.0f, 0.0f);
+    int ret = gemm_auto(QTQ, QT, Q, m, m, m, 1.0f, 0.0f);
     if (ret != 0)
     {
         printf("    ERROR: GEMM failed\n");
+        gemm_aligned_free(QT);
         gemm_aligned_free(QTQ);
         return 0;
     }
@@ -221,6 +235,7 @@ static int check_orthogonality(const float *Q, uint16_t m, double tol,
         }
     }
 
+    gemm_aligned_free(QT);
     gemm_aligned_free(QTQ);
 
     if (errors > 0)

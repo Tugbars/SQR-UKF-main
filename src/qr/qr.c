@@ -16,9 +16,9 @@
  */
 
 #include "qr.h"
-#include "gemm.h"
-#include "gemm_planning.h"
-#include "gemm_utils.h"
+#include "../gemm_2/gemm.h"           // ← FIXED: was "gemm.h"
+#include "../gemm_2/gemm_planning.h"  // ← FIXED: was "gemm_planning.h"
+#include "../gemm_2/gemm_utils.h"     // ← FIXED: was "gemm_utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -28,27 +28,103 @@
 #include <immintrin.h>
 
 
-#ifndef MIN
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#endif
+#define USE_NAIVE_GEMM_DEBUG 0  // Set to 1 to use naive GEMM, 0 for optimized
 
-#ifndef MAX
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#if USE_NAIVE_GEMM_DEBUG
+
+/**
+ * @brief Naive GEMM: C = alpha * A * B + beta * C
+ * 
+ * All matrices row-major:
+ * - A[m×k]: m rows, k columns
+ * - B[k×n]: k rows, n columns  
+ * - C[m×n]: m rows, n columns
+ */
+static int naive_gemm(float *C, const float *A, const float *B,
+                      uint16_t m, uint16_t k, uint16_t n,
+                      float alpha, float beta)
+{
+    if (!C || !A || !B)
+        return -1;
+
+    printf("    [NAIVE_GEMM] C[%d×%d] = %.2f*A[%d×%d]*B[%d×%d] + %.2f*C\n",
+           m, n, alpha, m, k, k, n, beta);
+
+    // Step 1: Scale existing C by beta
+    if (beta == 0.0f)
+    {
+        memset(C, 0, (size_t)m * n * sizeof(float));
+    }
+    else if (beta != 1.0f)
+    {
+        for (uint16_t i = 0; i < m; i++)
+        {
+            for (uint16_t j = 0; j < n; j++)
+            {
+                C[i * n + j] *= beta;
+            }
+        }
+    }
+
+    // Step 2: C += alpha * A * B
+    for (uint16_t i = 0; i < m; i++)
+    {
+        for (uint16_t j = 0; j < n; j++)
+        {
+            double sum = 0.0;
+            for (uint16_t p = 0; p < k; p++)
+            {
+                sum += (double)A[i * k + p] * (double)B[p * n + j];
+            }
+            C[i * n + j] += alpha * (float)sum;
+        }
+    }
+
+    return 0;
+}
+
+// Wrapper to match GEMM_CALL signature
+static int gemm_debug(float *C, const float *A, const float *B,
+                      uint16_t m, uint16_t k, uint16_t n,
+                      float alpha, float beta)
+{
+    return naive_gemm(C, A, B, m, k, n, alpha, beta);
+}
+
+#define GEMM_CALL gemm_debug
+
+#else
+
+// Use optimized GEMM
+#define GEMM_CALL gemm_dynamic
+
 #endif
 
 //==============================================================================
 // GEMM PLAN MANAGEMENT
 //==============================================================================
 
-typedef struct
+#ifdef MIN
+#undef MIN
+#endif
+
+#ifdef MAX
+#undef MAX
+#endif
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+static void destroy_panel_plans(qr_gemm_plans_t *plans)
 {
-    gemm_plan_t *plan_yt_c; // Y^T * C  [ib × m] × [m × n] = [ib × n]
-    gemm_plan_t *plan_t_z;  // T * Z    [ib × ib] × [ib × n] = [ib × n]
-    gemm_plan_t *plan_y_z;  // Y * Z    [m × ib] × [ib × n] = [m × n]
-    uint16_t plan_m;        // Exact dimensions (no M_max semantics)
-    uint16_t plan_n;
-    uint16_t plan_ib;
-} qr_gemm_plans_t;
+    if (!plans)
+        return;
+    gemm_plan_destroy(plans->plan_yt_c);
+    gemm_plan_destroy(plans->plan_t_z);
+    gemm_plan_destroy(plans->plan_y_z);
+    free(plans);
+}
+
 
 static qr_gemm_plans_t *create_panel_plans(uint16_t m, uint16_t n, uint16_t ib)
 {
@@ -74,16 +150,6 @@ static qr_gemm_plans_t *create_panel_plans(uint16_t m, uint16_t n, uint16_t ib)
     }
 
     return plans;
-}
-
-static void destroy_panel_plans(qr_gemm_plans_t *plans)
-{
-    if (!plans)
-        return;
-    gemm_plan_destroy(plans->plan_yt_c);
-    gemm_plan_destroy(plans->plan_t_z);
-    gemm_plan_destroy(plans->plan_y_z);
-    free(plans);
 }
 
 //==============================================================================
@@ -139,17 +205,19 @@ static uint16_t select_optimal_ib(uint16_t m, uint16_t n)
 // SIMD-OPTIMIZED HOUSEHOLDER REFLECTION
 //==============================================================================
 
-static void householder_reflection_simd(float *x, uint16_t m, float *tau)
+static void householder_reflection_simd(float *x, uint16_t m, float *tau, float *beta_out)
 {
     if (m == 0)
     {
         *tau = 0.0f;
+        if (beta_out) *beta_out = 0.0f;
         return;
     }
 
     if (m == 1)
     {
         *tau = 0.0f;
+        if (beta_out) *beta_out = x[0];
         x[0] = 1.0f;
         return;
     }
@@ -194,6 +262,7 @@ static void householder_reflection_simd(float *x, uint16_t m, float *tau)
     if (norm_sq == 0.0)
     {
         *tau = 0.0f;
+        if (beta_out) *beta_out = x0;
         x[0] = 1.0f;
         return;
     }
@@ -221,7 +290,8 @@ static void householder_reflection_simd(float *x, uint16_t m, float *tau)
     }
 
     *tau = (float)((beta - alpha) / beta);
-    x[0] = 1.0f;
+    if (beta_out) *beta_out = (float)beta;  // ✅ RETURN beta for R diagonal
+    x[0] = 1.0f;  // Reflector vector v[0] = 1
 }
 
 //==============================================================================
@@ -583,48 +653,16 @@ static void panel_qr_simd(float *panel, float *Y, float *YT, float *tau,
                           uint16_t m, uint16_t panel_stride, uint16_t ib,
                           float *tmp_col)
 {
-    // =========================================================================
-    // DETERMINE EQUAL-LENGTH REGION
-    // =========================================================================
-    // If m >= ib, all ib columns have the same length (m - 0, m - 1, ..., m - (ib-1))
-    // BUT only columns [0, ib - (ib-1)) = [0, 1) have EXACTLY the same length m.
-    // Actually, we need to be more careful:
-    //   Column j processes rows [k+j : m), so length = m - j
-    //   Equal length means we process a contiguous block where m - j stays constant
-    //   This only happens for j = 0 when the panel is "full"
-    //
-    // Better heuristic: Process columns where rows_below >= threshold as "fast"
-    // For simplicity: fast path = first column only when m is large enough
-    // OR: fast path = all columns where m - j >= some threshold
-    //
-    // Actually, the best split is:
-    //   Fast: j in [0, min(ib, m - ib)) → rows_below >= ib (large, stable)
-    //   Slow: j in [m - ib, ib)         → rows_below < ib (small, shrinking)
-
     const uint16_t fast_end = (m >= ib) ? ib : 0;
-    // If m >= ib: all columns 0..ib-1 have rows_below >= (m - (ib-1)) >= 1
-    // If m < ib:  skip fast path entirely (small panel)
-
-    // Alternative: fast path = columns where rows_below >= ib
-    // const uint16_t fast_end = (m >= 2 * ib) ? ib : ((m >= ib) ? (m - ib) : 0);
-
-    // For maximum benefit, let's use the simple rule:
-    // Fast path = ALL columns when m >= ib (most common case in top panels)
 
     // =========================================================================
-    // FAST PATH: EQUAL-LENGTH REFLECTORS (HOT REGION)
+    // FAST PATH: EQUAL-LENGTH REFLECTORS
     // =========================================================================
-    // All columns in this region have large, similar row counts
-    // No length-dependent conditionals → maximum ILP and vectorization
-    // =========================================================================
-
     for (uint16_t j = 0; j < fast_end; ++j)
     {
-        const uint16_t rows_below = m - j; // Still changes, but >= 1 always
+        const uint16_t rows_below = m - j;
 
-        // ---------------------------------------------------------------------
         // Prefetch next column
-        // ---------------------------------------------------------------------
         if (j + 1 < fast_end)
         {
             float *next_col = &panel[(j + 1) * panel_stride + (j + 1)];
@@ -635,35 +673,25 @@ static void panel_qr_simd(float *panel, float *Y, float *YT, float *tau,
             }
         }
 
-        // ---------------------------------------------------------------------
         // GATHER: Strided column → contiguous buffer
-        // ---------------------------------------------------------------------
-        // Column j starts at panel[j * panel_stride + j]
-        // Element (j+r, j) is at panel[(j+r) * panel_stride + j]
         float *col = &panel[j * panel_stride + j];
-
-        // NO length checks here - we know rows_below is valid
         for (uint16_t i = 0; i < rows_below; ++i)
         {
             tmp_col[i] = col[i * panel_stride];
         }
 
-        // ---------------------------------------------------------------------
-        // SIMD Householder reflection on contiguous buffer
-        // ---------------------------------------------------------------------
-        householder_reflection_simd(tmp_col, rows_below, &tau[j]);
+        // SIMD Householder reflection
+        float beta;
+        householder_reflection_simd(tmp_col, rows_below, &tau[j], &beta);
 
-        // ---------------------------------------------------------------------
-        // SCATTER: Contiguous buffer → strided column
-        // ---------------------------------------------------------------------
-        for (uint16_t i = 0; i < rows_below; ++i)
+        // ✅ FIXED SCATTER: diagonal gets beta (R), below gets v_tail
+        col[0] = beta;  // Store R diagonal element
+        for (uint16_t i = 1; i < rows_below; ++i)
         {
-            col[i * panel_stride] = tmp_col[i];
+            col[i * panel_stride] = tmp_col[i];  // Store reflector v[1:]
         }
 
-        // ---------------------------------------------------------------------
         // Apply reflector to trailing columns [j+1 : ib)
-        // ---------------------------------------------------------------------
         if (j + 1 < ib)
         {
             float *trailing = &panel[j * panel_stride + (j + 1)];
@@ -671,11 +699,7 @@ static void panel_qr_simd(float *panel, float *Y, float *YT, float *tau,
                             panel_stride, tmp_col, tau[j]);
         }
 
-        // ---------------------------------------------------------------------
-        // Store to Y[m×ib] and YT[ib×m] (dual pack)
-        // ---------------------------------------------------------------------
-        // Y: row-major, Y[i,j] = Y[i * ib + j]
-        // YT: row-major, YT[j,i] = YT[j * m + i]
+        // Store to Y[m×ib] and YT[ib×m] (full reflector v with v[0]=1)
         for (uint16_t i = j; i < m; ++i)
         {
             float val = (i == j) ? 1.0f : tmp_col[i - j];
@@ -692,57 +716,41 @@ static void panel_qr_simd(float *panel, float *Y, float *YT, float *tau,
     }
 
     // =========================================================================
-    // SLOW PATH: RAGGED TAIL (COLD REGION)
+    // SLOW PATH: RAGGED TAIL
     // =========================================================================
-    // Only executes for:
-    //   - Small panels (m < ib) → all columns go here
-    //   - Bottom of large panels (j >= fast_end) → last few columns
-    // Rare in practice, so branch misprediction cost is amortized
-    // =========================================================================
-
     for (uint16_t j = fast_end; j < ib; ++j)
     {
         const uint16_t rows_below = m - j;
 
-        // Early exit if we've run out of rows
         if (rows_below == 0)
             break;
 
-        // ---------------------------------------------------------------------
-        // Prefetch (if there's a next column)
-        // ---------------------------------------------------------------------
+        // Prefetch
         if (j + 1 < ib && j + 1 < m)
         {
             float *next_col = &panel[(j + 1) * panel_stride + (j + 1)];
             _mm_prefetch((const char *)next_col, _MM_HINT_T0);
         }
 
-        // ---------------------------------------------------------------------
-        // GATHER: Strided column → contiguous buffer
-        // ---------------------------------------------------------------------
+        // GATHER
         float *col = &panel[j * panel_stride + j];
-
         for (uint16_t i = 0; i < rows_below; ++i)
         {
             tmp_col[i] = col[i * panel_stride];
         }
 
-        // ---------------------------------------------------------------------
         // SIMD Householder reflection
-        // ---------------------------------------------------------------------
-        householder_reflection_simd(tmp_col, rows_below, &tau[j]);
+        float beta;
+        householder_reflection_simd(tmp_col, rows_below, &tau[j], &beta);
 
-        // ---------------------------------------------------------------------
-        // SCATTER: Contiguous buffer → strided column
-        // ---------------------------------------------------------------------
-        for (uint16_t i = 0; i < rows_below; ++i)
+        // ✅ FIXED SCATTER: diagonal gets beta, below gets v_tail
+        col[0] = beta;
+        for (uint16_t i = 1; i < rows_below; ++i)
         {
             col[i * panel_stride] = tmp_col[i];
         }
 
-        // ---------------------------------------------------------------------
-        // Apply reflector to trailing columns (if any)
-        // ---------------------------------------------------------------------
+        // Apply reflector to trailing columns
         if (j + 1 < ib)
         {
             float *trailing = &panel[j * panel_stride + (j + 1)];
@@ -750,9 +758,7 @@ static void panel_qr_simd(float *panel, float *Y, float *YT, float *tau,
                             panel_stride, tmp_col, tau[j]);
         }
 
-        // ---------------------------------------------------------------------
-        // Store to Y and YT with bounds checking
-        // ---------------------------------------------------------------------
+        // Store to Y and YT
         for (uint16_t i = j; i < m; ++i)
         {
             float val = (i == j) ? 1.0f : tmp_col[i - j];
@@ -760,7 +766,6 @@ static void panel_qr_simd(float *panel, float *Y, float *YT, float *tau,
             YT[j * m + i] = val;
         }
 
-        // Zero upper triangle
         for (uint16_t i = 0; i < j; ++i)
         {
             Y[i * ib + j] = 0.0f;
@@ -901,7 +906,7 @@ static int apply_block_reflector_optimized(
     }
     else
     {
-        ret = gemm_auto(Z, YT, C, ib, m, n, 1.0f, 0.0f);
+        ret = GEMM_CALL(Z, YT, C, ib, m, n, 1.0f, 0.0f);
     }
     if (ret != 0)
         return ret;
@@ -923,7 +928,7 @@ static int apply_block_reflector_optimized(
         }
         else
         {
-            ret = gemm_auto(Z_temp, T, Z, ib, ib, n, 1.0f, 0.0f);
+            ret = GEMM_CALL(Z_temp, T, Z, ib, ib, n, 1.0f, 0.0f);
         }
         if (ret != 0)
             return ret;
@@ -938,7 +943,7 @@ static int apply_block_reflector_optimized(
     }
     else
     {
-        ret = gemm_auto(C, Y, Z_temp, m, ib, n, -1.0f, 1.0f);
+        ret = GEMM_CALL(C, Y, Z_temp, m, ib, n, -1.0f, 1.0f);
     }
 
     return ret;
@@ -967,7 +972,7 @@ static int form_Q_blocked(qr_workspace *ws, float *Q, uint16_t m, uint16_t n)
         // Retrieve stored Y and T for this block
         if (!ws->Y_stored || !ws->T_stored)
         {
-            return -EINVAL; // Need stored reflectors
+            return -EINVAL;
         }
 
         float *Y_src = &ws->Y_stored[kt * ws->Y_block_stride];
@@ -976,7 +981,7 @@ static int form_Q_blocked(qr_workspace *ws, float *Q, uint16_t m, uint16_t n)
         memcpy(ws->Y, Y_src, rows_below * block_size * sizeof(float));
         memcpy(ws->T, T_src, block_size * block_size * sizeof(float));
 
-        // Rebuild YT from Y
+        // ✅ FIXED: Rebuild YT with correct stride (rows_below, not m)
         for (uint16_t j = 0; j < block_size; ++j)
         {
             for (uint16_t i = 0; i < rows_below; ++i)
