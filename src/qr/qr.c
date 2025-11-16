@@ -63,7 +63,8 @@ static qr_gemm_plans_t *create_panel_plans(uint16_t m, uint16_t n, uint16_t ib)
         return NULL;
 
     qr_gemm_plans_t *plans = (qr_gemm_plans_t *)calloc(1, sizeof(qr_gemm_plans_t));
-    if (!plans) return NULL;
+    if (!plans)
+        return NULL;
 
     plans->plan_m = m;
     plans->plan_n = n;
@@ -87,15 +88,18 @@ static qr_gemm_plans_t *create_panel_plans(uint16_t m, uint16_t n, uint16_t ib)
 static uint16_t select_optimal_ib(uint16_t m, uint16_t n)
 {
     const uint16_t min_dim = MIN(m, n);
-    uint16_t ib = MIN(64, min_dim);  // Default block size
-    
+    uint16_t ib = MIN(64, min_dim); // Default block size
+
     // Adjust for small matrices
-    if (min_dim < 32) ib = MIN(16, min_dim);
-    else if (min_dim < 64) ib = MIN(32, min_dim);
-    
+    if (min_dim < 32)
+        ib = MIN(16, min_dim);
+    else if (min_dim < 64)
+        ib = MIN(32, min_dim);
+
     // Ensure minimum block size
-    if (ib < 8) ib = MIN(8, min_dim);
-    
+    if (ib < 8)
+        ib = MIN(8, min_dim);
+
     return ib;
 }
 
@@ -105,53 +109,62 @@ static uint16_t select_optimal_ib(uint16_t m, uint16_t n)
 
 /**
  * @brief Compute Householder reflection - clean version
- * 
+ *
  * Given x[0:m], compute v and tau such that:
  *   (I - tau * v * v^T) * x = beta * e_1
  * where v[0] = 1 (implicit)
  */
 static void compute_householder_clean(float *x, uint16_t m, float *tau, float *beta)
 {
-    if (m == 0) {
+    if (m == 0)
+    {
         *tau = 0.0f;
-        if (beta) *beta = 0.0f;
+        if (beta)
+            *beta = 0.0f;
         return;
     }
-    
-    if (m == 1) {
+
+    if (m == 1)
+    {
         *tau = 0.0f;
-        if (beta) *beta = x[0];
+        if (beta)
+            *beta = x[0];
         x[0] = 1.0f;
         return;
     }
-    
+
     // Compute norm of x[1:m] with double precision
     double norm_sq = 0.0;
-    for (uint16_t i = 1; i < m; ++i) {
+    for (uint16_t i = 1; i < m; ++i)
+    {
         double xi = (double)x[i];
         norm_sq += xi * xi;
     }
-    
-    if (norm_sq == 0.0) {
+
+    if (norm_sq == 0.0)
+    {
         *tau = 0.0f;
-        if (beta) *beta = x[0];
+        if (beta)
+            *beta = x[0];
         x[0] = 1.0f;
         return;
     }
-    
+
     // Compute beta and scale
     double alpha = (double)x[0];
     double beta_val = -copysign(sqrt(alpha * alpha + norm_sq), alpha);
     double scale = 1.0 / (alpha - beta_val);
-    
+
     // Scale x[1:m] to form v[1:m]
-    for (uint16_t i = 1; i < m; ++i) {
+    for (uint16_t i = 1; i < m; ++i)
+    {
         x[i] *= (float)scale;
     }
-    
+
     *tau = (float)((beta_val - alpha) / beta_val);
-    if (beta) *beta = (float)beta_val;
-    x[0] = 1.0f;  // v[0] = 1
+    if (beta)
+        *beta = (float)beta_val;
+    x[0] = 1.0f; // v[0] = 1
 }
 
 /**
@@ -160,17 +173,21 @@ static void compute_householder_clean(float *x, uint16_t m, float *tau, float *b
 static void apply_householder_clean(float *C, uint16_t m, uint16_t n,
                                     uint16_t ldc, const float *v, float tau)
 {
-    if (tau == 0.0f) return;
-    
-    for (uint16_t j = 0; j < n; ++j) {
+    if (tau == 0.0f)
+        return;
+
+    for (uint16_t j = 0; j < n; ++j)
+    {
         // Compute v^T * C[:,j]
         double dot = 0.0;
-        for (uint16_t i = 0; i < m; ++i) {
+        for (uint16_t i = 0; i < m; ++i)
+        {
             dot += (double)v[i] * (double)C[i * ldc + j];
         }
-        
+
         // Update C[:,j] -= tau * v * dot
-        for (uint16_t i = 0; i < m; ++i) {
+        for (uint16_t i = 0; i < m; ++i)
+        {
             C[i * ldc + j] -= tau * v[i] * (float)dot;
         }
     }
@@ -184,52 +201,58 @@ static void apply_householder_clean(float *C, uint16_t m, uint16_t n,
  * @brief Factor a panel - clean and correct version
  */
 static void panel_factor_clean(
-    float *panel,      // Panel to factor [m × ib], stride = lda
-    float *Y,          // Output: Householder vectors [m × ib]  
-    float *tau,        // Output: tau values [ib]
-    uint16_t m,        // Rows in panel
-    uint16_t ib,       // Columns in panel
-    uint16_t lda,      // Stride of full matrix
-    float *work)       // Workspace [m]
+    float *panel, // Panel to factor [m × ib], stride = lda
+    float *Y,     // Output: Householder vectors [m × ib]
+    float *tau,   // Output: tau values [ib]
+    uint16_t m,   // Rows in panel
+    uint16_t ib,  // Columns in panel
+    uint16_t lda, // Stride of full matrix
+    float *work)  // Workspace [m]
 {
     // Clear Y first
     memset(Y, 0, m * ib * sizeof(float));
-    
-    for (uint16_t j = 0; j < ib && j < m; ++j) {
+
+    for (uint16_t j = 0; j < ib && j < m; ++j)
+    {
         uint16_t col_len = m - j;
-        
+
         // Extract column j from panel
         float *col_ptr = &panel[j * lda + j];
-        for (uint16_t i = 0; i < col_len; ++i) {
+        for (uint16_t i = 0; i < col_len; ++i)
+        {
             work[i] = col_ptr[i * lda];
         }
-        
+
         // Compute Householder reflector
         float beta;
         compute_householder_clean(work, col_len, &tau[j], &beta);
-        
+
         // Write beta to R diagonal
         col_ptr[0] = beta;
-        
+
         // Write reflector tail back to panel
-        for (uint16_t i = 1; i < col_len; ++i) {
+        for (uint16_t i = 1; i < col_len; ++i)
+        {
             col_ptr[i * lda] = work[i];
         }
-        
+
         // Store complete reflector in Y
         // Y[:,j] starts at row j with the reflector
-        for (uint16_t i = 0; i < j; ++i) {
-            Y[i * ib + j] = 0.0f;  // Zero above diagonal
+        for (uint16_t i = 0; i < j; ++i)
+        {
+            Y[i * ib + j] = 0.0f; // Zero above diagonal
         }
-        for (uint16_t i = 0; i < col_len; ++i) {
-            Y[(j + i) * ib + j] = work[i];  // Store reflector
+        for (uint16_t i = 0; i < col_len; ++i)
+        {
+            Y[(j + i) * ib + j] = work[i]; // Store reflector
         }
-        
+
         // Apply reflector to trailing columns
-        if (j + 1 < ib) {
+        if (j + 1 < ib)
+        {
             float *trailing = &panel[j * lda + (j + 1)];
-            apply_householder_clean(trailing, col_len, ib - j - 1, 
-                                   lda, work, tau[j]);
+            apply_householder_clean(trailing, col_len, ib - j - 1,
+                                    lda, work, tau[j]);
         }
     }
 }
@@ -241,91 +264,158 @@ static void build_T_matrix(const float *Y, const float *tau, float *T,
                            uint16_t m, uint16_t ib)
 {
     memset(T, 0, (size_t)ib * ib * sizeof(float));
-    if (ib == 0) return;
+    if (ib == 0)
+        return;
 
     double *w = NULL;
     double w_stack[64];
-    
-    if (ib <= 64) {
+
+    if (ib <= 64)
+    {
         w = w_stack;
-    } else {
+    }
+    else
+    {
         w = (double *)malloc(ib * sizeof(double));
-        if (!w) return;
+        if (!w)
+            return;
     }
 
-    for (uint16_t i = 0; i < ib; ++i) {
+    for (uint16_t i = 0; i < ib; ++i)
+    {
         T[i * ib + i] = tau[i];
-        
-        if (tau[i] == 0.0f || i == 0) continue;
-        
+
+        if (tau[i] == 0.0f || i == 0)
+            continue;
+
         // Compute w = -tau[i] * Y^T[:,0:i-1] * Y[:,i]
-        for (uint16_t j = 0; j < i; ++j) {
+        for (uint16_t j = 0; j < i; ++j)
+        {
             double dot = 0.0;
-            for (uint16_t r = 0; r < m; ++r) {
+            for (uint16_t r = 0; r < m; ++r)
+            {
                 dot += (double)Y[r * ib + j] * (double)Y[r * ib + i];
             }
             w[j] = -(double)tau[i] * dot;
         }
-        
+
         // T[0:i-1, i] = T[0:i-1, 0:i-1] * w
-        for (uint16_t j = 0; j < i; ++j) {
+        for (uint16_t j = 0; j < i; ++j)
+        {
             double sum = 0.0;
-            for (uint16_t k = 0; k < i; ++k) {
+            for (uint16_t k = 0; k < i; ++k)
+            {
                 sum += (double)T[j * ib + k] * w[k];
             }
             T[j * ib + i] = (float)sum;
         }
     }
-    
-    if (ib > 64) free(w);
+
+    if (ib > 64)
+        free(w);
 }
 
 //==============================================================================
 // APPLY BLOCK REFLECTOR (keep existing but cleaned up)
 //==============================================================================
 static int apply_block_reflector_clean(
-    float *C,        // Matrix to update [m × n]
-    const float *Y,  // Householder vectors [m × ib]
-    const float *T,  // T matrix [ib × ib]
+    float *C,       // Matrix to update [m × n]
+    const float *Y, // Householder vectors [m × ib]
+    const float *T, // T matrix [ib × ib]
     uint16_t m, uint16_t n, uint16_t ib,
-    float *Z,        // Workspace [ib × n]
-    float *Z_temp,   // Workspace [ib × n]
-    float *YT)       // Y transposed [ib × m]
+    float *Z,      // Workspace [ib × n]
+    float *Z_temp, // Workspace [ib × n]
+    float *YT)     // Y transposed [ib × m]
 {
     // Build YT if not provided
     float *YT_local = NULL;
-    if (!YT) {
+    if (!YT)
+    {
         YT_local = (float *)malloc(ib * m * sizeof(float));
-        if (!YT_local) return -ENOMEM;
+        if (!YT_local)
+            return -ENOMEM;
         YT = YT_local;
     }
-    
+
     // Transpose Y to YT
-    for (uint16_t i = 0; i < ib; ++i) {
-        for (uint16_t j = 0; j < m; ++j) {
+    for (uint16_t i = 0; i < ib; ++i)
+    {
+        for (uint16_t j = 0; j < m; ++j)
+        {
             YT[i * m + j] = Y[j * ib + i];
         }
     }
-    
+
     // Step 1: Z = Y^T * C
     int ret = GEMM_CALL(Z, YT, C, ib, m, n, 1.0f, 0.0f);
-    if (ret != 0) {
-        if (YT_local) free(YT_local);
+    if (ret != 0)
+    {
+        if (YT_local)
+            free(YT_local);
         return ret;
     }
-    
+
     // Step 2: Z_temp = T * Z
     ret = GEMM_CALL(Z_temp, T, Z, ib, ib, n, 1.0f, 0.0f);
-    if (ret != 0) {
-        if (YT_local) free(YT_local);
+    if (ret != 0)
+    {
+        if (YT_local)
+            free(YT_local);
         return ret;
     }
-    
+
     // Step 3: C -= Y * Z_temp
     ret = GEMM_CALL(C, Y, Z_temp, m, ib, n, -1.0f, 1.0f);
-    
-    if (YT_local) free(YT_local);
+
+    if (YT_local)
+        free(YT_local);
     return ret;
+}
+
+// Add this new function for strided updates
+static int apply_block_reflector_strided(
+    float *C,
+    const float *Y,
+    const float *T,
+    uint16_t m, uint16_t n, uint16_t ib,
+    uint16_t ldc, // Actual row stride of C
+    float *Z,
+    float *Z_temp)
+{
+    // Z = Y^T * C with correct stride
+    for (uint16_t i = 0; i < ib; ++i)
+    {
+        for (uint16_t j = 0; j < n; ++j)
+        {
+            double sum = 0.0;
+            for (uint16_t r = 0; r < m; ++r)
+            {
+                sum += (double)Y[r * ib + i] * (double)C[r * ldc + j]; // Use ldc!
+            }
+            Z[i * n + j] = (float)sum;
+        }
+    }
+
+    // Z_temp = T * Z (these are tight, so GEMM is OK)
+    int ret = GEMM_CALL(Z_temp, T, Z, ib, ib, n, 1.0f, 0.0f);
+    if (ret != 0)
+        return ret;
+
+    // C -= Y * Z_temp with correct stride
+    for (uint16_t r = 0; r < m; ++r)
+    {
+        for (uint16_t j = 0; j < n; ++j)
+        {
+            double sum = 0.0;
+            for (uint16_t k = 0; k < ib; ++k)
+            {
+                sum += (double)Y[r * ib + k] * (double)Z_temp[k * n + j];
+            }
+            C[r * ldc + j] -= (float)sum; // Use ldc!
+        }
+    }
+
+    return 0;
 }
 
 //==============================================================================
@@ -334,142 +424,159 @@ static int apply_block_reflector_clean(
 int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
                           uint16_t m, uint16_t n, bool only_R)
 {
-    if (!ws || !A || !R) return -EINVAL;
-    if (m > ws->m_max || n > ws->n_max) return -EINVAL;
+    if (!ws || !A || !R)
+        return -EINVAL;
+    if (m > ws->m_max || n > ws->n_max)
+        return -EINVAL;
 
     const uint16_t kmax = MIN(m, n);
-    
+
     // ========================================================================
     // PHASE 1: BLOCKED FACTORIZATION
     // ========================================================================
     uint16_t block_count = 0;
-    
-    for (uint16_t k = 0; k < kmax; k += ws->ib) {
+
+    for (uint16_t k = 0; k < kmax; k += ws->ib)
+    {
         uint16_t block_size = MIN(ws->ib, kmax - k);
         uint16_t rows_below = m - k;
         uint16_t cols_right = (n > k + block_size) ? (n - k - block_size) : 0;
-        
+
         // Factor current panel
         panel_factor_clean(&A[k * n + k], ws->Y, &ws->tau[k],
-                          rows_below, block_size, n, ws->tmp);
-        
+                           rows_below, block_size, n, ws->tmp);
+
         // Build T matrix
         build_T_matrix(ws->Y, &ws->tau[k], ws->T, rows_below, block_size);
-        
+
         // Store Y and T for Q formation
-        if (ws->Y_stored && ws->T_stored) {
+        if (ws->Y_stored && ws->T_stored)
+        {
             size_t y_offset = block_count * ws->Y_block_stride;
             size_t t_offset = block_count * ws->T_block_stride;
-            
+
             float *Y_dst = &ws->Y_stored[y_offset];
             float *T_dst = &ws->T_stored[t_offset];
-            
+
             // Copy Y with actual size
             memcpy(Y_dst, ws->Y, rows_below * block_size * sizeof(float));
-            
+
             // Copy T (always block_size × block_size)
             memcpy(T_dst, ws->T, block_size * block_size * sizeof(float));
         }
-        
+
         // Apply block reflector to trailing matrix
-        if (cols_right > 0) {
-            // Build YT with rows_below stride for trailing update
-            // YT is [block_size × rows_below] for this operation
-            for (uint16_t i = 0; i < block_size; ++i) {
-                for (uint16_t j = 0; j < rows_below; ++j) {
+        if (cols_right > 0)
+        {
+            // Build YT for this operation
+            for (uint16_t i = 0; i < block_size; ++i)
+            {
+                for (uint16_t j = 0; j < rows_below; ++j)
+                {
                     ws->YT[i * rows_below + j] = ws->Y[j * block_size + i];
                 }
             }
-            
-            int ret = apply_block_reflector_clean(
-                &A[k * n + k + block_size],
-                ws->Y, ws->T, rows_below, cols_right, block_size,
-                ws->Z, ws->Z_temp, ws->YT);
-            
-            if (ret != 0) return ret;
+
+            // ✅ USE STRIDED VERSION HERE (submatrix has stride n, not cols_right)
+            int ret = apply_block_reflector_strided(
+                &A[k * n + k + block_size], // Submatrix pointer
+                ws->Y, ws->T,
+                rows_below, // m dimension
+                cols_right, // n dimension (logical width)
+                block_size, // ib
+                n,          // ldc = FULL matrix width (physical stride)
+                ws->Z, ws->Z_temp);
+
+            if (ret != 0)
+                return ret;
         }
-        
+
         block_count++;
     }
-    
+
     // ========================================================================
     // PHASE 2: EXTRACT R
     // ========================================================================
-    for (uint16_t i = 0; i < m; ++i) {
-        for (uint16_t j = 0; j < n; ++j) {
+    for (uint16_t i = 0; i < m; ++i)
+    {
+        for (uint16_t j = 0; j < n; ++j)
+        {
             R[i * n + j] = (i <= j) ? A[i * n + j] : 0.0f;
         }
     }
-    
+
     // ========================================================================
     // PHASE 3: FORM Q - WITH CONSISTENT YT DIMENSIONS
     // ========================================================================
-   if (!only_R && Q) {
-    // Initialize Q = I
-    memset(Q, 0, (size_t)m * m * sizeof(float));
-    for (uint16_t i = 0; i < m; ++i) {
-        Q[i * m + i] = 1.0f;
-    }
-    
-    // Apply blocks in reverse order
-    for (int blk = block_count - 1; blk >= 0; blk--) {
-        uint16_t k = blk * ws->ib;
-        uint16_t block_size = MIN(ws->ib, kmax - k);
-        uint16_t rows_below = m - k;
-        
-        // Clear workspace
-        memset(ws->Y, 0, ws->m_max * ws->ib * sizeof(float));
-        memset(ws->YT, 0, ws->ib * ws->m_max * sizeof(float));
-        
-        // Retrieve Y and T
-        size_t y_offset = blk * ws->Y_block_stride;
-        size_t t_offset = blk * ws->T_block_stride;
-        
-        float *Y_src = &ws->Y_stored[y_offset];
-        float *T_src = &ws->T_stored[t_offset];
-        
-        // Copy Y and T to workspace
-        memcpy(ws->Y, Y_src, rows_below * block_size * sizeof(float));
-        memcpy(ws->T, T_src, block_size * block_size * sizeof(float));
-        
-        // Build Y_full: shift Y down by k rows
-        float *Y_full = ws->Z_temp;
-        memset(Y_full, 0, m * block_size * sizeof(float));
-        
-        for (uint16_t i = 0; i < rows_below; ++i) {
-            for (uint16_t j = 0; j < block_size; ++j) {
-                Y_full[(k + i) * block_size + j] = ws->Y[i * block_size + j];
-            }
+    if (!only_R && Q)
+    {
+        // Initialize Q = I
+        memset(Q, 0, (size_t)m * m * sizeof(float));
+        for (uint16_t i = 0; i < m; ++i)
+        {
+            Q[i * m + i] = 1.0f;
         }
-        
-        // CRITICAL FIX: Build YT as TRUE transpose of Y_full
-        // YT must also be shifted by k to match Y_full
-        for (uint16_t i = 0; i < block_size; ++i) {
-            for (uint16_t j = 0; j < rows_below; ++j) {
-                uint16_t global_row = k + j;  // Apply the k shift!
-                ws->YT[i * m + global_row] = ws->Y[j * block_size + i];
+
+        // Apply blocks in reverse order
+        for (int blk = block_count - 1; blk >= 0; blk--)
+        {
+            uint16_t k = blk * ws->ib;
+            uint16_t block_size = MIN(ws->ib, kmax - k);
+            uint16_t rows_below = m - k;
+
+            // Clear workspace
+            memset(ws->Y, 0, ws->m_max * ws->ib * sizeof(float));
+            memset(ws->YT, 0, ws->ib * ws->m_max * sizeof(float));
+
+            // Retrieve Y and T
+            size_t y_offset = blk * ws->Y_block_stride;
+            size_t t_offset = blk * ws->T_block_stride;
+
+            memcpy(ws->Y, &ws->Y_stored[y_offset],
+                   rows_below * block_size * sizeof(float));
+            memcpy(ws->T, &ws->T_stored[t_offset],
+                   block_size * block_size * sizeof(float));
+
+            // Build Y_full: shift Y down by k rows
+            float *Y_full = ws->Z_temp;
+            memset(Y_full, 0, m * block_size * sizeof(float));
+
+            for (uint16_t i = 0; i < rows_below; ++i)
+            {
+                for (uint16_t j = 0; j < block_size; ++j)
+                {
+                    Y_full[(k + i) * block_size + j] = ws->Y[i * block_size + j];
+                }
             }
-            // The rest is already zero from memset
+
+            // ✅ CRITICAL FIX: Build YT as TRUE transpose of Y_full with k-shift
+            memset(ws->YT, 0, block_size * m * sizeof(float));
+            for (uint16_t i = 0; i < block_size; ++i)
+            {
+                for (uint16_t j = 0; j < rows_below; ++j)
+                {
+                    uint16_t global_row = k + j; // ← THE KEY FIX: Add k offset!
+                    ws->YT[i * m + global_row] = ws->Y[j * block_size + i];
+                }
+            }
+
+            // Now Y_full and YT are true transposes
+            int ret = apply_block_reflector_clean(
+                Q,          // Apply to all of Q (tight packing, stride=m)
+                Y_full,     // Y with k-shift [m × block_size]
+                ws->T,      // T matrix [block_size × block_size]
+                m,          // All rows
+                m,          // All columns (stride matches!)
+                block_size, // Number of reflectors
+                ws->Z,      // Workspace
+                ws->Y,      // Can reuse as workspace
+                ws->YT);    // YT with k-shift, true transpose of Y_full
+
+            if (ret != 0)
+                return ret;
         }
-        
-        // Now Y_full and YT are true transposes, so the block reflector
-        // H = I - Y_full * T * YT is the same one from factorization
-        
-        int ret = apply_block_reflector_clean(
-            Q,           // Apply to all of Q
-            Y_full,      // Y with k-shift [m × block_size]
-            ws->T,       // T matrix [block_size × block_size]
-            m,           // All rows
-            m,           // All columns
-            block_size,  // Number of reflectors
-            ws->Z,       // Workspace
-            ws->Y,       // Can reuse Y as workspace
-            ws->YT);     // YT with k-shift, true transpose of Y_full
-        
-        if (ret != 0) return ret;
     }
-}
-    
+
     return 0;
 }
 
@@ -480,7 +587,8 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
 int qr_ws_blocked(qr_workspace *ws, const float *A, float *Q, float *R,
                   uint16_t m, uint16_t n, bool only_R)
 {
-    if (!ws || !A || !R) return -EINVAL;
+    if (!ws || !A || !R)
+        return -EINVAL;
     memcpy(ws->Cpack, A, (size_t)m * n * sizeof(float));
     return qr_ws_blocked_inplace(ws, ws->Cpack, Q, R, m, n, only_R);
 }
@@ -489,7 +597,8 @@ int qr_blocked(const float *A, float *Q, float *R,
                uint16_t m, uint16_t n, bool only_R)
 {
     qr_workspace *ws = qr_workspace_alloc(m, n, 0);
-    if (!ws) return -ENOMEM;
+    if (!ws)
+        return -ENOMEM;
     int ret = qr_ws_blocked(ws, A, Q, R, m, n, only_R);
     qr_workspace_free(ws);
     return ret;

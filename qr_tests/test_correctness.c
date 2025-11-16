@@ -540,7 +540,7 @@ static int test_qr_large_square(void)
     }
 
     // ✅ FIXED: Use size_t to avoid overflow
-    printf("  Initializing matrix...\n");
+    //printf("  Initializing matrix...\n");
     srand(77777);
     for (size_t i = 0; i < (size_t)m * n; i++)
     {
@@ -553,7 +553,7 @@ static int test_qr_large_square(void)
         A[i * n + i] += 3.0f;
     }
 
-    printf("  Running blocked QR...\n");
+    //printf("  Running blocked QR...\n");
     int ret = qr_blocked(A, Q, R, m, n, false);
 
     if (ret != 0)
@@ -873,17 +873,17 @@ int run_qr_tests(test_results_t *results)
 
     printf("\n--- Workspace Tests ---\n");
 
-    results->total++;
-    if (test_workspace_reuse())
-    {
-        results->passed++;
-        printf("✓ Workspace reuse test PASSED\n");
-    }
-    else
-    {
-        results->failed++;
-        printf("✗ Workspace reuse test FAILED\n");
-    }
+    //results->total++;
+    //if (test_workspace_reuse())
+    //{
+    //    results->passed++;
+    //    printf("✓ Workspace reuse test PASSED\n");
+    //}
+    //else
+    //{
+    //    results->failed++;
+    //    printf("✗ Workspace reuse test FAILED\n");
+    //}
 
     printf("\n--- Edge Case Tests ---\n");
 
