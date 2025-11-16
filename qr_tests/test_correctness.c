@@ -539,10 +539,10 @@ static int test_qr_large_square(void)
         return 0;
     }
 
-    // Initialize with well-conditioned matrix
+    // ✅ FIXED: Use size_t to avoid overflow
     printf("  Initializing matrix...\n");
     srand(77777);
-    for (uint16_t i = 0; i < m * n; i++)
+    for (size_t i = 0; i < (size_t)m * n; i++)
     {
         A[i] = ((float)(rand() % 200) - 100.0f) / 100.0f;
     }
