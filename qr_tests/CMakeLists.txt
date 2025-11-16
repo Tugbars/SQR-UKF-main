@@ -18,7 +18,7 @@ if(MSVC)
     set(WARNING_FLAGS /W4)
 else()
     set(SIMD_FLAGS -mavx2 -mfma -msse4.2)
-    set(OPT_FLAGS -O3 -ffast-math -march=native)
+    set(OPT_FLAGS -O3 -march=native)
     set(WARNING_FLAGS -Wall -Wextra -Wpedantic -Wno-unused-parameter)
 endif()
 
