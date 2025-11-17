@@ -963,6 +963,19 @@ qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
     ws->vn1 = (float *)malloc(n_max * sizeof(float));
     ws->vn2 = (float *)malloc(n_max * sizeof(float));
 
+     // panel_Y_temp: Used for Y_left and Y_right during recursion
+    // Max size: m_max × ib (worst case for Y_left at first level)
+    ws->panel_Y_temp = (float *)gemm_aligned_alloc(32, 
+        (size_t)m_max * ws->ib * sizeof(float));
+    
+    // panel_T_temp: T matrix workspace for recursion
+    ws->panel_T_temp = (float *)gemm_aligned_alloc(32, 
+        ws->ib * ws->ib * sizeof(float));
+    
+    // panel_Z_temp: Z workspace for recursion
+    ws->panel_Z_temp = (float *)gemm_aligned_alloc(32, 
+        ws->ib * ws->ib * sizeof(float));
+
     size_t bytes =
         min_dim * sizeof(float) +
         m_max * sizeof(float) * 2 +
@@ -971,6 +984,11 @@ qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
         (size_t)ws->ib * n_big * sizeof(float) * 2 +
         (size_t)m_max * n_max * sizeof(float) +
         n_max * sizeof(float) * 2;
+
+     
+    bytes += (size_t)m_max * ws->ib * sizeof(float);      // panel_Y_temp
+    bytes += ws->ib * ws->ib * sizeof(float) * 2;         // panel_T_temp, panel_Z_temp
+    
 
     //==========================================================================
     // ✅ Allocate Y_stored and T_stored with proper layout
@@ -1008,7 +1026,8 @@ qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
     //==========================================================================
 
     if (!ws->tau || !ws->tmp || !ws->work || !ws->T || !ws->Cpack ||
-        !ws->Y || !ws->YT || !ws->Z || !ws->Z_temp || !ws->vn1 || !ws->vn2)
+        !ws->Y || !ws->YT || !ws->Z || !ws->Z_temp || !ws->vn1 || !ws->vn2 ||
+        !ws->panel_Y_temp || !ws->panel_T_temp || !ws->panel_Z_temp)
     {
         qr_workspace_free(ws);
         return NULL;
@@ -1063,6 +1082,12 @@ void qr_workspace_free(qr_workspace *ws)
     gemm_aligned_free(ws->Z_temp);
     gemm_aligned_free(ws->Y_stored);
     gemm_aligned_free(ws->T_stored);
+
+      // ✅ Free new buffers
+    gemm_aligned_free(ws->panel_Y_temp);
+    gemm_aligned_free(ws->panel_T_temp);
+    gemm_aligned_free(ws->panel_Z_temp);
+
     free(ws->vn1);
     free(ws->vn2);
     free(ws);
