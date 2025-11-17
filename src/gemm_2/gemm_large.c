@@ -974,3 +974,324 @@ void gemm_get_tuning(size_t M, size_t K, size_t N,
     gemm_select_blocking(M, K, N, MC, KC, NC, MR, NR);
 }
 
+/**
+ * @brief Pack A panel with explicit source stride
+ */
+static pack_strides_t pack_A_panel_simd_strided(
+    float *restrict Ap,
+    const float *restrict A,
+    size_t M, size_t lda,  // ← was K, now lda
+    size_t i0, size_t ib,
+    size_t k0, size_t kb,
+    float alpha,
+    size_t requested_mr)
+{
+    (void)M;
+    
+    size_t actual_mr = requested_mr;
+    assert(ib <= actual_mr && "ib exceeds MR: planning error");
+
+    if (ib < actual_mr)
+    {
+        memset(Ap, 0, kb * actual_mr * sizeof(float));
+    }
+
+    if (alpha == 1.0f)
+    {
+        for (size_t k = 0; k < kb; ++k)
+        {
+            if (k + 8 < kb)
+                PREFETCH_T0(A + i0 * lda + (k0 + k + 8));
+
+            const float *src_col = A + i0 * lda + (k0 + k);  // ← use lda
+            float *dst = Ap + k * actual_mr;
+
+            size_t i = 0;
+            for (; i + 7 < ib; i += 8)
+            {
+                __m256 v = _mm256_set_ps(
+                    src_col[7 * lda], src_col[6 * lda], src_col[5 * lda], src_col[4 * lda],
+                    src_col[3 * lda], src_col[2 * lda], src_col[1 * lda], src_col[0 * lda]);
+                _mm256_storeu_ps(dst + i, v);
+                src_col += 8 * lda;
+            }
+
+            const float *src_tail = A + (i0 + i) * lda + (k0 + k);
+            for (; i < ib; ++i)
+            {
+                dst[i] = src_tail[0];
+                src_tail += lda;
+            }
+        }
+    }
+    else
+    {
+        __m256 valpha = _mm256_set1_ps(alpha);
+        
+        for (size_t k = 0; k < kb; ++k)
+        {
+            if (k + 8 < kb)
+                PREFETCH_T0(A + i0 * lda + (k0 + k + 8));
+
+            const float *src_col = A + i0 * lda + (k0 + k);
+            float *dst = Ap + k * actual_mr;
+
+            size_t i = 0;
+            for (; i + 7 < ib; i += 8)
+            {
+                __m256 v = _mm256_set_ps(
+                    src_col[7 * lda], src_col[6 * lda], src_col[5 * lda], src_col[4 * lda],
+                    src_col[3 * lda], src_col[2 * lda], src_col[1 * lda], src_col[0 * lda]);
+                _mm256_storeu_ps(dst + i, _mm256_mul_ps(v, valpha));
+                src_col += 8 * lda;
+            }
+
+            const float *src_tail = A + (i0 + i) * lda + (k0 + k);
+            for (; i < ib; ++i)
+            {
+                dst[i] = src_tail[0] * alpha;
+                src_tail += lda;
+            }
+        }
+    }
+
+    pack_strides_t strides;
+    strides.a_k_stride = actual_mr;
+    strides.b_k_stride = 0;
+    return strides;
+}
+
+/**
+ * @brief Pack B panel with explicit source stride
+ */
+static pack_strides_t pack_B_panel_simd_strided(
+    float *restrict Bp,
+    const float *restrict B,
+    size_t K, size_t ldb,  // ← was N, now ldb
+    size_t k0, size_t kb,
+    size_t j0, size_t jb)
+{
+    (void)K;
+
+    const size_t B_STRIDE = 16;
+
+    if (jb < B_STRIDE)
+    {
+        memset(Bp, 0, kb * B_STRIDE * sizeof(float));
+    }
+
+    for (size_t k = 0; k < kb; ++k)
+    {
+        if (k + 4 < kb)
+            PREFETCH_T0(B + (k0 + k + 4) * ldb + j0);
+
+        const float *src_row = B + (k0 + k) * ldb + j0;  // ← use ldb
+        float *dst = Bp + k * B_STRIDE;
+
+        size_t j = 0;
+        for (; j + 7 < jb; j += 8)
+        {
+            __m256 v = _mm256_loadu_ps(src_row + j);
+            _mm256_storeu_ps(dst + j, v);
+        }
+
+        for (; j < jb; ++j)
+        {
+            dst[j] = src_row[j];
+        }
+    }
+
+    pack_strides_t strides;
+    strides.a_k_stride = 0;
+    strides.b_k_stride = B_STRIDE;
+    return strides;
+}
+
+/**
+ * @brief Execute GEMM with explicit stride parameters
+ * 
+ * This variant allows C, A, B to be submatrices of larger arrays,
+ * avoiding expensive pack/unpack operations in QR blocked updates.
+ * 
+ * **Use Case:**
+ * When C is a submatrix at C[i0:i0+M, j0:j0+N] within a larger matrix
+ * with leading dimension ldc, use this instead of copying.
+ * 
+ * **Example (QR trailing update):**
+ * ```c
+ * // Update A[k:m, k+ib:n] without copying
+ * float *C_sub = &A[k * n + (k + ib)];
+ * gemm_execute_plan_strided(plan, C_sub, Y, Z_temp,
+ *                          m-k, ib, n-(k+ib),
+ *                          n, ib, n,  // ldc, lda, ldb
+ *                          -1.0f, 1.0f);
+ * ```
+ * 
+ * @param plan  Execution plan (M,K,N must match logical dimensions)
+ * @param C     Output submatrix (M×N logical, stride ldc)
+ * @param A     Input A submatrix (M×K logical, stride lda)
+ * @param B     Input B submatrix (K×N logical, stride ldb)
+ * @param M     Logical rows in A and C
+ * @param K     Logical cols in A, rows in B
+ * @param N     Logical cols in B and C
+ * @param ldc   Physical stride of C (distance between rows)
+ * @param lda   Physical stride of A
+ * @param ldb   Physical stride of B
+ * @param alpha Scalar for A*B
+ * @param beta  Scalar for C
+ * 
+ * @return 0 on success, -1 on error
+ * 
+ * @note plan dimensions must match M,K,N (not ldc,lda,ldb)
+ * @note ldc >= N, lda >= K, ldb >= N (no validation!)
+ */
+int gemm_execute_plan_strided(
+    gemm_plan_t *plan,
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
+    size_t M, size_t K, size_t N,
+    size_t ldc, size_t lda, size_t ldb,
+    float alpha, float beta)
+{
+    if (!plan || !C || !A || !B)
+        return -1;
+    
+    // Validate logical dimensions match plan
+    if (M != plan->M || K != plan->K || N != plan->N)
+        return -1;
+
+    //--------------------------------------------------------------------------
+    // Beta pre-scaling with stride
+    //--------------------------------------------------------------------------
+    bool first_accumulation;
+    if (beta == 0.0f)
+    {
+        // Zero with stride awareness
+        for (size_t i = 0; i < M; ++i)
+            memset(C + i * ldc, 0, N * sizeof(float));
+        first_accumulation = true;
+    }
+    else if (beta != 1.0f)
+    {
+        // Scale with stride awareness
+        __m256 vbeta = _mm256_set1_ps(beta);
+        for (size_t i = 0; i < M; ++i)
+        {
+            float *row = C + i * ldc;
+            size_t j = 0;
+            for (; j + 7 < N; j += 8)
+            {
+                __m256 c = _mm256_loadu_ps(row + j);
+                _mm256_storeu_ps(row + j, _mm256_mul_ps(c, vbeta));
+            }
+            for (; j < N; ++j)
+                row[j] *= beta;
+        }
+        first_accumulation = false;
+    }
+    else
+    {
+        first_accumulation = false;
+    }
+
+    float *Ap = plan->workspace_a;
+    float *Bp = plan->workspace_b;
+
+    const size_t n_nc_tiles = plan->n_nc_tiles;
+    const size_t n_kc_tiles = plan->n_kc_tiles;
+    const size_t n_mc_tiles = plan->n_mc_tiles;
+
+    //--------------------------------------------------------------------------
+    // Main loop: Only change is using lda/ldb/ldc instead of K/N
+    //--------------------------------------------------------------------------
+    for (size_t jt = 0; jt < n_nc_tiles; jt++)
+    {
+        size_t j0 = jt * plan->NC;
+        size_t jb = MIN(plan->NC, N - j0);
+
+        for (size_t kt = 0; kt < n_kc_tiles; kt++)
+        {
+            size_t k0 = kt * plan->KC;
+            size_t kb = MIN(plan->KC, K - k0);
+
+            size_t n_panels = (jb + plan->NR - 1) / plan->NR;
+
+            // Pack B with stride ldb
+            pack_strides_t b_strides;
+            for (size_t p = 0; p < n_panels; p++)
+            {
+                size_t j = j0 + p * plan->NR;
+                size_t jw = MIN(plan->NR, j0 + jb - j);
+
+                float *Bp_panel = Bp + p * plan->KC * 16;
+                
+                // ✅ KEY CHANGE: Use ldb instead of plan->N
+                b_strides = pack_B_panel_simd_strided(
+                    Bp_panel, B, K, ldb,  // ← ldb instead of N
+                    k0, kb, j, jw);
+            }
+
+            for (size_t it = 0; it < n_mc_tiles; it++)
+            {
+                size_t i0 = it * plan->MC;
+                size_t ib = MIN(plan->MC, M - i0);
+                size_t n_mr_tiles = (ib + plan->MR - 1) / plan->MR;
+
+                for (size_t mt = 0; mt < n_mr_tiles; mt++)
+                {
+                    size_t i = i0 + mt * plan->MR;
+                    size_t mh = MIN(plan->MR, M - i);
+                    size_t pack_mr = plan->MR;
+
+                    // Pack A with stride lda
+                    // ✅ KEY CHANGE: Use lda instead of plan->K
+                    pack_strides_t a_strides = pack_A_panel_simd_strided(
+                        Ap, A, M, lda,  // ← lda instead of K
+                        i, mh, k0, kb, alpha, pack_mr);
+
+                    // Execute kernels
+                    for (size_t p = 0; p < n_panels; p++)
+                    {
+                        size_t j = j0 + p * plan->NR;
+                        size_t jw = MIN(plan->NR, j0 + jb - j);
+
+                        gemm_kernel_id_t kernel_id;
+
+                        if (mh == plan->MR && jw == plan->NR)
+                        {
+                            kernel_id = (kt == 0 && first_accumulation)
+                                            ? plan->kern_full_store
+                                            : plan->kern_full_add;
+                        }
+                        else
+                        {
+                            gemm_kernel_id_t kern_add, kern_store;
+                            int dummy_width;
+                            gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy_width);
+                            kernel_id = (kt == 0 && first_accumulation) ? kern_store : kern_add;
+                        }
+
+                        // ✅ KEY CHANGE: Use ldc instead of plan->N
+                        float *cptr = C + i * ldc + j;  // ← ldc
+                        float *bptr = Bp + p * plan->KC * 16;
+
+                        dispatch_kernel(
+                            kernel_id,
+                            cptr,
+                            ldc,  // ← ldc instead of plan->N
+                            Ap,
+                            a_strides.a_k_stride,
+                            bptr,
+                            b_strides.b_k_stride,
+                            kb,
+                            mh,
+                            jw);
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}

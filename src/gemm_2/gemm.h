@@ -288,6 +288,22 @@ void gemm_get_tuning(size_t M, size_t K, size_t N,
                      size_t *MR, size_t *NR);
 
 
+/**
+ * @brief GEMM with explicit stride parameters
+ * 
+ * Allows operating on submatrices without copying.
+ * 
+ * @note Requires ldc >= N, lda >= K, ldb >= N
+ */
+int gemm_strided(
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
+    size_t M, size_t K, size_t N,
+    size_t ldc, size_t lda, size_t ldb,
+    float alpha, float beta);
+
+
 #ifdef __cplusplus
 }
 #endif
