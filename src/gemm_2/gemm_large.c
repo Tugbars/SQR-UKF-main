@@ -1295,3 +1295,21 @@ int gemm_execute_plan_strided(
 
     return 0;
 }
+
+int gemm_strided(
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
+    size_t M, size_t K, size_t N,
+    size_t ldc, size_t lda, size_t ldb,
+    float alpha, float beta)
+{
+    gemm_plan_t *plan = gemm_plan_create(M, K, N);
+    if (!plan)
+        return -1;
+    
+    int ret = gemm_execute_plan_strided(plan, C, A, B, M, K, N,
+                                        ldc, lda, ldb, alpha, beta);
+    gemm_plan_destroy(plan);
+    return ret;
+}
