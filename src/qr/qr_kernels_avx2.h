@@ -621,6 +621,37 @@ static inline void copy_strided_to_contiguous_avx2(
     }
 }
 
+static inline void copy_contiguous_to_strided_avx2(
+    float *restrict dst,           // Strided destination
+    const float *restrict src,     // Contiguous source
+    uint16_t rows, uint16_t cols,
+    uint16_t ld_dst)               // Stride of destination
+{
+    // Process each row independently
+    for (uint16_t i = 0; i < rows; ++i)
+    {
+        // Calculate row pointers
+        const float *src_row = &src[i * cols];    // Contiguous access
+        float *dst_row = &dst[i * ld_dst];        // Strided access
+        
+        uint16_t j = 0;
+        
+        // Main loop: Copy 8 floats at a time
+        for (; j + 7 < cols; j += 8)
+        {
+            // Load 8 consecutive floats from contiguous source
+            __m256 v = _mm256_loadu_ps(&src_row[j]);
+            
+            // Store 8 consecutive floats to strided destination
+            _mm256_storeu_ps(&dst_row[j], v);
+        }
+        
+        // Scalar tail: Copy remaining 0-7 elements
+        for (; j < cols; ++j)
+            dst_row[j] = src_row[j];
+    }
+}
+
 /**
  * @brief AVX2-optimized zero-fill for strided matrices
  * 
