@@ -755,6 +755,9 @@ static int test_qr_large_square(void)
     }
 
     //printf("  Running blocked QR...\n");
+    float *A_orig = gemm_aligned_alloc(32, m * n * sizeof(float));
+
+    memcpy(A_orig, A, (size_t)m * n * sizeof(float));  // BEFORE qr_blocked
     int ret = qr_blocked(A, Q, R, m, n, false);
 
     if (ret != 0)
@@ -769,7 +772,8 @@ static int test_qr_large_square(void)
     // For large matrices, use relaxed tolerances
     passed &= is_upper_triangular(R, m, n, 1e-3);
     passed &= check_orthogonality(Q, m, 5e-4, "256×256");
-    passed &= check_reconstruction(A, Q, R, m, n, 1e-3, "256×256");
+    passed &= check_reconstruction(A_orig, Q, R, m, n, 1e-3, "256×256");  // Use A_orig
+
 
 cleanup:
     gemm_aligned_free(A);

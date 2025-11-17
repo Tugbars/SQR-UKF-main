@@ -944,37 +944,6 @@ int gemm_dynamic(
 }
 
 /**
- * @brief Query blocking parameters for given matrix dimensions
- * 
- * Returns the blocking parameters that would be selected by the planner
- * for given matrix dimensions. Useful for:
- * - Performance analysis
- * - Workspace size estimation
- * - Debugging blocking strategies
- * 
- * @param[in]  M  Number of rows in A and C
- * @param[in]  K  Number of columns in A, rows in B
- * @param[in]  N  Number of columns in B and C
- * @param[out] MC M-dimension cache block size
- * @param[out] KC K-dimension cache block size
- * @param[out] NC N-dimension cache block size
- * @param[out] MR M-dimension register block size
- * @param[out] NR N-dimension register block size
- * 
- * @note All output parameters must be non-NULL
- * @note Does not create a plan (lightweight query)
- * 
- * @see gemm_select_blocking()
- * @see gemm_workspace_query()
- */
-void gemm_get_tuning(size_t M, size_t K, size_t N,
-                     size_t *MC, size_t *KC, size_t *NC,
-                     size_t *MR, size_t *NR)
-{
-    gemm_select_blocking(M, K, N, MC, KC, NC, MR, NR);
-}
-
-/**
  * @brief Pack A panel with explicit source stride
  */
 static pack_strides_t pack_A_panel_simd_strided(
@@ -1312,4 +1281,35 @@ int gemm_strided(
                                         ldc, lda, ldb, alpha, beta);
     gemm_plan_destroy(plan);
     return ret;
+}
+
+/**
+ * @brief Query blocking parameters for given matrix dimensions
+ * 
+ * Returns the blocking parameters that would be selected by the planner
+ * for given matrix dimensions. Useful for:
+ * - Performance analysis
+ * - Workspace size estimation
+ * - Debugging blocking strategies
+ * 
+ * @param[in]  M  Number of rows in A and C
+ * @param[in]  K  Number of columns in A, rows in B
+ * @param[in]  N  Number of columns in B and C
+ * @param[out] MC M-dimension cache block size
+ * @param[out] KC K-dimension cache block size
+ * @param[out] NC N-dimension cache block size
+ * @param[out] MR M-dimension register block size
+ * @param[out] NR N-dimension register block size
+ * 
+ * @note All output parameters must be non-NULL
+ * @note Does not create a plan (lightweight query)
+ * 
+ * @see gemm_select_blocking()
+ * @see gemm_workspace_query()
+ */
+void gemm_get_tuning(size_t M, size_t K, size_t N,
+                     size_t *MC, size_t *KC, size_t *NC,
+                     size_t *MR, size_t *NR)
+{
+    gemm_select_blocking(M, K, N, MC, KC, NC, MR, NR);
 }

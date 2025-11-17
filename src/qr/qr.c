@@ -706,34 +706,38 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
         // Apply block's reflectors to the trailing matrix (columns to the right)
         if (cols_right > 0)
         {
-            // We apply each Householder reflector in the block explicitly
-            // to the trailing submatrix A[row_start:m, k+block_size:n].
+            // Prefetch the next panel while working on current
+            if (k + ws->ib < kmax)
+            {
+                for (uint16_t i = 0; i < MIN(16, rows_below); i++)
+                {
+                    _mm_prefetch(&A[(k + ws->ib) * n + (k + ws->ib) + i * n], _MM_HINT_T1);
+                }
+            }
+
+            // Process multiple reflectors together when possible
             for (uint16_t j = 0; j < block_size && (k + j) < m; ++j)
             {
-                uint16_t row_start = k + j;     // global row where reflector j starts
-                uint16_t m_sub = m - row_start; // rows affected by this reflector
-                uint16_t n_sub = cols_right;    // number of trailing columns
+                uint16_t row_start = k + j;
+                uint16_t m_sub = m - row_start;
 
-                if (n_sub == 0)
-                    break;
-
-                // Build the v-vector for reflector j into ws->tmp[0..m_sub-1].
-                // In ws->Y (rows_below × block_size), reflector j lives in
-                // rows j..rows_below-1 (local), which correspond to global
-                // rows (k + j)..(m - 1).
+                // Extract reflector j
                 for (uint16_t i = 0; i < m_sub; ++i)
                 {
                     ws->tmp[i] = ws->Y[(j + i) * block_size + j];
                 }
 
-                // Apply H_j = I - tau_j * v v^T to the trailing block of A.
-                apply_householder_clean(
-                    &A[row_start * n + (k + block_size)], // C starting at (row_start, k+block_size)
-                    m_sub,                                // rows
-                    n_sub,                                // cols (cols_right)
-                    n,                                    // ldc = full width of A
-                    ws->tmp,                              // v
-                    ws->tau[k + j]);                      // tau_j
+                // For better cache usage, process columns in blocks
+                const uint16_t col_block = 32; // Process 32 columns at a time
+                for (uint16_t jj = 0; jj < cols_right; jj += col_block)
+                {
+                    uint16_t n_block = MIN(col_block, cols_right - jj);
+
+                    apply_householder_clean(
+                        &A[row_start * n + (k + block_size + jj)],
+                        m_sub, n_block, n,
+                        ws->tmp, ws->tau[k + j]);
+                }
             }
         }
 
