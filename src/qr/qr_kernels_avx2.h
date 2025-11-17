@@ -22,6 +22,8 @@
 #define QR_KERNELS_AVX2_H
 
 #include <stdint.h>
+#include <math.h>
+#include <float.h>
 #include <immintrin.h>
 
 #ifdef __AVX2__
@@ -734,6 +736,138 @@ static inline void extract_R_avx2(float *restrict R, const float *restrict A,
         for (; j < n; ++j)
             r_row[j] = a_row[j];
     }
+}
+
+/**
+ * @brief Overflow-safe squared norm using LAPACK's DLASSQ algorithm
+ * 
+ * Computes ||x||² without overflow/underflow by maintaining (scale, sumsq):
+ *   norm² = scale² * sumsq
+ * 
+ * where scale = max(|x[i]|) and sumsq = Σ(x[i]/scale)²
+ * 
+ * This handles:
+ * - Large values (|x| > √FLT_MAX ≈ 1e19): Would overflow in naive x²
+ * - Tiny values (|x| < √FLT_MIN ≈ 1e-19): Would underflow in naive x²
+ * - Mixed scales: Some huge, some tiny elements
+ * 
+ * @param x Input vector
+ * @param len Vector length
+ * @param scale [in/out] Running scale factor (max |x[i]| seen so far)
+ * @param sumsq [in/out] Running sum of squares (Σ(x[i]/scale)²)
+ * 
+ * @note Based on LAPACK SLASSQ/DLASSQ
+ * @note Call with scale=0, sumsq=1 initially
+ * @note Final norm = scale * sqrt(sumsq)
+ */
+static inline void dlassq_avx2(const float *restrict x, uint16_t len,
+                                double *restrict scale, double *restrict sumsq)
+{
+    if (len == 0)
+        return;
+
+    double s = *scale;
+    double ssq = *sumsq;
+
+#ifdef __AVX2__
+    if (len >= 8)
+    {
+        // Process 8 elements at a time
+        for (uint16_t i = 0; i < len - 7; i += 8)
+        {
+            __m256 v = _mm256_loadu_ps(&x[i]);
+            
+            // Compute absolute values
+            __m256 abs_v = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            
+            // Extract to scalar for safe comparison/update
+            // (AVX2 doesn't have good horizontal max, this is acceptable)
+            float vals[8];
+            _mm256_storeu_ps(vals, abs_v);
+            
+            for (int j = 0; j < 8; ++j)
+            {
+                double absxi = (double)vals[j];
+                
+                if (absxi > s)
+                {
+                    // New max: rescale sumsq
+                    double ratio = s / absxi;
+                    ssq = 1.0 + ssq * ratio * ratio;
+                    s = absxi;
+                }
+                else if (absxi > 0.0)
+                {
+                    // Add to sumsq
+                    double ratio = absxi / s;
+                    ssq += ratio * ratio;
+                }
+                // else: zero or NaN, skip
+            }
+        }
+    }
+#endif
+
+    // Scalar tail
+    for (uint16_t i = (len / 8) * 8; i < len; ++i)
+    {
+        double absxi = fabs((double)x[i]);
+        
+        if (absxi > s)
+        {
+            double ratio = s / absxi;
+            ssq = 1.0 + ssq * ratio * ratio;
+            s = absxi;
+        }
+        else if (absxi > 0.0)
+        {
+            double ratio = absxi / s;
+            ssq += ratio * ratio;
+        }
+    }
+
+    *scale = s;
+    *sumsq = ssq;
+}
+
+/**
+ * @brief Check for NaN/Inf in column
+ * 
+ * @return true if any NaN or Inf found
+ */
+static inline bool has_nan_or_inf(const float *x, uint16_t len)
+{
+#ifdef __AVX2__
+    if (len >= 8)
+    {
+        for (uint16_t i = 0; i < len - 7; i += 8)
+        {
+            __m256 v = _mm256_loadu_ps(&x[i]);
+            
+            // Check for NaN: x != x
+            __m256 nan_mask = _mm256_cmp_ps(v, v, _CMP_UNORD_Q);
+            
+            // Check for Inf: |x| == Inf
+            __m256 abs_v = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            __m256 inf_mask = _mm256_cmp_ps(abs_v, _mm256_set1_ps(INFINITY), _CMP_EQ_OQ);
+            
+            // Combine masks
+            __m256 bad_mask = _mm256_or_ps(nan_mask, inf_mask);
+            
+            if (_mm256_movemask_ps(bad_mask) != 0)
+                return true;
+        }
+    }
+#endif
+
+    // Scalar tail
+    for (uint16_t i = (len / 8) * 8; i < len; ++i)
+    {
+        if (isnan(x[i]) || isinf(x[i]))
+            return true;
+    }
+    
+    return false;
 }
 
 #endif // __AVX2__

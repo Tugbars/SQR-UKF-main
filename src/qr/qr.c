@@ -90,12 +90,89 @@ static uint16_t select_optimal_ib(uint16_t m, uint16_t n)
     return ib;
 }
 
+
+/**
+ * @brief Check for extreme values that need safe path
+ * 
+ * @param x Vector to check
+ * @param len Vector length
+ * @param max_abs [out] Maximum absolute value found
+ * @return true if safe path needed (NaN/Inf or extreme values)
+ */
+static inline bool needs_safe_householder(const float *x, uint16_t len, float *max_abs)
+{
+    // Thresholds based on float32 range
+    const float OVERFLOW_THRESHOLD = 1e19f;   // √FLT_MAX ≈ 1.84e19
+    const float UNDERFLOW_THRESHOLD = 1e-19f; // √FLT_MIN ≈ 1.08e-19
+    
+    // Check for NaN/Inf first
+    if (has_nan_or_inf(x, len))
+        return true;
+    
+    // Find maximum absolute value
+    float max_val = 0.0f;
+    
+#ifdef __AVX2__
+    if (len >= 8)
+    {
+        __m256 max_vec = _mm256_setzero_ps();
+        
+        for (uint16_t i = 0; i < len - 7; i += 8)
+        {
+            __m256 v = _mm256_loadu_ps(&x[i]);
+            __m256 abs_v = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), v);
+            max_vec = _mm256_max_ps(max_vec, abs_v);
+        }
+        
+        // Horizontal max
+        float vals[8];
+        _mm256_storeu_ps(vals, max_vec);
+        for (int i = 0; i < 8; ++i)
+            if (vals[i] > max_val)
+                max_val = vals[i];
+    }
+#endif
+
+    // Scalar tail
+    for (uint16_t i = (len / 8) * 8; i < len; ++i)
+    {
+        float abs_val = fabsf(x[i]);
+        if (abs_val > max_val)
+            max_val = abs_val;
+    }
+    
+    *max_abs = max_val;
+    
+    // Check if extreme
+    if (max_val > OVERFLOW_THRESHOLD)
+        return true;  // Risk of overflow in x²
+    
+    if (max_val > 0.0f && max_val < UNDERFLOW_THRESHOLD)
+        return true;  // Risk of underflow in x²
+    
+    return false;
+}
+
 //==============================================================================
 // HOUSEHOLDER REFLECTION PRIMITIVES
 //==============================================================================
 
-static void compute_householder_clean(float *restrict x, uint16_t m,
-                                      float *restrict tau, float *restrict beta)
+/**
+ * @brief Robust Householder reflector generation with fast/safe path selection
+ * 
+ * Uses fast AVX2 norm computation by default, falls back to scaled algorithm
+ * only when overflow/underflow risk detected.
+ * 
+ * @param x [in/out] Input vector, output: normalized reflector (x[0]=1 implicit)
+ * @param m Vector length
+ * @param tau [out] Householder scaling factor τ
+ * @param beta [out] Resulting diagonal element β
+ * 
+ * @note Fast path: Direct norm² computation (most common)
+ * @note Safe path: LAPACK DLASSQ scaling (rare, extreme values)
+ */
+static void compute_householder_robust(float *restrict x, uint16_t m,
+                                        float *restrict tau, float *restrict beta)
 {
     if (m == 0)
     {
@@ -114,8 +191,109 @@ static void compute_householder_clean(float *restrict x, uint16_t m,
         return;
     }
 
-    // ✅ Use AVX2 kernel if available
+    //==========================================================================
+    // Check if we need safe path
+    //==========================================================================
+    
+    float tail_max;
+    bool need_safe = needs_safe_householder(&x[1], m - 1, &tail_max);
+    
+    // Also check alpha
+    float abs_alpha = fabsf(x[0]);
+    if (!need_safe)
+    {
+        const float OVERFLOW_THRESHOLD = 1e19f;
+        const float UNDERFLOW_THRESHOLD = 1e-19f;
+        
+        if (!isfinite(x[0]) ||
+            abs_alpha > OVERFLOW_THRESHOLD ||
+            (abs_alpha > 0.0f && abs_alpha < UNDERFLOW_THRESHOLD))
+        {
+            need_safe = true;
+        }
+    }
+
+    //==========================================================================
+    // SAFE PATH: Use scaled computation if needed
+    //==========================================================================
+    
+    if (need_safe)
+    {
+        double alpha = (double)x[0];
+        
+        // Compute safe norm using LAPACK DLASSQ algorithm
+        double scale = 0.0;
+        double sumsq = 1.0;
+        
+        // Add tail elements
+        for (uint16_t i = 1; i < m; ++i)
+        {
+            double absxi = fabs((double)x[i]);
+            if (absxi > scale)
+            {
+                double ratio = scale / absxi;
+                sumsq = 1.0 + sumsq * ratio * ratio;
+                scale = absxi;
+            }
+            else if (absxi > 0.0)
+            {
+                double ratio = absxi / scale;
+                sumsq += ratio * ratio;
+            }
+        }
+        
+        // Add alpha
+        double absalpha = fabs(alpha);
+        if (absalpha > scale)
+        {
+            double ratio = scale / absalpha;
+            sumsq = 1.0 + sumsq * ratio * ratio;
+            scale = absalpha;
+        }
+        else if (absalpha > 0.0)
+        {
+            double ratio = absalpha / scale;
+            sumsq += ratio * ratio;
+        }
+        
+        // Handle zero/NaN case
+        if (scale == 0.0 || !isfinite(sumsq))
+        {
+            *tau = 0.0f;
+            if (beta)
+                *beta = x[0];
+            x[0] = 1.0f;
+            return;
+        }
+        
+        // Reconstruct norm
+        double norm = scale * sqrt(sumsq);
+        
+        // Compute beta
+        double beta_val = -copysign(norm, alpha);
+        
+        // Compute tau
+        *tau = (float)((beta_val - alpha) / beta_val);
+        
+        if (beta)
+            *beta = (float)beta_val;
+        
+        // Normalize reflector with safe scaling
+        double scale_factor = 1.0 / (alpha - beta_val);
+        
+        for (uint16_t i = 1; i < m; ++i)
+            x[i] *= (float)scale_factor;
+        
+        x[0] = 1.0f;
+        return;
+    }
+
+    //==========================================================================
+    // FAST PATH: Normal computation (no overflow risk)
+    //==========================================================================
+    
     double norm_sq;
+    
 #ifdef __AVX2__
     norm_sq = (m > 9) ? compute_norm_sq_avx2(&x[1], m - 1) : 0.0;
     if (m <= 9)
@@ -129,6 +307,7 @@ static void compute_householder_clean(float *restrict x, uint16_t m,
         }
     }
 
+    // Check for zero tail
     if (norm_sq == 0.0)
     {
         *tau = 0.0f;
@@ -142,7 +321,7 @@ static void compute_householder_clean(float *restrict x, uint16_t m,
     double beta_val = -copysign(sqrt(alpha * alpha + norm_sq), alpha);
     double scale = 1.0 / (alpha - beta_val);
 
-    // Vectorized scaling (already fast enough, keep as-is)
+    // Vectorized scaling
 #ifdef __AVX2__
     if (m > 9)
     {
@@ -169,7 +348,6 @@ static void compute_householder_clean(float *restrict x, uint16_t m,
         *beta = (float)beta_val;
     x[0] = 1.0f;
 }
-
 
 static void apply_householder_clean(float *restrict C, uint16_t m, uint16_t n,
                                     uint16_t ldc, const float *restrict v, float tau)
@@ -249,7 +427,7 @@ static void panel_factor_clean(
 
         // Compute Householder reflector
         float beta;
-        compute_householder_clean(work, col_len, &tau[j], &beta);
+        compute_householder_robust(work, col_len, &tau[j], &beta);
 
         // Write beta to R diagonal
         col_ptr[0] = beta;
