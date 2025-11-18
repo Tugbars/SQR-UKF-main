@@ -405,7 +405,7 @@ void gemm_select_kernels(
         }
     }
     else if (m_class == 3 || m_class == 4) {
-        // ✅ CRITICAL FIX: m ∈ [9, ∞) → Use 16× kernels (composite)
+        //  CRITICAL FIX: m ∈ [9, ∞) → Use 16× kernels (composite)
         if (n_class <= 2) {  // n ∈ [1, 8]
             selected_add = KERN_16x8_ADD;
             selected_store = KERN_16x8_STORE;
@@ -678,14 +678,12 @@ gemm_plan_t *gemm_plan_create_with_mode(
     }
     else  // GEMM_MEM_DYNAMIC
 {
-    // ✅ FIX: Allocate workspace_a based on MR, not MC!
+    // FIX: Allocate workspace_a based on MR, not MC!
     // 
     // Rationale: pack_A_panel_simd_strided() always writes MR rows,
     // regardless of actual ib. It writes kb × requested_mr floats.
     // So workspace_a must be sized for MR × KC, not MC × KC.
-    // 
-    // Old (WRONG): size_t a_size = plan->MC * plan->KC * sizeof(float);
-    // New (CORRECT):
+
     size_t a_size = plan->MR * plan->KC * sizeof(float);
     
     // workspace_b sizing: Multiple N-panels, each KC × 16 floats
