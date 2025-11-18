@@ -283,8 +283,8 @@ void gemm_select_kernels(
         return;
     }
 
-    // Priority 2: 16×8 (tall tile, composite)
-    if (m_height >= 16 && n_width >= 8 && n_width < 16) {
+    // Priority 2: 16×8 (tall tile, n MUST be ≤ 8)
+    if (m_height >= 16 && n_width >= 1 && n_width <= 8) {
         *kern_add = KERN_16x8_ADD;
         *kern_store = KERN_16x8_STORE;
         *kernel_width = 8;
@@ -292,7 +292,7 @@ void gemm_select_kernels(
     }
 
     // Priority 3: 8×16 (wide tile, native)
-    if (m_height >= 8 && m_height < 16 && n_width >= 16) {
+    if (m_height >= 8 && m_height < 16 && n_width > 8) {
         *kern_add = KERN_8x16_ADD;
         *kern_store = KERN_8x16_STORE;
         *kernel_width = 16;
@@ -300,38 +300,38 @@ void gemm_select_kernels(
     }
 
     // Priority 4: 16×6 (for QR with N=6 blocks, composite)
-    if (m_height >= 16 && n_width >= 6 && n_width < 8) {
+    if (m_height >= 16 && n_width >= 6 && n_width <= 8) {
         *kern_add = KERN_16x6_ADD;
         *kern_store = KERN_16x6_STORE;
         *kernel_width = 6;
         return;
     }
 
-    // Priority 5: 8×8 (most common, native)
-    if (m_height >= 8 && m_height < 16 && n_width >= 8 && n_width < 16) {
+    // Priority 5: 8×8 (handles m=5-15, n≤8)
+    if (m_height >= 5 && m_height < 16 && n_width >= 1 && n_width <= 8) {  // ✅ Changed >= 8 to >= 5
         *kern_add = KERN_8x8_ADD;
         *kern_store = KERN_8x8_STORE;
         *kernel_width = 8;
         return;
     }
 
-    // Priority 6: 8×6 (for QR with N=6 blocks, native)
-    if (m_height >= 8 && m_height < 16 && n_width >= 6 && n_width < 8) {
+    // Priority 6: 8×6 (for QR, redundant now but keep for clarity)
+    if (m_height >= 8 && m_height < 16 && n_width == 6) {
         *kern_add = KERN_8x6_ADD;
         *kern_store = KERN_8x6_STORE;
         *kernel_width = 6;
         return;
     }
 
-    // Priority 7: 4×8 (short tile, native)
-    if (m_height >= 4 && m_height < 8) {
+    // Priority 7: 4×8 (handles m=1-4)
+    if (m_height >= 1 && m_height <= 4) {  // ✅ Only m≤4
         *kern_add = KERN_4x8_ADD;
         *kern_store = KERN_4x8_STORE;
         *kernel_width = 8;
         return;
     }
 
-    // Fallback: 1×8 (single row, always fits)
+    // Fallback: 1×8 (should rarely/never be reached)
     *kern_add = KERN_1x8_ADD;
     *kern_store = KERN_1x8_STORE;
     *kernel_width = 8;

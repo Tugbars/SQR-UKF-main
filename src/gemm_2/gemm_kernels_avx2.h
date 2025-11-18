@@ -262,7 +262,7 @@ static inline void gemm_4x8_panel_avx2fma_add(
     float *RESTRICT c, size_t ldc,
     const float *RESTRICT Ap, size_t a_k_stride,
     const float *RESTRICT Bp, size_t b_k_stride,
-    size_t Kblk, size_t jb, __m256i m)
+    size_t Kblk, size_t m_block, size_t jb, __m256i m)
 {
     (void)m; // Unused in safe version
 
@@ -325,22 +325,26 @@ static inline void gemm_4x8_panel_avx2fma_add(
         acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 3), b, acc3);
     }
 
-    // ✅ SAFE WRITEBACK: No masked stores!
+     // ✅ Conditional writeback based on actual row count
     if (jb == 8)
     {
-        // Full width - fast path
-        GEMM_STORE_C(c + 0 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 0 * ldc), acc0));
-        GEMM_STORE_C(c + 1 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 1 * ldc), acc1));
-        GEMM_STORE_C(c + 2 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 2 * ldc), acc2));
-        GEMM_STORE_C(c + 3 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 3 * ldc), acc3));
+        // Write only the rows that exist
+        if (m_block >= 1)
+            GEMM_STORE_C(c + 0 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 0 * ldc), acc0));
+        if (m_block >= 2)
+            GEMM_STORE_C(c + 1 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 1 * ldc), acc1));
+        if (m_block >= 3)
+            GEMM_STORE_C(c + 2 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 2 * ldc), acc2));
+        if (m_block >= 4)
+            GEMM_STORE_C(c + 3 * ldc, _mm256_add_ps(GEMM_LOAD_C(c + 3 * ldc), acc3));
     }
     else
     {
-        // Partial width - safe scalar loop
-        gemm_store_partial_add(c + 0 * ldc, acc0, jb);
-        gemm_store_partial_add(c + 1 * ldc, acc1, jb);
-        gemm_store_partial_add(c + 2 * ldc, acc2, jb);
-        gemm_store_partial_add(c + 3 * ldc, acc3, jb);
+        // Partial width: use scalar loops (already conditional on m_block)
+        if (m_block >= 1) gemm_store_partial_add(c + 0 * ldc, acc0, jb);
+        if (m_block >= 2) gemm_store_partial_add(c + 1 * ldc, acc1, jb);
+        if (m_block >= 3) gemm_store_partial_add(c + 2 * ldc, acc2, jb);
+        if (m_block >= 4) gemm_store_partial_add(c + 3 * ldc, acc3, jb);
     }
 }
 
@@ -352,7 +356,7 @@ static inline void gemm_4x8_panel_avx2fma_store(
     float *RESTRICT c, size_t ldc,
     const float *RESTRICT Ap, size_t a_k_stride,
     const float *RESTRICT Bp, size_t b_k_stride,
-    size_t Kblk, size_t jb, __m256i m)
+    size_t Kblk,  size_t m_block, size_t jb, __m256i m)
 {
     (void)m; // Unused in safe version
 
@@ -415,22 +419,30 @@ static inline void gemm_4x8_panel_avx2fma_store(
         acc3 = _mm256_fmadd_ps(_mm256_broadcast_ss(Ap + k * a_k_stride + 3), b, acc3);
     }
 
-    // ✅ SAFE WRITEBACK: No masked stores!
+     // ✅ SAFE WRITEBACK: Conditional on m_block
     if (jb == 8)
     {
-        // Full width - fast path
-        GEMM_STORE_C(c + 0 * ldc, acc0);
-        GEMM_STORE_C(c + 1 * ldc, acc1);
-        GEMM_STORE_C(c + 2 * ldc, acc2);
-        GEMM_STORE_C(c + 3 * ldc, acc3);
+        // Full width - direct stores, but only for rows that exist
+        if (m_block >= 1)
+            GEMM_STORE_C(c + 0 * ldc, acc0);
+        if (m_block >= 2)
+            GEMM_STORE_C(c + 1 * ldc, acc1);
+        if (m_block >= 3)
+            GEMM_STORE_C(c + 2 * ldc, acc2);
+        if (m_block >= 4)
+            GEMM_STORE_C(c + 3 * ldc, acc3);
     }
     else
     {
-        // Partial width - safe scalar loop
-        gemm_store_partial_store(c + 0 * ldc, acc0, jb);
-        gemm_store_partial_store(c + 1 * ldc, acc1, jb);
-        gemm_store_partial_store(c + 2 * ldc, acc2, jb);
-        gemm_store_partial_store(c + 3 * ldc, acc3, jb);
+        // Partial width - safe scalar loop, conditional on m_block
+        if (m_block >= 1)
+            gemm_store_partial_store(c + 0 * ldc, acc0, jb);
+        if (m_block >= 2)
+            gemm_store_partial_store(c + 1 * ldc, acc1, jb);
+        if (m_block >= 3)
+            gemm_store_partial_store(c + 2 * ldc, acc2, jb);
+        if (m_block >= 4)
+            gemm_store_partial_store(c + 3 * ldc, acc3, jb);
     }
 }
 
@@ -1974,7 +1986,7 @@ static inline void gemm_16x8_panel_avx2fma_add(
     const int do_pf = (int)(Kblk >= (size_t)GEMM_PREFETCH_MIN_K);
     gemm_prefetch_c_rows(c, ldc, m);
 
-    const size_t PF_LONG = 32;
+    //const size_t PF_LONG = 32;
 
     // ✅ MAIN LOOP: Unroll by 2 with interleaved computation
     size_t k = 0;

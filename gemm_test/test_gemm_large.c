@@ -373,12 +373,13 @@ static int test_kernel_4x8(void)
 
     // Correct argument order for 4x8
     gemm_4x8_panel_avx2fma_store(
-        C_test, ldc,
-        Ap, 8,
-        Bp, 16,
-        K,
-        8, // jb (width)
-        mask);
+    C_test, ldc,
+    Ap, 8,
+    Bp, 16,
+    K,
+    4,     // m_block (number of rows to actually write)
+    8,     // jb (width)
+    mask);
 
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
 
@@ -392,13 +393,13 @@ static int test_kernel_4x8(void)
     }
 
     gemm_4x8_panel_avx2fma_add(
-        C_test, ldc,
-        Ap, 8,
-        Bp, 16,
-        K,
-        8,
-        mask);
-
+    C_test, ldc,
+    Ap, 8,
+    Bp, 16,
+    K,
+    4,     // m_block (number of rows to actually write)
+    8,     // jb (width)
+    mask);
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 1);
 
     passed &= compare_matrices_verbose(C_test, C_ref, M, N, ldc, 1e-5f, "4x8 ADD");
@@ -973,17 +974,23 @@ static int test_kernel_combination(void)
 
     __m256i mask = _mm256_set1_epi32(-1);
 
-    gemm_8x8_panel_avx2fma_store(
-        C_test, ldc,
-        Ap8, 8,
-        Bp, 16,
-        K, 8, 8, mask);
+    gemm_4x8_panel_avx2fma_store(
+    C_test + 8 * ldc, ldc,
+    Ap4, 8,
+    Bp, 16,
+    K,
+    4,     // m_block (4 rows for this tile)
+    8,     // jb (width)
+    mask);
 
     gemm_4x8_panel_avx2fma_store(
-        C_test + 8 * ldc, ldc,
-        Ap4, 8,
-        Bp, 16,
-        K, 8, mask);
+    C_test + 8 * ldc, ldc,
+    Ap4, 8,
+    Bp, 16,
+    K,
+    4,     // m_block - processing 4 rows
+    8,     // jb - width is 8
+    mask);
 
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
 

@@ -1112,21 +1112,19 @@ int run_qr_tests(test_results_t *results)
         printf("✗ Large square test FAILED\n");
     }
 
+     printf("\n--- Workspace Tests ---\n");
 
-
-    //printf("\n--- Workspace Tests ---\n");
-
-    //results->total++;
-    //if (test_workspace_reuse())
-    //{
-    //    results->passed++;
-    //    printf("✓ Workspace reuse test PASSED\n");
-    //}
-    //else
-    //{
-    //    results->failed++;
-    //    printf("✗ Workspace reuse test FAILED\n");
-    //}
+     results->total++;
+     if (test_workspace_reuse())
+    {
+         results->passed++;
+         printf("✓ Workspace reuse test PASSED\n");
+     }
+     else
+    {
+         results->failed++;
+         printf("✗ Workspace reuse test FAILED\n");
+     }
 
     printf("\n--- Edge Case Tests ---\n");
 

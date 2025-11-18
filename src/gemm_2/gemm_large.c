@@ -631,13 +631,16 @@ static inline void dispatch_kernel(
                                      Kblk, m_block, n_block, mask_unused);
         break;
     case KERN_4x8_ADD:
-        gemm_4x8_panel_avx2fma_add(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
-                                   Kblk, n_block, mask_unused);
-        break;
-    case KERN_4x8_STORE:
-        gemm_4x8_panel_avx2fma_store(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
-                                     Kblk, n_block, mask_unused);
-        break;
+    gemm_4x8_panel_avx2fma_add(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
+                               Kblk, m_block, n_block, mask_unused);
+    //                                ^^^^^^^ ✅ ADD THIS!
+    break;
+
+case KERN_4x8_STORE:
+    gemm_4x8_panel_avx2fma_store(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
+                                 Kblk, m_block, n_block, mask_unused);
+    //                                  ^^^^^^^ ✅ ADD THIS!
+    break;
     case KERN_1x8_ADD:
         gemm_1x8_panel_avx2fma_add(c, Ap, a_k_stride, Bp, b_k_stride,
                                    Kblk, n_block, mask_unused);
@@ -839,6 +842,9 @@ static bool handle_beta_scaling_strided(
  * @see gemm_plan_create()
  * @see gemm_auto()
  */
+/**
+ * @brief Execute GEMM operation using a pre-computed plan (internal implementation)
+ */
 static int gemm_execute_internal(
     gemm_plan_t *plan,
     float *restrict C,
@@ -853,7 +859,7 @@ static int gemm_execute_internal(
     float *Ap = plan->workspace_a;
     float *Bp = plan->workspace_b;
 
-    // Main execution loop
+    // Main execution loop: NC → KC → MC
     for (size_t jt = 0; jt < tiles.n_nc; jt++)
     {
         size_t j0 = jt * plan->NC;
@@ -866,14 +872,14 @@ static int gemm_execute_internal(
 
             size_t n_panels = (jb + plan->NR - 1) / plan->NR;
 
-            // Pack B panels
+            // ✅ FIX: Pack B panels with correct stride (kb, not plan->KC)
             pack_strides_t b_strides;
             for (size_t p = 0; p < n_panels; p++)
             {
                 size_t j = j0 + p * plan->NR;
                 size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                float *Bp_panel = Bp + p * plan->KC * 16;
+                float *Bp_panel = Bp + p * kb * 16;  // ✅ FIXED: Use kb instead of plan->KC
                 b_strides = pack_B_panel_simd_strided(
                     Bp_panel, B, K, ldb,
                     k0, kb, j, jw);
@@ -902,25 +908,30 @@ static int gemm_execute_internal(
                         size_t j = j0 + p * plan->NR;
                         size_t jw = MIN(plan->NR, j0 + jb - j);
 
+                        // Kernel selection
                         gemm_kernel_id_t kernel_id;
 
                         if (mh == plan->MR && jw == plan->NR)
                         {
+                            // Full tile: use pre-selected kernel
                             kernel_id = (kt == 0 && first_accumulation)
                                             ? plan->kern_full_store
                                             : plan->kern_full_add;
                         }
                         else
                         {
+                            // Edge tile: dynamic selection
                             gemm_kernel_id_t kern_add, kern_store;
                             int dummy_width;
                             gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy_width);
                             kernel_id = (kt == 0 && first_accumulation) ? kern_store : kern_add;
                         }
 
+                        // Get pointers
                         float *cptr = C + i * ldc + j;
-                        float *bptr = Bp + p * plan->KC * 16;
+                        float *bptr = Bp + p * kb * 16;  // ✅ FIXED: Use kb instead of plan->KC
 
+                        // Dispatch kernel
                         dispatch_kernel(
                             kernel_id,
                             cptr,
