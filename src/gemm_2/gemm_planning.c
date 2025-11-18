@@ -277,22 +277,25 @@ void gemm_select_blocking(
  * 2. Handle ALL combinations systematically
  * 3. Kernels handle partial tiles via scalar loops (safe)
  */
+/**
+ * @brief Select kernel using refined 2D dispatch table
+ * 
+ * KEY FIX: Distinguish m ∈ [5,8] from m ∈ [9,15]
+ */
 void gemm_select_kernels(
     size_t m_height, size_t n_width,
     gemm_kernel_id_t *kern_add,
     gemm_kernel_id_t *kern_store,
     int *kernel_width)
 {
-    // ✅ EXHAUSTIVE SELECTION: Cover all (m, n) space
-    
     //==========================================================================
-    // M-DIMENSION CLASSIFICATION
+    // M-DIMENSION CLASSIFICATION (REFINED!)
     //==========================================================================
     int m_class;
-    if (m_height >= 16)      m_class = 4;  // 16+ rows
-    else if (m_height >= 8)  m_class = 3;  // 8-15 rows
-    else if (m_height >= 5)  m_class = 2;  // 5-7 rows  ← CRITICAL for edge tiles!
-    else if (m_height >= 1)  m_class = 1;  // 1-4 rows
+    if (m_height >= 16)      m_class = 4;  // 16+ rows → use 16× kernels
+    else if (m_height >= 9)  m_class = 3;  // 9-15 rows → use 16× kernels (composite)
+    else if (m_height >= 5)  m_class = 2;  // 5-8 rows → use 8× kernels
+    else if (m_height >= 1)  m_class = 1;  // 1-4 rows → use 4× kernels
     else                     m_class = 0;  // ERROR
     
     //==========================================================================
@@ -300,37 +303,34 @@ void gemm_select_kernels(
     //==========================================================================
     int n_class;
     if (n_width >= 16)       n_class = 4;  // 16+ cols
-    else if (n_width >= 9)   n_class = 3;  // 9-15 cols  ← CRITICAL!
+    else if (n_width >= 9)   n_class = 3;  // 9-15 cols (needs 16-wide kernel)
     else if (n_width >= 6)   n_class = 2;  // 6-8 cols
     else if (n_width >= 1)   n_class = 1;  // 1-5 cols
     else                     n_class = 0;  // ERROR
     
     //==========================================================================
-    // 2D DISPATCH TABLE (m_class × n_class)
+    // 2D DISPATCH TABLE
     //==========================================================================
-    // Notation: [m_class, n_class] → kernel
-    
     // ┌─────────┬─────────┬─────────┬─────────┬─────────┐
     // │ m\n     │ 1-5     │ 6-8     │ 9-15    │ 16+     │
     // ├─────────┼─────────┼─────────┼─────────┼─────────┤
-    // │ 1-4     │ 4×8     │ 4×8     │ 4×8     │ 4×8     │  ← 4×8 handles all n
-    // │ 5-7     │ 8×8     │ 8×8     │ 8×16    │ 8×16    │  ← Use 8×8 or 8×16
-    // │ 8-15    │ 8×8     │ 8×8     │ 8×16    │ 8×16    │
-    // │ 16+     │ 16×8    │ 16×8    │ 16×16   │ 16×16   │  ← Use composite
+    // │ 1-4     │ 4×8     │ 4×8     │ 4×8     │ 4×8     │
+    // │ 5-8     │ 8×8     │ 8×8     │ 8×16    │ 8×16    │
+    // │ 9-15    │ 16×8    │ 16×8    │ 16×16   │ 16×16   │ ← CRITICAL FIX!
+    // │ 16+     │ 16×8    │ 16×8    │ 16×16   │ 16×16   │
     // └─────────┴─────────┴─────────┴─────────┴─────────┘
     
     gemm_kernel_id_t selected_add, selected_store;
     int selected_width;
     
-    // Row 1: m ∈ [1, 4]
     if (m_class == 1) {
-        // 4×8 kernel handles ALL n via scalar loops for n > 8
+        // m ∈ [1, 4]: Always use 4×8
         selected_add = KERN_4x8_ADD;
         selected_store = KERN_4x8_STORE;
         selected_width = 8;
     }
-    // Row 2-3: m ∈ [5, 15]
-    else if (m_class == 2 || m_class == 3) {
+    else if (m_class == 2) {
+        // m ∈ [5, 8]: Use 8×8 or 8×16
         if (n_class <= 2) {  // n ∈ [1, 8]
             selected_add = KERN_8x8_ADD;
             selected_store = KERN_8x8_STORE;
@@ -341,20 +341,20 @@ void gemm_select_kernels(
             selected_width = 16;
         }
     }
-    // Row 4: m ≥ 16
-    else if (m_class == 4) {
+    else if (m_class == 3 || m_class == 4) {
+        // ✅ CRITICAL FIX: m ∈ [9, ∞) → Use 16× kernels (composite)
         if (n_class <= 2) {  // n ∈ [1, 8]
             selected_add = KERN_16x8_ADD;
             selected_store = KERN_16x8_STORE;
             selected_width = 8;
         } else {  // n ∈ [9, ∞)
-            selected_add = KERN_16x16_ADD;  // Composite: 2× 8×16 calls
+            selected_add = KERN_16x16_ADD;  // ← Composite: 2× 8×16 calls
             selected_store = KERN_16x16_STORE;
             selected_width = 16;
         }
     }
-    // ERROR: Should never reach
     else {
+        // Fallback (should never reach)
         selected_add = KERN_1x8_ADD;
         selected_store = KERN_1x8_STORE;
         selected_width = 8;
