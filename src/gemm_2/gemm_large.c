@@ -510,24 +510,26 @@ static pack_strides_t pack_B_panel_simd_strided(
 
     const size_t B_STRIDE = 16;
 
-    #ifndef NDEBUG
+#ifndef NDEBUG
     // Simple always-on debug for strided cases
-    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0)) {
+    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0))
+    {
         printf("  pack_B: k0=%llu, kb=%llu, j0=%llu, jb=%llu, ldb=%llu\n",
                (unsigned long long)k0, (unsigned long long)kb,
                (unsigned long long)j0, (unsigned long long)jb,
                (unsigned long long)ldb);
-        
+
         // Print first source row
         printf("    B source [k=%llu, j=%llu..%llu]: [",
                (unsigned long long)k0, (unsigned long long)j0,
                (unsigned long long)(j0 + (jb < 8 ? jb : 8) - 1));
-        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++) {
+        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++)
+        {
             printf("%.1f ", B[k0 * ldb + (j0 + j)]);
         }
         printf("]\n");
     }
-    #endif
+#endif
 
     if (jb < B_STRIDE)
     {
@@ -555,15 +557,17 @@ static pack_strides_t pack_B_panel_simd_strided(
         }
     }
 
-        #ifndef NDEBUG
-    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0)) {
+#ifndef NDEBUG
+    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0))
+    {
         printf("    B packed [k=0]: [");
-        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++) {
+        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++)
+        {
             printf("%.1f ", Bp[j]);
         }
         printf("]\n");
     }
-    #endif
+#endif
 
     pack_strides_t strides;
     strides.a_k_stride = 0;
@@ -844,7 +848,7 @@ static bool handle_beta_scaling_strided(
  * - Small overhead (~5%) from packing
  * - 169.8 GFLOPS on Intel i9-14900 (single-core)
  * - 162× faster than naive implementation
- * 
+ *
  * ┌─────────────────────────────────────────────────────────────┐
  *│ NC Loop (j0 = 0, 256, 512, ...)                             │
  *│   ┌───────────────────────────────────────────────────────┐ │
@@ -893,6 +897,17 @@ static bool handle_beta_scaling_strided(
  * @see gemm_auto()
  */
 
+/**
+ * @brief Core GEMM execution engine with blocked algorithm
+ * 
+ * Implements: C = alpha * A * B + beta * C
+ * 
+ * Loop order: NC → KC → MC → MR (outermost to innermost)
+ * - NC: Vertical strips of B and C (maximize B panel reuse)
+ * - KC: Reduction dimension blocks (pack B once, reuse across all M)
+ * - MC: Horizontal strips of A and C (frequently repacked, but small)
+ * - MR: Micro-kernel tiles (actual computation happens here)
+ */
 static int gemm_execute_internal(
     gemm_plan_t *plan,
     float *restrict C,
@@ -904,135 +919,249 @@ static int gemm_execute_internal(
     float alpha, float beta,
     bool first_accumulation)
 {
-    float *Ap = plan->workspace_a;
-    float *Bp = plan->workspace_b;
+    // Get workspace pointers from pre-allocated plan
+    float *Ap = plan->workspace_a;  // Packed A panels (MR × KC)
+    float *Bp = plan->workspace_b;  // Packed B panels (multiple panels × KC × 16)
 
-    // Main execution loop: NC → KC → MC
+    //==========================================================================
+    // LEVEL 1: NC LOOP - Vertical strips of B and C
+    //==========================================================================
+    // Process N-dimension in blocks of NC columns at a time.
+    // Each NC block covers columns [j0, j0+jb) where jb ≤ NC.
+    // 
+    // **Cache strategy:** B panels packed in this loop are reused across
+    // all MC tiles in the inner loops → maximize L2 cache efficiency!
+    //==========================================================================
+    
     for (size_t jt = 0; jt < tiles.n_nc; jt++)
     {
-        size_t j0 = jt * plan->NC;
-        size_t jb = MIN(plan->NC, N - j0);
+        // Compute starting column and width of this NC block
+        size_t j0 = jt * plan->NC;           // Starting column index
+        size_t jb = MIN(plan->NC, N - j0);   // Actual width (handle edge case)
 
+        //======================================================================
+        // LEVEL 2: KC LOOP - Reduction dimension blocks
+        //======================================================================
+        // Process K-dimension in blocks of KC elements at a time.
+        // Each KC block covers reduction indices [k0, k0+kb) where kb ≤ KC.
+        // 
+        // **Critical insight:** B panels are packed ONCE per KC×NC tile,
+        // then reused for ALL MC tiles below. This is the key to performance!
+        //======================================================================
+        
         for (size_t kt = 0; kt < tiles.n_kc; kt++)
         {
-            size_t k0 = kt * plan->KC;
-            size_t kb = MIN(plan->KC, K - k0);
+            // Compute starting index and size of this KC block
+            size_t k0 = kt * plan->KC;       // Starting K index
+            size_t kb = MIN(plan->KC, K - k0); // Actual K block size (handle edge)
 
-            size_t n_panels = (jb + plan->NR - 1) / plan->NR;
+            //==================================================================
+            // PACK B PANELS (Once per KC×NC tile)
+            //==================================================================
+            // Divide the jb columns into panels of width NR.
+            // Each panel is KC × NR and gets packed into a contiguous buffer.
+            // 
+            // **Memory layout:** Bp[panel_p] = Bp + p * plan->KC * 16
+            // Note: Stride is plan->KC (not kb!) because workspace is allocated
+            //       for maximum KC, ensuring consistent panel offsets.
+            //==================================================================
+            
+            size_t n_panels = (jb + plan->NR - 1) / plan->NR; // Ceiling division
+            pack_strides_t b_strides; // Will store B_STRIDE=16 for kernel access
 
-            // Pack B panels with correct stride
-            pack_strides_t b_strides;
             for (size_t p = 0; p < n_panels; p++)
             {
-                size_t j = j0 + p * plan->NR;
-                size_t jw = MIN(plan->NR, j0 + jb - j);
+                // Compute starting column and width for this panel
+                size_t j = j0 + p * plan->NR;        // Panel start column
+                size_t jw = MIN(plan->NR, j0 + jb - j); // Panel width (handle edge)
 
-                // ✅ Use plan->KC for panel stride, not kb
+                // ✅ CRITICAL: Use plan->KC for stride, NOT kb!
+                // Reason: Workspace is allocated for max KC rows. Using kb would
+                //         cause panels to overlap in memory when kb < plan->KC.
                 float *Bp_panel = Bp + p * plan->KC * 16;
-                
+
+                // Pack B[k0:k0+kb, j:j+jw] into Bp_panel
+                // Result: Bp_panel has kb rows × 16 cols (stride always 16)
                 b_strides = pack_B_panel_simd_strided(
                     Bp_panel, B, K, ldb,
-                    k0, kb, j, jw);
-                
-                // ✅ DEBUG: Verify packed B for this panel
-                #ifndef NDEBUG
-                if ((M == 1 && K == 8 && N == 1) || 
-                    (M == 7 && K == 5 && N == 9) ||
-                    (M == 7 && K == 9 && N == 11)) {
-                    printf("  Verify pack: Panel %llu, B[k=%llu..%llu, j=%llu..%llu] -> offset %llu (plan->KC=%llu):\n",
-                           (unsigned long long)p,
-                           (unsigned long long)k0, (unsigned long long)(k0 + kb - 1),
-                           (unsigned long long)j, (unsigned long long)(j + jw - 1),
-                           (unsigned long long)(p * plan->KC * 16),
-                           (unsigned long long)plan->KC);
-                    
-                    // Show first 4 K-rows of packed B
-                    printf("    Packed B (first %llu K-rows): ", 
-                           (unsigned long long)(kb < 4 ? kb : 4));
-                    for (size_t kk = 0; kk < (kb < 4 ? kb : 4); kk++) {
-                        printf("[K=%llu: %.1f] ", 
-                               (unsigned long long)kk, 
-                               Bp_panel[kk * 16]);
-                    }
-                    printf("\n");
-                }
-                #endif
+                    k0, kb,      // Source K range to pack
+                    j, jw);      // Source N range to pack
             }
 
+            //==================================================================
+            // LEVEL 3: MC LOOP - Horizontal strips of A and C
+            //==================================================================
+            // Process M-dimension in blocks of MC rows at a time.
+            // Each MC block covers rows [i0, i0+ib) where ib ≤ MC.
+            // 
+            // **Frequency:** A panels are packed MULTIPLE times (once per MC
+            // block), but they're small (MR × KC) so this is acceptable.
+            //==================================================================
+            
             for (size_t it = 0; it < tiles.n_mc; it++)
             {
-                size_t i0 = it * plan->MC;
-                size_t ib = MIN(plan->MC, M - i0);
-                size_t n_mr_tiles = (ib + plan->MR - 1) / plan->MR;
+                // Compute starting row and height of this MC block
+                size_t i0 = it * plan->MC;           // Starting row index
+                size_t ib = MIN(plan->MC, M - i0);   // Actual height (handle edge)
+                
+                // How many MR-sized tiles fit in this MC block?
+                size_t n_mr_tiles = (ib + plan->MR - 1) / plan->MR; // Ceiling div
 
+                //==============================================================
+                // LEVEL 4: MR LOOP - Micro-kernel tiles
+                //==============================================================
+                // Process ib rows in chunks of MR rows at a time.
+                // Each MR tile is the unit of work for a single micro-kernel.
+                //==============================================================
+                
                 for (size_t mt = 0; mt < n_mr_tiles; mt++)
                 {
-                    size_t i = i0 + mt * plan->MR;
-                    size_t mh = MIN(plan->MR, M - i);
-                    size_t pack_mr = plan->MR;
+                    // Compute starting row and height for this MR tile
+                    size_t i = i0 + mt * plan->MR;       // Tile start row
+                    size_t mh = MIN(plan->MR, M - i);    // Tile height (handle edge)
+                    size_t pack_mr = plan->MR;            // Physical capacity (always MR)
 
-                    // Pack A panel
+                    //==========================================================
+                    // PACK A PANEL (Once per MR tile)
+                    //==========================================================
+                    // Pack A[i:i+mh, k0:k0+kb] into Ap, applying alpha scaling.
+                    // 
+                    // **Layout:** Column-major (K-outer):
+                    //   Ap[k][m] = Ap[k * MR + m]
+                    // 
+                    // **Alpha absorption:** A is multiplied by alpha during pack,
+                    // so kernels just compute A*B (not alpha*A*B).
+                    //==========================================================
+                    
                     pack_strides_t a_strides = pack_A_panel_simd_strided(
                         Ap, A, M, lda,
-                        i, mh, k0, kb, alpha, pack_mr);
+                        i, mh,        // Source M range to pack
+                        k0, kb,       // Source K range to pack
+                        alpha,        // Alpha absorbed into A during pack
+                        pack_mr);     // Physical capacity (MR)
 
-                    // Execute kernels on all N-panels
+                    //==========================================================
+                    // EXECUTE KERNELS ON ALL N-PANELS
+                    //==========================================================
+                    // For each N-panel in this NC block, execute the micro-kernel
+                    // to compute: C[i:i+mh, j:j+jw] += Ap * Bp_panel
+                    //==========================================================
+                    
                     for (size_t p = 0; p < n_panels; p++)
                     {
+                        // Recompute panel position (same as during pack)
                         size_t j = j0 + p * plan->NR;
                         size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                        // Select kernel for this tile size
+                        //==================================================
+                        // KERNEL SELECTION
+                        //==================================================
+                        // Select optimal kernel based on actual tile size (mh × jw).
+                        // Returns both ADD and STORE variants, plus native width.
+                        // 
+                        // **Why two variants?**
+                        // - STORE: C = A*B (overwrite, used when beta=0 on first K-tile)
+                        // - ADD: C += A*B (accumulate, used for K-tiles 1..n)
+                        //==================================================
+                        
                         gemm_kernel_id_t kern_add, kern_store;
-                        int kernel_width;
+                        int kernel_width; // Native width of selected kernel (6, 8, or 16)
+                        
                         gemm_select_kernels(mh, jw, &kern_add, &kern_store, &kernel_width);
 
-                        // Multi-pass execution: Split wide tiles into kernel-width chunks
-                        size_t j_offset = 0;
+                        //==================================================
+                        // MULTI-PASS EXECUTION
+                        //==================================================
+                        // If tile width jw > kernel_width, split into multiple passes.
+                        // 
+                        // **Example:** jw=11, kernel_width=8
+                        //   Pass 1: columns [0, 8)   (8 columns)
+                        //   Pass 2: columns [8, 11)  (3 columns)
+                        // 
+                        // Each pass processes kernel_width columns (or remainder).
+                        //==================================================
+                        
+                        size_t j_offset = 0; // Column offset within this panel
+                        
                         while (j_offset < jw)
                         {
+                            // How many columns in this pass?
                             size_t jw_chunk = MIN((size_t)kernel_width, jw - j_offset);
 
-                            // Determine ADD vs STORE mode
+                            //==============================================
+                            // ADD vs STORE MODE SELECTION
+                            //==============================================
+                            // Decision tree:
+                            // 1. First K-tile (kt=0) AND beta was 0 → STORE
+                            //    (No need to load old C values, just overwrite)
+                            // 2. Subsequent K-tiles (kt>0) → ADD
+                            //    (Accumulate partial results across K)
+                            // 3. First K-tile BUT beta≠0 → ADD
+                            //    (Need to preserve beta*C, so accumulate)
+                            //==============================================
+                            
                             gemm_kernel_id_t kernel_id;
                             if (kt == 0 && first_accumulation)
                             {
-                                kernel_id = kern_store;
+                                kernel_id = kern_store; // C = A*B (overwrite)
                             }
                             else
                             {
-                                kernel_id = kern_add;
+                                kernel_id = kern_add;   // C += A*B (accumulate)
                             }
 
-                            // Compute adjusted pointers for this chunk
-                            float *cptr = C + i * ldc + (j + j_offset);
+                            //==============================================
+                            // POINTER ARITHMETIC
+                            //==============================================
                             
-                            // ✅ CRITICAL FIX: Use plan->KC, not kb!
+                            // Output pointer: C[i, j+j_offset]
+                            // - i: Current MR tile start row
+                            // - j+j_offset: Current panel column + pass offset
+                            float *cptr = C + i * ldc + (j + j_offset);
+
+                            // Input B pointer: Bp[panel_p, k=0, n=j_offset]
+                            // - p * plan->KC * 16: Panel offset (uses plan->KC!)
+                            // - j_offset: Column offset within panel
+                            // 
+                            // ✅ CRITICAL: Use plan->KC (not kb) for panel stride!
+                            // Reason: Workspace allocated for max KC, so all panels
+                            //         have consistent offsets even when kb < plan->KC.
                             float *bptr = Bp + p * plan->KC * 16 + j_offset;
 
-                            // Dispatch kernel for this chunk
+                            //==============================================
+                            // KERNEL DISPATCH
+                            //==============================================
+                            // Execute micro-kernel: C[i:i+mh, j+j_offset:j+j_offset+jw_chunk]
+                            //                       op= Ap[0:mh, 0:kb] * Bp[0:kb, j_offset:j_offset+jw_chunk]
+                            // where op is either = (STORE) or += (ADD)
+                            //==============================================
+                            
                             dispatch_kernel(
-                                kernel_id,
-                                cptr,
-                                ldc,
-                                Ap,
-                                a_strides.a_k_stride,
-                                bptr,
-                                b_strides.b_k_stride,
-                                kb,
-                                mh,
-                                jw_chunk);
+                                kernel_id,              // Which kernel variant?
+                                cptr,                   // Output: C submatrix pointer
+                                ldc,                    // C stride (leading dimension)
+                                Ap,                     // Input: Packed A panel
+                                a_strides.a_k_stride,   // A stride (= MR)
+                                bptr,                   // Input: Packed B panel (with offset)
+                                b_strides.b_k_stride,   // B stride (= 16, always)
+                                kb,                     // Number of K iterations
+                                mh,                     // Actual tile height (≤ MR)
+                                jw_chunk);              // Actual tile width for this pass
 
-
-
+                            // Advance to next column chunk
                             j_offset += kernel_width;
-                        }
-
-                    }
-                }
-            }
-        }
-    }
+                            
+                        } // end while (multi-pass)
+                        
+                    } // end for p (N-panels)
+                    
+                } // end for mt (MR tiles)
+                
+            } // end for it (MC blocks)
+            
+        } // end for kt (KC blocks)
+        
+    } // end for jt (NC blocks)
 
     return 0;
 }
