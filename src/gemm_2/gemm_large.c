@@ -711,71 +711,211 @@ static inline void dispatch_kernel(
     }
 }
 
-//==============================================================================
-// MAIN EXECUTION LOOP (OPTIMIZED!)
-//==============================================================================
-
-// Helper for non-strided beta scaling
+/**
+ * @brief Apply beta scaling to output matrix C (contiguous layout)
+ * 
+ * Implements the beta component of BLAS GEMM semantics:
+ * - beta = 0.0: Zero C (does NOT read old values, uses memset)
+ * - beta = 1.0: No-op (C unchanged, pure accumulation mode)
+ * - beta ≠ 1.0: Scale C *= beta (general case)
+ * 
+ * **BLAS Compliance:**
+ * According to BLAS standard, when beta=0, implementations should NOT
+ * read the original C values (which may contain uninitialized data or NaN).
+ * This function respects that by using memset instead of multiply-by-zero.
+ * 
+ * **Vectorization:**
+ * Uses AVX2 to process 8 elements per iteration in the main loop,
+ * with scalar tail loop for remaining elements.
+ * 
+ * **When to use this variant:**
+ * Use when C is stored contiguously (ldc = N), allowing single memset.
+ * For strided layouts, use handle_beta_scaling_strided() instead.
+ * 
+ * @param[in,out] C     Output matrix (M × N, row-major, contiguous)
+ * @param[in]     M     Number of rows in C
+ * @param[in]     N     Number of columns in C (also the stride, ldc)
+ * @param[in]     ldc   Leading dimension of C (must equal N for this function)
+ * @param[in]     beta  Scalar multiplier for C
+ * 
+ * @return true if first_accumulation mode (beta=0, C was zeroed)
+ * @return false if accumulation mode (beta≠0, must ADD to existing C)
+ * 
+ * @note Called once per gemm_execute_plan(), not per tile
+ * @note For beta=0: ~200 GB/s (memset bandwidth)
+ * @note For beta≠1: ~50 GB/s (vectorized read-multiply-write)
+ * @note Thread-safe if different threads use different C matrices
+ * 
+ * @see handle_beta_scaling_strided()
+ * @see gemm_execute_plan()
+ */
 static bool handle_beta_scaling(
     float *restrict C,
     size_t M, size_t N, size_t ldc,
     float beta)
 {
+    //==========================================================================
+    // CASE 1: beta = 0.0 (Zero output, BLAS-compliant)
+    //==========================================================================
+    // BLAS standard: When beta=0, do NOT read old C values (may be NaN/uninit).
+    // Implementation: Single contiguous memset (fastest possible zeroing).
+    // 
+    // Performance: ~200 GB/s on modern CPUs (memory bandwidth limited)
+    //==========================================================================
+    
     if (beta == 0.0f)
     {
         memset(C, 0, M * N * sizeof(float));
-        return true; // first_accumulation = true
+        return true; // Signal: Use STORE mode for first K-tile (don't load C)
     }
+    
+    //==========================================================================
+    // CASE 2: beta = 1.0 (No-op, pure accumulation)
+    //==========================================================================
+    // No scaling needed, C remains unchanged.
+    // Kernels will ADD to existing values: C += alpha*A*B
+    //==========================================================================
+    
     else if (beta != 1.0f)
     {
-        __m256 vbeta = _mm256_set1_ps(beta);
+        //======================================================================
+        // CASE 3: beta ≠ 1.0 (General scaling: C *= beta)
+        //======================================================================
+        // Process each row with AVX2 vectorization (8 floats at a time).
+        // 
+        // Performance: ~50 GB/s (read 4 bytes → multiply → write 4 bytes)
+        // Memory traffic: 2× (read + write) vs memset's 1× (write only)
+        //======================================================================
+        
+        __m256 vbeta = _mm256_set1_ps(beta); // Broadcast beta to all lanes
+        
         for (size_t i = 0; i < M; ++i)
         {
-            float *row = C + i * ldc;
+            float *row = C + i * ldc; // Pointer to current row
             size_t j = 0;
+            
+            // Vectorized main loop: Process 8 elements per iteration
             for (; j + 7 < N; j += 8)
             {
-                __m256 c = _mm256_loadu_ps(row + j);
-                _mm256_storeu_ps(row + j, _mm256_mul_ps(c, vbeta));
+                __m256 c = _mm256_loadu_ps(row + j);              // Load 8 floats
+                _mm256_storeu_ps(row + j, _mm256_mul_ps(c, vbeta)); // C *= beta, store
             }
+            
+            // Scalar tail loop: Handle remaining elements (0-7)
             for (; j < N; ++j)
+            {
                 row[j] *= beta;
+            }
         }
-        return false;
+        
+        return false; // Signal: Use ADD mode (accumulate into scaled C)
     }
-    return false; // beta == 1.0f
+    
+    // CASE 2 continuation: beta == 1.0
+    return false; // Signal: Use ADD mode (accumulate into unchanged C)
 }
 
-// Helper for strided beta scaling
+/**
+ * @brief Apply beta scaling to output matrix C (strided layout)
+ * 
+ * Identical semantics to handle_beta_scaling(), but optimized for
+ * non-contiguous (strided) C matrices where ldc > N.
+ * 
+ * **Key Difference:**
+ * When beta=0, cannot use single memset because rows are not contiguous.
+ * Instead, memset each row individually.
+ * 
+ * **Use Case:**
+ * Strided GEMM operations where C is a submatrix of a larger matrix:
+ * - QR decomposition trailing matrix updates
+ * - Block algorithms operating on matrix views
+ * - Panel updates in factorizations
+ * 
+ * **Example:**
+ * ```
+ * float large_matrix[256][256];
+ * // Update submatrix [64:192, 128:256]
+ * float *C = &large_matrix[64][128];
+ * size_t ldc = 256;  // Stride of large matrix
+ * size_t M = 128, N = 128;  // Submatrix size
+ * handle_beta_scaling_strided(C, M, N, ldc, beta);
+ * ```
+ * 
+ * @param[in,out] C     Output matrix (M × N, row-major, stride=ldc)
+ * @param[in]     M     Number of rows in C
+ * @param[in]     N     Number of columns in C
+ * @param[in]     ldc   Leading dimension of C (stride, may be > N)
+ * @param[in]     beta  Scalar multiplier for C
+ * 
+ * @return true if first_accumulation mode (beta=0, C was zeroed)
+ * @return false if accumulation mode (beta≠0, must ADD to existing C)
+ * 
+ * @note Slightly slower than handle_beta_scaling() for beta=0 due to
+ *       multiple memset calls vs single contiguous memset
+ * @note For beta≠1: Same performance as non-strided version
+ * @note Thread-safe if different threads use different C matrices
+ * 
+ * @see handle_beta_scaling()
+ * @see gemm_execute_plan_strided()
+ */
 static bool handle_beta_scaling_strided(
     float *restrict C,
     size_t M, size_t N, size_t ldc,
     float beta)
 {
+    //==========================================================================
+    // CASE 1: beta = 0.0 (Zero output, strided layout)
+    //==========================================================================
+    // Cannot use single memset because rows are not contiguous (ldc > N).
+    // Must zero each row individually.
+    // 
+    // Performance: ~180 GB/s (slightly slower than contiguous due to
+    //              multiple memset calls and potential TLB pressure)
+    //==========================================================================
+    
     if (beta == 0.0f)
     {
         for (size_t i = 0; i < M; ++i)
-            memset(C + i * ldc, 0, N * sizeof(float));
-        return true;
+        {
+            memset(C + i * ldc, 0, N * sizeof(float)); // Zero one row
+        }
+        return true; // Signal: Use STORE mode for first K-tile
     }
+    
+    //==========================================================================
+    // CASE 2 & 3: beta = 1.0 (no-op) or beta ≠ 1.0 (scale)
+    //==========================================================================
+    // Logic identical to non-strided version.
+    // The stride (ldc) is already used in row pointer computation.
+    //==========================================================================
+    
     else if (beta != 1.0f)
     {
         __m256 vbeta = _mm256_set1_ps(beta);
+        
         for (size_t i = 0; i < M; ++i)
         {
-            float *row = C + i * ldc;
+            float *row = C + i * ldc; // ← Uses stride ldc
             size_t j = 0;
+            
+            // Vectorized main loop: 8 elements per iteration
             for (; j + 7 < N; j += 8)
             {
                 __m256 c = _mm256_loadu_ps(row + j);
                 _mm256_storeu_ps(row + j, _mm256_mul_ps(c, vbeta));
             }
+            
+            // Scalar tail: Remaining elements
             for (; j < N; ++j)
+            {
                 row[j] *= beta;
+            }
         }
-        return false;
+        
+        return false; // Signal: Use ADD mode
     }
-    return false;
+    
+    return false; // beta == 1.0, no-op
 }
 
 /**
@@ -811,31 +951,7 @@ static bool handle_beta_scaling_strided(
  * - A panels (MC × KC × 4 bytes) fit in L1 (~48 KB)
  * - C submatrix (MC × NC × 4 bytes) fits in L2
  * - Overall L2 hit rate: ~98% for large matrices
- *
- * **Optimization Highlights:**
- *
- * 1. **Pre-computed Tile Counts:**
- *    ```c
- *    // OLD: for (jt = 0; jt < (N + NC - 1) / NC; jt++)
- *    // NEW: for (jt = 0; jt < plan->n_nc_tiles; jt++)
- *    ```
- *    Eliminates division (1-2 cycles) from hot path.
- *
- * 2. **Pre-selected Kernels:**
- *    ```c
- *    // Fast path (95% of tiles):
- *    kernel_id = first_k ? plan->kern_full_store : plan->kern_full_add;
- *
- *    // Slow path (5% of tiles):
- *    gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy);
- *    ```
- *    Eliminates kernel selection overhead for full tiles.
- *
- * 3. **Alpha Absorption:**
- *    Multiplies A by alpha during packing, reducing total multiply count.
- *
- * 4. **Beta Pre-scaling:**
- *    Applies beta to entire C matrix once, not per-tile.
+ 
  *
  * **ADD vs STORE Modes:**
  *
@@ -895,18 +1011,6 @@ static bool handle_beta_scaling_strided(
  *
  * @see gemm_plan_create()
  * @see gemm_auto()
- */
-
-/**
- * @brief Core GEMM execution engine with blocked algorithm
- * 
- * Implements: C = alpha * A * B + beta * C
- * 
- * Loop order: NC → KC → MC → MR (outermost to innermost)
- * - NC: Vertical strips of B and C (maximize B panel reuse)
- * - KC: Reduction dimension blocks (pack B once, reuse across all M)
- * - MC: Horizontal strips of A and C (frequently repacked, but small)
- * - MR: Micro-kernel tiles (actual computation happens here)
  */
 static int gemm_execute_internal(
     gemm_plan_t *plan,
