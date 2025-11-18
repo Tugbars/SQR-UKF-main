@@ -43,6 +43,7 @@
 #include "gemm_small.h"
 #include "gemm_planning.h"
 #include <string.h>
+#include <stdio.h>
 #include <stdbool.h>
 #include <assert.h>
 
@@ -859,7 +860,6 @@ static int gemm_execute_internal(
     float *Ap = plan->workspace_a;
     float *Bp = plan->workspace_b;
 
-    // Main execution loop: NC → KC → MC
     for (size_t jt = 0; jt < tiles.n_nc; jt++)
     {
         size_t j0 = jt * plan->NC;
@@ -868,18 +868,31 @@ static int gemm_execute_internal(
         for (size_t kt = 0; kt < tiles.n_kc; kt++)
         {
             size_t k0 = kt * plan->KC;
-            size_t kb = MIN(plan->KC, K - k0);
+            size_t kb = MIN(plan->KC, K - k0);  // ← kb can be < plan->KC!
 
             size_t n_panels = (jb + plan->NR - 1) / plan->NR;
 
-            // ✅ FIX: Pack B panels with correct stride (kb, not plan->KC)
+
+            // ✅ ADD DEBUG CODE HERE:
+            if (M == 100 && K == 50 && N == 75) {
+                printf("DEBUG jt=%zu kt=%zu: j0=%zu jb=%zu k0=%zu kb=%zu n_panels=%zu\n",
+                       jt, kt, j0, jb, k0, kb, n_panels);
+                for (size_t p = 0; p < n_panels; p++) {
+                    size_t j = j0 + p * plan->NR;
+                    size_t jw = MIN(plan->NR, j0 + jb - j);
+                    printf("  Panel %zu: j=%zu jw=%zu Bp_offset=%zu\n",
+                           p, j, jw, p * kb * 16);
+                }
+            }
+
+            // ✅ LOCATION 1: Pack B panels (use kb, not plan->KC)
             pack_strides_t b_strides;
             for (size_t p = 0; p < n_panels; p++)
             {
                 size_t j = j0 + p * plan->NR;
                 size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                float *Bp_panel = Bp + p * kb * 16;  // ✅ FIXED: Use kb instead of plan->KC
+                float *Bp_panel = Bp + p * kb * 16;  // ✅ FIX: kb not plan->KC
                 b_strides = pack_B_panel_simd_strided(
                     Bp_panel, B, K, ldb,
                     k0, kb, j, jw);
@@ -897,41 +910,45 @@ static int gemm_execute_internal(
                     size_t mh = MIN(plan->MR, M - i);
                     size_t pack_mr = plan->MR;
 
-                    // Pack A panel
                     pack_strides_t a_strides = pack_A_panel_simd_strided(
                         Ap, A, M, lda,
                         i, mh, k0, kb, alpha, pack_mr);
 
-                    // Execute kernels on all N-panels
+                    // ✅ LOCATION 2: Access B panels (use kb, not plan->KC)
                     for (size_t p = 0; p < n_panels; p++)
                     {
                         size_t j = j0 + p * plan->NR;
                         size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                        // Kernel selection
                         gemm_kernel_id_t kernel_id;
 
                         if (mh == plan->MR && jw == plan->NR)
                         {
-                            // Full tile: use pre-selected kernel
                             kernel_id = (kt == 0 && first_accumulation)
                                             ? plan->kern_full_store
                                             : plan->kern_full_add;
                         }
                         else
                         {
-                            // Edge tile: dynamic selection
                             gemm_kernel_id_t kern_add, kern_store;
                             int dummy_width;
                             gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy_width);
                             kernel_id = (kt == 0 && first_accumulation) ? kern_store : kern_add;
                         }
 
-                        // Get pointers
                         float *cptr = C + i * ldc + j;
-                        float *bptr = Bp + p * kb * 16;  // ✅ FIXED: Use kb instead of plan->KC
+                        float *bptr = Bp + p * kb * 16;  // ✅ FIX: kb not plan->KC
 
-                        // Dispatch kernel
+                        if (M == 100 && K == 50 && N == 75 && p == 4) {
+    printf("  DISPATCH panel 4: i=%zu mh=%zu j=%zu jw=%zu kernel=%d\n",
+           i, mh, j, jw, (int)kernel_id);
+    printf("    cptr offset=%ld, bptr offset=%ld\n",
+           (long)(cptr - C), (long)(bptr - Bp));
+}
+
+dispatch_kernel(kernel_id, cptr, ldc, Ap, a_strides.a_k_stride,
+                bptr, b_strides.b_k_stride, kb, mh, jw);
+
                         dispatch_kernel(
                             kernel_id,
                             cptr,
