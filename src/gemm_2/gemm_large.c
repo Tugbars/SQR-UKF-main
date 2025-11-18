@@ -845,6 +845,11 @@ static bool handle_beta_scaling_strided(
 /**
  * @brief Execute GEMM operation using a pre-computed plan (internal implementation)
  */
+/**
+ * @brief Execute GEMM operation using a pre-computed plan (internal implementation)
+ * 
+ * CRITICAL FIX: Multi-pass execution for tiles wider than kernel width
+ */
 static int gemm_execute_internal(
     gemm_plan_t *plan,
     float *restrict C,
@@ -872,14 +877,14 @@ static int gemm_execute_internal(
 
             size_t n_panels = (jb + plan->NR - 1) / plan->NR;
 
-            // ✅ FIX: Pack B panels with correct stride (kb, not plan->KC)
+            // Pack B panels with correct stride
             pack_strides_t b_strides;
             for (size_t p = 0; p < n_panels; p++)
             {
                 size_t j = j0 + p * plan->NR;
                 size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                float *Bp_panel = Bp + p * kb * 16;  // ✅ FIXED: Use kb instead of plan->KC
+                float *Bp_panel = Bp + p * kb * 16;
                 b_strides = pack_B_panel_simd_strided(
                     Bp_panel, B, K, ldb,
                     k0, kb, j, jw);
@@ -902,47 +907,55 @@ static int gemm_execute_internal(
                         Ap, A, M, lda,
                         i, mh, k0, kb, alpha, pack_mr);
 
-                    // Execute kernels on all N-panels
+                    // ✅ CRITICAL FIX: Execute kernels on all N-panels with multi-pass
                     for (size_t p = 0; p < n_panels; p++)
                     {
                         size_t j = j0 + p * plan->NR;
                         size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                        // Kernel selection
-                        gemm_kernel_id_t kernel_id;
+                        // Select kernel for this tile size
+                        gemm_kernel_id_t kern_add, kern_store;
+                        int kernel_width;
+                        gemm_select_kernels(mh, jw, &kern_add, &kern_store, &kernel_width);
 
-                        if (mh == plan->MR && jw == plan->NR)
+                        // ✅ MULTI-PASS EXECUTION: Split wide tiles into kernel-width chunks
+                        size_t j_offset = 0;
+                        while (j_offset < jw)
                         {
-                            // Full tile: use pre-selected kernel
-                            kernel_id = (kt == 0 && first_accumulation)
-                                            ? plan->kern_full_store
-                                            : plan->kern_full_add;
-                        }
-                        else
-                        {
-                            // Edge tile: dynamic selection
-                            gemm_kernel_id_t kern_add, kern_store;
-                            int dummy_width;
-                            gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy_width);
-                            kernel_id = (kt == 0 && first_accumulation) ? kern_store : kern_add;
-                        }
+                            // Compute chunk width (clamp to kernel's native width)
+                            size_t jw_chunk = MIN((size_t)kernel_width, jw - j_offset);
 
-                        // Get pointers
-                        float *cptr = C + i * ldc + j;
-                        float *bptr = Bp + p * kb * 16;  // ✅ FIXED: Use kb instead of plan->KC
+                            // Determine ADD vs STORE mode
+                            gemm_kernel_id_t kernel_id;
+                            if (kt == 0 && first_accumulation)
+                            {
+                                kernel_id = kern_store;  // First K-tile: overwrite
+                            }
+                            else
+                            {
+                                kernel_id = kern_add;    // Subsequent K-tiles: accumulate
+                            }
 
-                        // Dispatch kernel
-                        dispatch_kernel(
-                            kernel_id,
-                            cptr,
-                            ldc,
-                            Ap,
-                            a_strides.a_k_stride,
-                            bptr,
-                            b_strides.b_k_stride,
-                            kb,
-                            mh,
-                            jw);
+                            // Compute adjusted pointers for this chunk
+                            float *cptr = C + i * ldc + (j + j_offset);
+                            float *bptr = Bp + p * kb * 16 + j_offset;
+
+                            // Dispatch kernel for this chunk
+                            dispatch_kernel(
+                                kernel_id,
+                                cptr,
+                                ldc,
+                                Ap,
+                                a_strides.a_k_stride,
+                                bptr,
+                                b_strides.b_k_stride,
+                                kb,
+                                mh,
+                                jw_chunk);  // ✅ jw_chunk ≤ kernel_width guaranteed!
+
+                            // Advance to next chunk
+                            j_offset += kernel_width;
+                        }
                     }
                 }
             }

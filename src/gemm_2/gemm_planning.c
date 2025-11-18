@@ -269,72 +269,100 @@ void gemm_select_blocking(
  * @see gemm_kernel_id_t
  * @see dispatch_kernel() in gemm_large.c
  */
+/**
+ * @brief Select kernel using exhaustive 2D dispatch table
+ * 
+ * RULES:
+ * 1. Always select LARGEST kernel that fits (m_kernel ≤ m, n_kernel ≤ n)
+ * 2. Handle ALL combinations systematically
+ * 3. Kernels handle partial tiles via scalar loops (safe)
+ */
 void gemm_select_kernels(
     size_t m_height, size_t n_width,
     gemm_kernel_id_t *kern_add,
     gemm_kernel_id_t *kern_store,
     int *kernel_width)
 {
-    // Priority 1: 16×16 (largest, composite)
-    if (m_height >= 16 && n_width >= 16) {
-        *kern_add = KERN_16x16_ADD;
-        *kern_store = KERN_16x16_STORE;
-        *kernel_width = 16;
-        return;
+    // ✅ EXHAUSTIVE SELECTION: Cover all (m, n) space
+    
+    //==========================================================================
+    // M-DIMENSION CLASSIFICATION
+    //==========================================================================
+    int m_class;
+    if (m_height >= 16)      m_class = 4;  // 16+ rows
+    else if (m_height >= 8)  m_class = 3;  // 8-15 rows
+    else if (m_height >= 5)  m_class = 2;  // 5-7 rows  ← CRITICAL for edge tiles!
+    else if (m_height >= 1)  m_class = 1;  // 1-4 rows
+    else                     m_class = 0;  // ERROR
+    
+    //==========================================================================
+    // N-DIMENSION CLASSIFICATION
+    //==========================================================================
+    int n_class;
+    if (n_width >= 16)       n_class = 4;  // 16+ cols
+    else if (n_width >= 9)   n_class = 3;  // 9-15 cols  ← CRITICAL!
+    else if (n_width >= 6)   n_class = 2;  // 6-8 cols
+    else if (n_width >= 1)   n_class = 1;  // 1-5 cols
+    else                     n_class = 0;  // ERROR
+    
+    //==========================================================================
+    // 2D DISPATCH TABLE (m_class × n_class)
+    //==========================================================================
+    // Notation: [m_class, n_class] → kernel
+    
+    // ┌─────────┬─────────┬─────────┬─────────┬─────────┐
+    // │ m\n     │ 1-5     │ 6-8     │ 9-15    │ 16+     │
+    // ├─────────┼─────────┼─────────┼─────────┼─────────┤
+    // │ 1-4     │ 4×8     │ 4×8     │ 4×8     │ 4×8     │  ← 4×8 handles all n
+    // │ 5-7     │ 8×8     │ 8×8     │ 8×16    │ 8×16    │  ← Use 8×8 or 8×16
+    // │ 8-15    │ 8×8     │ 8×8     │ 8×16    │ 8×16    │
+    // │ 16+     │ 16×8    │ 16×8    │ 16×16   │ 16×16   │  ← Use composite
+    // └─────────┴─────────┴─────────┴─────────┴─────────┘
+    
+    gemm_kernel_id_t selected_add, selected_store;
+    int selected_width;
+    
+    // Row 1: m ∈ [1, 4]
+    if (m_class == 1) {
+        // 4×8 kernel handles ALL n via scalar loops for n > 8
+        selected_add = KERN_4x8_ADD;
+        selected_store = KERN_4x8_STORE;
+        selected_width = 8;
     }
-
-    // Priority 2: 16×8 (tall tile, n MUST be ≤ 8)
-    if (m_height >= 16 && n_width >= 1 && n_width <= 8) {
-        *kern_add = KERN_16x8_ADD;
-        *kern_store = KERN_16x8_STORE;
-        *kernel_width = 8;
-        return;
+    // Row 2-3: m ∈ [5, 15]
+    else if (m_class == 2 || m_class == 3) {
+        if (n_class <= 2) {  // n ∈ [1, 8]
+            selected_add = KERN_8x8_ADD;
+            selected_store = KERN_8x8_STORE;
+            selected_width = 8;
+        } else {  // n ∈ [9, ∞)
+            selected_add = KERN_8x16_ADD;
+            selected_store = KERN_8x16_STORE;
+            selected_width = 16;
+        }
     }
-
-    // Priority 3: 8×16 (wide tile, native)
-    if (m_height >= 8 && m_height < 16 && n_width > 8) {
-        *kern_add = KERN_8x16_ADD;
-        *kern_store = KERN_8x16_STORE;
-        *kernel_width = 16;
-        return;
+    // Row 4: m ≥ 16
+    else if (m_class == 4) {
+        if (n_class <= 2) {  // n ∈ [1, 8]
+            selected_add = KERN_16x8_ADD;
+            selected_store = KERN_16x8_STORE;
+            selected_width = 8;
+        } else {  // n ∈ [9, ∞)
+            selected_add = KERN_16x16_ADD;  // Composite: 2× 8×16 calls
+            selected_store = KERN_16x16_STORE;
+            selected_width = 16;
+        }
     }
-
-    // Priority 4: 16×6 (for QR with N=6 blocks, composite)
-    if (m_height >= 16 && n_width >= 6 && n_width <= 8) {
-        *kern_add = KERN_16x6_ADD;
-        *kern_store = KERN_16x6_STORE;
-        *kernel_width = 6;
-        return;
+    // ERROR: Should never reach
+    else {
+        selected_add = KERN_1x8_ADD;
+        selected_store = KERN_1x8_STORE;
+        selected_width = 8;
     }
-
-    // Priority 5: 8×8 (handles m=5-15, n≤8)
-    if (m_height >= 5 && m_height < 16 && n_width >= 1 && n_width <= 8) {  // ✅ Changed >= 8 to >= 5
-        *kern_add = KERN_8x8_ADD;
-        *kern_store = KERN_8x8_STORE;
-        *kernel_width = 8;
-        return;
-    }
-
-    // Priority 6: 8×6 (for QR, redundant now but keep for clarity)
-    if (m_height >= 8 && m_height < 16 && n_width == 6) {
-        *kern_add = KERN_8x6_ADD;
-        *kern_store = KERN_8x6_STORE;
-        *kernel_width = 6;
-        return;
-    }
-
-    // Priority 7: 4×8 (handles m=1-4)
-    if (m_height >= 1 && m_height <= 4) {  // ✅ Only m≤4
-        *kern_add = KERN_4x8_ADD;
-        *kern_store = KERN_4x8_STORE;
-        *kernel_width = 8;
-        return;
-    }
-
-    // Fallback: 1×8 (should rarely/never be reached)
-    *kern_add = KERN_1x8_ADD;
-    *kern_store = KERN_1x8_STORE;
-    *kernel_width = 8;
+    
+    *kern_add = selected_add;
+    *kern_store = selected_store;
+    *kernel_width = selected_width;
 }
 
 //==============================================================================
