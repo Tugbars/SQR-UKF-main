@@ -125,18 +125,16 @@ void gemm_select_blocking(
     
     //--------------------------------------------------------------------------
     // Case 1: Tall Matrices (M >> N)
-    // Strategy: Large MC to amortize A packing, small NC for cache efficiency
     //--------------------------------------------------------------------------
     if (aspect_mn > 3.0) {
         *MC = ADAPTIVE_MC_TALL;      // 256 rows at a time
         *KC = ADAPTIVE_KC_TALL;      // Moderate K blocking
-        *NC = MIN(N, ADAPTIVE_NC_SMALL); // Small N panels
+        *NC = MIN(N, ADAPTIVE_NC_SMALL); // Small N panels - ALREADY CLAMPED HERE
         *MR = 16;                     // Use tallest kernels
         *NR = (N >= 16) ? 16 : ((N >= 8) ? 8 : 6); // Adapt to N
     }
     //--------------------------------------------------------------------------
     // Case 2: Wide Matrices (N >> M)
-    // Strategy: Small MC to reduce footprint, large NC to amortize B packing
     //--------------------------------------------------------------------------
     else if (aspect_mn < 0.33) {
         *MC = MIN(M, ADAPTIVE_MC_SMALL); // Don't exceed M
@@ -147,7 +145,6 @@ void gemm_select_blocking(
     }
     //--------------------------------------------------------------------------
     // Case 3: Deep Matrices (K >> M,N)
-    // Strategy: Large KC to reduce packing frequency
     //--------------------------------------------------------------------------
     else if (aspect_kn > 4.0) {
         *MC = MIN(M, ADAPTIVE_MC_SMALL);
@@ -158,7 +155,6 @@ void gemm_select_blocking(
     }
     //--------------------------------------------------------------------------
     // Case 4: Balanced Matrices
-    // Strategy: Use default tuned parameters (optimized for Intel 14900K)
     //--------------------------------------------------------------------------
     else {
         *MC = GEMM_BLOCK_MC; // 128
@@ -204,7 +200,7 @@ void gemm_select_blocking(
         // Ensure minimum safe values
         *MC = MAX(*MC, *MR);
         *KC = MAX(*KC, ADAPTIVE_KC_MIN);
-        *NC = MAX(*NC, *NR);
+        *NC = MAX(*NC, MIN(*NR, N));
     }
     
     //--------------------------------------------------------------------------
@@ -216,6 +212,12 @@ void gemm_select_blocking(
         *KC = ADAPTIVE_KC_MIN;
         *NC = *NR;
     }
+
+
+     // ADD THIS: Final clamp to ensure we never exceed matrix dimensions
+    *MC = MIN(*MC, M);
+    *KC = MIN(*KC, K);
+    *NC = MIN(*NC, N);
 }
 
 //==============================================================================
@@ -371,19 +373,17 @@ void gemm_select_kernels(
  */
 static void precompute_panels(gemm_plan_t *plan)
 {
-    size_t n_panels = (plan->N + plan->NR - 1) / plan->NR;
+    size_t n_panels = (plan->max_N + plan->NR - 1) / plan->NR;
 
     for (size_t p = 0; p < n_panels; p++)
     {
         panel_info_t *panel = &plan->npanels[p];
         
-        // Starting column for this panel
         panel->j_start = p * plan->NR;
         
-        // Width: NR for full panels, N - j_start for last panel
-        panel->j_width = (panel->j_start + plan->NR <= plan->N)
+        panel->j_width = (panel->j_start + plan->NR <= plan->max_N)
                             ? plan->NR
-                            : (plan->N - panel->j_start);
+                            : (plan->max_N - panel->j_start);
     }
 }
 
@@ -533,47 +533,37 @@ gemm_plan_t *gemm_plan_create_with_mode(
     size_t M, size_t K, size_t N,
     gemm_memory_mode_t mode)
 {
-    // Validate mode vs dimensions
     if (mode == GEMM_MEM_STATIC && !gemm_fits_static(M, K, N))
         return NULL;
 
-    // Allocate plan structure
     gemm_plan_t *plan = (gemm_plan_t *)calloc(1, sizeof(gemm_plan_t));
     if (!plan)
         return NULL;
 
-    // Store dimensions
-    plan->M = M;
-    plan->K = K;
-    plan->N = N;
+    // Store maximum dimensions
+    plan->max_M = M;
+    plan->max_K = K;
+    plan->max_N = N;
     plan->mem_mode = mode;
 
-    //--------------------------------------------------------------------------
-    // Select blocking parameters (aspect-ratio adaptive)
-    //--------------------------------------------------------------------------
+    // Select blocking parameters
     gemm_select_blocking(M, K, N,
                          &plan->MC, &plan->KC, &plan->NC,
                          &plan->MR, &plan->NR);
 
-    //--------------------------------------------------------------------------
-    // PRE-COMPUTE TILE COUNTS (OPTIMIZATION: Eliminates division in hot path)
-    //--------------------------------------------------------------------------
-    plan->n_nc_tiles = (N + plan->NC - 1) / plan->NC;
-    plan->n_kc_tiles = (K + plan->KC - 1) / plan->KC;
-    plan->n_mc_tiles = (M + plan->MC - 1) / plan->MC;
+    // Precompute tile counts for max dimensions
+    plan->n_mc_tiles_max = (M + plan->MC - 1) / plan->MC;
+    plan->n_kc_tiles_max = (K + plan->KC - 1) / plan->KC;
+    plan->n_nc_tiles_max = (N + plan->NC - 1) / plan->NC;
 
-    //--------------------------------------------------------------------------
-    // PRE-SELECT KERNELS FOR FULL TILES (OPTIMIZATION: Eliminates dispatch)
-    //--------------------------------------------------------------------------
+    // Pre-select kernels for full tiles
     int dummy_width;
     gemm_select_kernels(plan->MR, plan->NR,
                        &plan->kern_full_add,
                        &plan->kern_full_store,
                        &dummy_width);
 
-    //--------------------------------------------------------------------------
     // Allocate panel descriptors
-    //--------------------------------------------------------------------------
     plan->n_npanels = (N + plan->NR - 1) / plan->NR;
     plan->npanels = (panel_info_t *)calloc(plan->n_npanels, sizeof(panel_info_t));
 
@@ -583,54 +573,35 @@ gemm_plan_t *gemm_plan_create_with_mode(
         return NULL;
     }
 
-    // Pre-compute all panel start/width pairs
     precompute_panels(plan);
 
-    //--------------------------------------------------------------------------
-    // Setup Workspace (mode-dependent)
-    //--------------------------------------------------------------------------
+    // Setup Workspace
     if (mode == GEMM_MEM_STATIC)
     {
-        // Initialize static pool if not already done
         gemm_static_init();
-        
-        // Partition static buffer:
-        // [0 ... MC*KC-1]: A workspace
-        // [MC*KC ... end]: B workspace
         plan->workspace_a = gemm_static_pool.workspace;
         plan->workspace_b = gemm_static_pool.workspace + (plan->MC * plan->KC);
         plan->workspace_temp = gemm_static_pool.workspace;
-        plan->workspace_size = 0; // Not owned by plan
+        plan->workspace_size = 0;
         plan->workspace_aligned = 1;
     }
     else
     {
-        // Dynamic allocation with 64-byte alignment
-        
-        // Packed A buffer: MC × KC floats
         size_t a_size = plan->MC * plan->KC * sizeof(float);
-        
-        // Packed B buffer: (NC/NR) panels × KC rows × 16-wide stride
-        // Note: B stride is always 16 (see pack_B_panel_simd)
         size_t max_n_panels = (plan->NC + plan->NR - 1) / plan->NR;
         size_t b_size = max_n_panels * plan->KC * 16 * sizeof(float);
-        
-        // Temp buffer: MC × NC floats
         size_t temp_size = plan->MC * plan->NC * sizeof(float);
 
-        // Align to 64-byte boundaries
         a_size = (a_size + 63) & ~(size_t)63;
         b_size = (b_size + 63) & ~(size_t)63;
         temp_size = (temp_size + 63) & ~(size_t)63;
 
         plan->workspace_size = a_size + b_size + temp_size;
 
-        // Allocate buffers
         plan->workspace_a = (float *)gemm_aligned_alloc(64, a_size);
         plan->workspace_b = (float *)gemm_aligned_alloc(64, b_size);
         plan->workspace_temp = (float *)gemm_aligned_alloc(64, temp_size);
 
-        // Check for allocation failure
         if (!plan->workspace_a || !plan->workspace_b || !plan->workspace_temp)
         {
             gemm_plan_destroy(plan);

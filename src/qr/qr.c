@@ -678,6 +678,53 @@ static int apply_block_reflector_clean(
     return ret;
 }
 
+
+static int apply_block_reflector_strided(
+    float *restrict C,
+    const float *restrict Y,
+    const float *restrict T,
+    uint16_t m, uint16_t n, uint16_t ib,
+    uint16_t ldc,
+    uint16_t ldy,
+    float *restrict Z,
+    float *restrict Z_temp,
+    float *restrict YT)
+{
+    // Transpose Y: YT[ib × m]
+    for (uint16_t i = 0; i < ib; ++i)
+        for (uint16_t j = 0; j < m; ++j)
+            YT[i * m + j] = Y[j * ldy + i];
+
+    // ✅ Z = Y^T * C using strided GEMM
+    // Y is m×ib with stride ldy, C is m×n with stride ldc
+    // We need Y^T * C = [ib×m] × [m×n] = [ib×n]
+    
+    // Since YT is already transposed and contiguous, use it directly
+    int ret = gemm_strided(Z, YT, C, 
+                          ib, m, n,           // logical dimensions
+                          n, m, ldc,          // strides: Z is ib×n, YT is ib×m, C has stride ldc
+                          1.0f, 0.0f);
+    if (ret != 0) return ret;
+
+    // ✅ Z_temp = T * Z (both contiguous)
+    ret = gemm_strided(Z_temp, T, Z,
+                      ib, ib, n,
+                      n, ib, n,              // all contiguous
+                      1.0f, 0.0f);
+    if (ret != 0) return ret;
+
+    // ✅ C = C - Y * Z_temp using strided GEMM
+    // Y is m×ib with stride ldy, Z_temp is ib×n (contiguous)
+    // C is m×n with stride ldc
+    ret = gemm_strided(C, Y, Z_temp,
+                      m, ib, n,
+                      ldc, ldy, n,           // C has stride ldc, Y has stride ldy
+                      -1.0f, 1.0f);
+    
+    return ret;
+}
+
+
 //==============================================================================
 // MAIN QR ALGORITHM
 //==============================================================================

@@ -44,10 +44,10 @@ static int test_plan_create_destroy_basic(void)
     }
 
     // Verify dimensions
-    if (plan->M != 64 || plan->K != 64 || plan->N != 64)
+    if (plan->max_M != 64 || plan->max_K != 64 || plan->max_N != 64)
     {
         printf("    FAIL: Dimensions incorrect (M=" FMT_SIZE_T ", K=" FMT_SIZE_T ", N=" FMT_SIZE_T ")\n",
-               CAST_SIZE_T(plan->M), CAST_SIZE_T(plan->K), CAST_SIZE_T(plan->N));
+               CAST_SIZE_T(plan->max_M), CAST_SIZE_T(plan->max_K), CAST_SIZE_T(plan->max_N));
         gemm_plan_destroy(plan);
         return 0;
     }
@@ -319,25 +319,25 @@ static int test_precomputed_tile_counts_regular(void)
     size_t expected_mc = (256 + plan->MC - 1) / plan->MC;
 
     printf("    Pre-computed: nc=" FMT_SIZE_T ", kc=" FMT_SIZE_T ", mc=" FMT_SIZE_T "\n",
-           CAST_SIZE_T(plan->n_nc_tiles), CAST_SIZE_T(plan->n_kc_tiles), CAST_SIZE_T(plan->n_mc_tiles));
+           CAST_SIZE_T(plan->n_nc_tiles_max), CAST_SIZE_T(plan->n_kc_tiles_max), CAST_SIZE_T(plan->n_mc_tiles_max));
     printf("    Expected:     nc=" FMT_SIZE_T ", kc=" FMT_SIZE_T ", mc=" FMT_SIZE_T "\n",
            CAST_SIZE_T(expected_nc), CAST_SIZE_T(expected_kc), CAST_SIZE_T(expected_mc));
 
-    if (plan->n_nc_tiles != expected_nc)
+    if (plan->n_nc_tiles_max != expected_nc)
     {
         printf("    FAIL: n_nc_tiles mismatch\n");
         gemm_plan_destroy(plan);
         return 0;
     }
 
-    if (plan->n_kc_tiles != expected_kc)
+    if (plan->n_kc_tiles_max != expected_kc)
     {
         printf("    FAIL: n_kc_tiles mismatch\n");
         gemm_plan_destroy(plan);
         return 0;
     }
 
-    if (plan->n_mc_tiles != expected_mc)
+    if (plan->n_mc_tiles_max != expected_mc)
     {
         printf("    FAIL: n_mc_tiles mismatch\n");
         gemm_plan_destroy(plan);
@@ -363,11 +363,11 @@ static int test_precomputed_tile_counts_irregular(void)
     printf("    Blocking: MC=" FMT_SIZE_T ", KC=" FMT_SIZE_T ", NC=" FMT_SIZE_T "\n",
            CAST_SIZE_T(plan->MC), CAST_SIZE_T(plan->KC), CAST_SIZE_T(plan->NC));
     printf("    Pre-computed: nc=" FMT_SIZE_T ", kc=" FMT_SIZE_T ", mc=" FMT_SIZE_T "\n",
-           CAST_SIZE_T(plan->n_nc_tiles), CAST_SIZE_T(plan->n_kc_tiles), CAST_SIZE_T(plan->n_mc_tiles));
+           CAST_SIZE_T(plan->n_nc_tiles_max), CAST_SIZE_T(plan->n_kc_tiles_max), CAST_SIZE_T(plan->n_mc_tiles_max));
 
-    int match = (plan->n_nc_tiles == expected_nc &&
-                 plan->n_kc_tiles == expected_kc &&
-                 plan->n_mc_tiles == expected_mc);
+    int match = (plan->n_nc_tiles_max == expected_nc &&
+                 plan->n_kc_tiles_max == expected_kc &&
+                 plan->n_mc_tiles_max == expected_mc);
 
     if (!match)
     {
@@ -389,7 +389,7 @@ static int test_precomputed_tile_counts_edge(void)
         return 0;
 
     // Even 1×1×1 should have at least 1 tile in each dimension
-    if (plan->n_nc_tiles == 0 || plan->n_kc_tiles == 0 || plan->n_mc_tiles == 0)
+    if (plan->n_nc_tiles_max == 0 || plan->n_kc_tiles_max == 0 || plan->n_mc_tiles_max == 0)
     {
         printf("    FAIL: Should have at least 1 tile per dimension\n");
         gemm_plan_destroy(plan);
@@ -397,7 +397,7 @@ static int test_precomputed_tile_counts_edge(void)
     }
 
     printf("    Tile counts: nc=" FMT_SIZE_T ", kc=" FMT_SIZE_T ", mc=" FMT_SIZE_T " (all ≥ 1)\n",
-           CAST_SIZE_T(plan->n_nc_tiles), CAST_SIZE_T(plan->n_kc_tiles), CAST_SIZE_T(plan->n_mc_tiles));
+           CAST_SIZE_T(plan->n_nc_tiles_max), CAST_SIZE_T(plan->n_kc_tiles_max), CAST_SIZE_T(plan->n_mc_tiles_max));
 
     gemm_plan_destroy(plan);
     return 1;
@@ -734,9 +734,9 @@ static int test_edge_single_tile(void)
         return 0;
 
     printf("    Tile counts: nc=" FMT_SIZE_T ", kc=" FMT_SIZE_T ", mc=" FMT_SIZE_T "\n",
-           CAST_SIZE_T(plan->n_nc_tiles), CAST_SIZE_T(plan->n_kc_tiles), CAST_SIZE_T(plan->n_mc_tiles));
+           CAST_SIZE_T(plan->n_nc_tiles_max), CAST_SIZE_T(plan->n_kc_tiles_max), CAST_SIZE_T(plan->n_mc_tiles_max));
 
-    if (plan->n_nc_tiles == 0 || plan->n_kc_tiles == 0 || plan->n_mc_tiles == 0)
+    if (plan->n_nc_tiles_max == 0 || plan->n_kc_tiles_max == 0 || plan->n_mc_tiles_max == 0)
     {
         printf("    FAIL: Should have at least one tile per dimension\n");
         gemm_plan_destroy(plan);

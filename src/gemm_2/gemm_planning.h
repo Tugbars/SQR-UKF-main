@@ -125,6 +125,10 @@ typedef enum {
 // EXECUTION PLAN
 //==============================================================================
 
+typedef struct {
+    size_t n_mc, n_kc, n_nc;
+} tile_counts_t;
+
 /**
  * @brief Complete execution plan for a GEMM operation
  * 
@@ -145,54 +149,38 @@ typedef enum {
  * @see gemm_execute_plan()
  * @see gemm_plan_destroy()
  */
+
+
 typedef struct gemm_plan {
-    //--------------------------------------------------------------------------
-    // Matrix Dimensions
-    //--------------------------------------------------------------------------
-    size_t M;  /**< Number of rows in A and C */
-    size_t K;  /**< Number of columns in A, rows in B (shared dimension) */
-    size_t N;  /**< Number of columns in B and C */
+    // Maximum dimensions for workspace
+    size_t max_M, max_K, max_N;
     
-    //--------------------------------------------------------------------------
-    // Blocking Parameters
-    //--------------------------------------------------------------------------
-    size_t MC;  /**< M-dimension cache block size (rows of A per panel) */
-    size_t KC;  /**< K-dimension cache block size (shared dimension blocking) */
-    size_t NC;  /**< N-dimension cache block size (columns of B per panel) */
-    size_t MR;  /**< M-dimension register block (micro-kernel height: 8 or 16) */
-    size_t NR;  /**< N-dimension register block (micro-kernel width: 6, 8, or 16) */
+    // Precomputed tile counts for max dimensions (fast path)
+    size_t n_mc_tiles_max;
+    size_t n_kc_tiles_max;
+    size_t n_nc_tiles_max;
     
-    //--------------------------------------------------------------------------
-    // PRE-COMPUTED EXECUTION METADATA (OPTIMIZATION)
-    //--------------------------------------------------------------------------
-    size_t n_nc_tiles;   /**< Number of NC tiles: (N + NC - 1) / NC */
-    size_t n_kc_tiles;   /**< Number of KC tiles: (K + KC - 1) / KC */
-    size_t n_mc_tiles;   /**< Number of MC tiles: (M + MC - 1) / MC */
+    // Blocking parameters
+    size_t MC, KC, NC;
+    size_t MR, NR;
     
-    //--------------------------------------------------------------------------
-    // PRE-SELECTED KERNELS FOR FULL TILES (OPTIMIZATION)
-    //--------------------------------------------------------------------------
-    gemm_kernel_id_t kern_full_add;      /**< Kernel for full MR×NR tiles (ADD mode) */
-    gemm_kernel_id_t kern_full_store;    /**< Kernel for full MR×NR tiles (STORE mode) */
+    // Panel descriptors
+    size_t n_npanels;
+    panel_info_t *npanels;
     
-    //--------------------------------------------------------------------------
-    // Panel Descriptors (NO MASKS!)
-    //--------------------------------------------------------------------------
-    size_t n_npanels;        /**< Total number of N-panels: (N + NR - 1) / NR */
-    panel_info_t *npanels;   /**< Array of panel descriptors (length: n_npanels) */
+    // Pre-selected kernels
+    gemm_kernel_id_t kern_full_add;
+    gemm_kernel_id_t kern_full_store;
     
-    //--------------------------------------------------------------------------
-    // Memory Strategy
-    //--------------------------------------------------------------------------
-    gemm_memory_mode_t mem_mode;  /**< Workspace allocation mode (static/dynamic) */
+    // Memory mode
+    gemm_memory_mode_t mem_mode;
     
-    float *workspace_a;     /**< Packed A panel buffer (size: MC × KC floats) */
-    float *workspace_b;     /**< Packed B panel buffer (size: KC × NC floats) */
-    float *workspace_temp;  /**< Temporary computation buffer (size: MC × NC floats) */
-    
-    size_t workspace_size;   /**< Total workspace size in bytes (dynamic mode only) */
-    int workspace_aligned;   /**< Non-zero if workspace is 64-byte aligned */
-    
+    // Workspace
+    float *workspace_a;
+    float *workspace_b;
+    float *workspace_temp;
+    size_t workspace_size;
+    int workspace_aligned;
 } gemm_plan_t;
 
 //==============================================================================
