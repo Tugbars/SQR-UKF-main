@@ -4,39 +4,38 @@
  *
  * This module implements the production GEMM execution layer that handles
  * matrices too large for Tier 1 fixed-size kernels. It orchestrates:
- * 
+ *
  * **Execution Pipeline:**
  * 1. Beta pre-scaling (once, before K-loop)
  * 2. NC → KC → MC blocking (maximize B panel reuse in L2)
  * 3. SIMD-optimized packing (1.5-2× faster than scalar)
  * 4. Micro-kernel dispatch with pre-selected kernels
- * 
+ *
  * **Key Optimizations:**
  * - Pre-computed tile counts (no division in hot path)
  * - Pre-selected kernels for full tiles (no dispatch overhead)
  * - Kernel selection only for edge tiles (~5% of work)
  * - Alpha absorption into packed A (reduces multiply count)
  * - Beta pre-scaling (eliminates per-tile overhead)
- * 
+ *
  * **Cache Strategy:**
  * The NC → KC → MC loop order is critical for performance:
  * - B panels (KC × NR) are packed once and reused across all MC tiles
  * - Maximizes L2 cache hit rate (~98% for large matrices)
  * - Minimizes memory traffic (packing overhead ~5%)
- * 
+ *
  * **Memory Layout:**
  * ```
  * Packed A: [k=0: m0 m1 ... m7/15][k=1: m0 m1 ...][...]
  *           └──── MR elements ────┘
- * 
+ *
  * Packed B: [k=0: n0 n1 ... n15][k=1: n0 n1 ...][...]
  *           └──── 16 elements ──┘ (fixed stride)
  * ```
- * 
+ *
  * @author TUGBARS
  * @date 2025
  */
-
 
 #include "gemm_kernels_avx2.h"
 #include "gemm_simd_ops.h"
@@ -44,6 +43,7 @@
 #include "gemm_planning.h"
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <assert.h>
 
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
@@ -54,20 +54,20 @@
 
 /**
  * @brief Stride information for packed panels
- * 
+ *
  * The packing functions return stride information so the execution
  * loop knows how to index into packed buffers:
- * 
+ *
  * - **A stride**: Distance between consecutive K-iterations in packed A
  * - **B stride**: Distance between consecutive K-iterations in packed B
- * 
+ *
  * **Usage:**
  * ```c
  * pack_strides_t s = pack_A_panel_simd(...);
  * float *a_k0 = Ap + 0 * s.a_k_stride; // K=0
  * float *a_k1 = Ap + 1 * s.a_k_stride; // K=1
  * ```
- * 
+ *
  * @note Only the relevant stride is set; the other is 0
  */
 typedef struct
@@ -82,29 +82,29 @@ typedef struct
 
 /**
  * @brief Pre-scale output matrix C by beta (before accumulation)
- * 
+ *
  * Applies the beta scaling factor to the entire C matrix ONCE before
  * the K-loop begins. This is more efficient than scaling during each
  * tile update.
- * 
+ *
  * **BLAS Semantics:**
  * - beta = 0.0: Zero C (does not read old values, just memset)
  * - beta = 1.0: No-op (C unchanged, accumulation mode)
  * - beta ≠ 1.0: Scale C *= beta (general case)
- * 
+ *
  * **Vectorization:**
  * - Main loop: 8 elements per iteration (AVX2)
  * - Tail loop: Scalar for remaining elements
- * 
+ *
  * @param C     Output matrix (M × N, row-major)
  * @param M     Number of rows in C
  * @param N     Number of columns in C
  * @param beta  Scalar multiplier for C
- * 
+ *
  * @note Called once per gemm_execute_plan(), not per tile
  * @note For beta=0, uses memset (fastest path)
  * @note For beta=1, does nothing (no memory access)
- * 
+ *
  * @see gemm_execute_plan()
  */
 static void scale_matrix_beta(
@@ -144,45 +144,44 @@ static void scale_matrix_beta(
     // else beta == 1.0f: no-op (accumulation mode)
 }
 
-
 //==============================================================================
 // SIMD-OPTIMIZED PACKING
 //==============================================================================
 
 /**
  * @brief Pack A panel with SIMD gather and alpha scaling
- * 
+ *
  * Packs a submatrix of A from column-major storage to row-major packed format,
  * applying alpha scaling during the pack operation.
- * 
+ *
  * **Input Layout (A):** Row-major, A[i,k] = A[i*K + k]
  * ```
  * A[i0, k0]   A[i0, k0+1]   ...
  * A[i0+1, k0] A[i0+1, k0+1] ...
  * ...
  * ```
- * 
+ *
  * **Output Layout (Ap):** Column-major (K-outer), Ap[k][i] format
  * ```
  * K=0: [m0 m1 m2 ... m7/15]
  * K=1: [m0 m1 m2 ... m7/15]
  * ...
  * ```
- * 
+ *
  * **SIMD Optimization:**
  * - Gathers 8 rows at once using `_mm256_set_ps()`
  * - 1.5-2× faster than scalar packing
  * - Prefetches K+8 to hide memory latency
- * 
+ *
  * **Alpha Scaling:**
  * - alpha = 1.0: Skip multiplication (fast path)
  * - alpha ≠ 1.0: Apply during pack (Ap = alpha * A)
- * 
+ *
  * **Buffer Safety:**
  * - Always allocates requested_mr rows (physical capacity)
  * - Only fills ib rows (logical content)
  * - Remaining rows are zeroed (safe for edge tiles)
- * 
+ *
  * @param[out] Ap          Packed output buffer (kb × requested_mr floats)
  * @param[in]  A           Source matrix (M × K, row-major)
  * @param[in]  M           Total rows in A (for indexing, unused)
@@ -193,16 +192,16 @@ static void scale_matrix_beta(
  * @param[in]  kb          Number of columns to pack
  * @param[in]  alpha       Scalar multiplier (absorbed into pack)
  * @param[in]  requested_mr Expected MR from planner (8 or 16)
- * 
+ *
  * @return Stride information (a_k_stride = requested_mr)
- * 
+ *
  * @pre ib <= requested_mr (planner must ensure this)
  * @pre Ap must have space for kb × requested_mr floats
- * 
+ *
  * @note Prefetching distance (8) tuned for Intel 14900K
  * @note Zeroes entire buffer first (safety, ~2% overhead)
  * @note Unused rows (ib < requested_mr) are left as zero
- * 
+ *
  * @see pack_B_panel_simd()
  * @see gemm_execute_plan()
  */
@@ -312,34 +311,34 @@ static pack_strides_t pack_A_panel_simd(
 
 /**
  * @brief Pack B panel with SIMD copy
- * 
+ *
  * Packs a submatrix of B from row-major storage to row-major packed format
  * with fixed stride for cache alignment.
- * 
+ *
  * **Input Layout (B):** Row-major, B[k,j] = B[k*N + j]
  * ```
  * B[k0, j0]   B[k0, j0+1]   ...
  * B[k0+1, j0] B[k0+1, j0+1] ...
  * ...
  * ```
- * 
+ *
  * **Output Layout (Bp):** Row-major with fixed stride=16
  * ```
  * K=0: [n0 n1 ... n7/15] [pad to 16]
  * K=1: [n0 n1 ... n7/15] [pad to 16]
  * ...
  * ```
- * 
+ *
  * **Fixed Stride:**
  * - B_STRIDE = 16 (fixed, independent of NR)
  * - Allows 16-wide kernels without special handling
  * - Wastes ~50% space for NR=8, but simplifies code
- * 
+ *
  * **SIMD Optimization:**
  * - Copies 8 elements per iteration (AVX2)
  * - Prefetches K+4 to hide memory latency
  * - 1.5-2× faster than scalar packing
- * 
+ *
  * @param[out] Bp  Packed output buffer (kb × 16 floats)
  * @param[in]  B   Source matrix (K × N, row-major)
  * @param[in]  K   Total rows in B (for indexing, unused)
@@ -348,13 +347,13 @@ static pack_strides_t pack_A_panel_simd(
  * @param[in]  kb  Number of rows to pack
  * @param[in]  j0  Starting column index in B
  * @param[in]  jb  Number of columns to pack (≤ NR)
- * 
+ *
  * @return Stride information (b_k_stride = 16)
- * 
+ *
  * @note B_STRIDE = 16 is hardcoded (matches kernel expectations)
  * @note Zeroes entire buffer first (ensures unused columns are zero)
  * @note Planner must ensure NR ≤ 16 (validated by assertion in caller)
- * 
+ *
  * @see pack_A_panel_simd()
  * @see gemm_execute_plan()
  */
@@ -410,21 +409,20 @@ static pack_strides_t pack_B_panel_simd(
     return strides;
 }
 
-
 /**
  * @brief Pack A panel with explicit source stride
  */
 static pack_strides_t pack_A_panel_simd_strided(
     float *restrict Ap,
     const float *restrict A,
-    size_t M, size_t lda,  // ← was K, now lda
+    size_t M, size_t lda, // ← was K, now lda
     size_t i0, size_t ib,
     size_t k0, size_t kb,
     float alpha,
     size_t requested_mr)
 {
     (void)M;
-    
+
     size_t actual_mr = requested_mr;
     assert(ib <= actual_mr && "ib exceeds MR: planning error");
 
@@ -440,7 +438,7 @@ static pack_strides_t pack_A_panel_simd_strided(
             if (k + 8 < kb)
                 PREFETCH_T0(A + i0 * lda + (k0 + k + 8));
 
-            const float *src_col = A + i0 * lda + (k0 + k);  // ← use lda
+            const float *src_col = A + i0 * lda + (k0 + k); // ← use lda
             float *dst = Ap + k * actual_mr;
 
             size_t i = 0;
@@ -464,7 +462,7 @@ static pack_strides_t pack_A_panel_simd_strided(
     else
     {
         __m256 valpha = _mm256_set1_ps(alpha);
-        
+
         for (size_t k = 0; k < kb; ++k)
         {
             if (k + 8 < kb)
@@ -504,13 +502,32 @@ static pack_strides_t pack_A_panel_simd_strided(
 static pack_strides_t pack_B_panel_simd_strided(
     float *restrict Bp,
     const float *restrict B,
-    size_t K, size_t ldb,  // ← was N, now ldb
+    size_t K, size_t ldb, // ← was N, now ldb
     size_t k0, size_t kb,
     size_t j0, size_t jb)
 {
     (void)K;
 
     const size_t B_STRIDE = 16;
+
+    #ifndef NDEBUG
+    // Simple always-on debug for strided cases
+    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0)) {
+        printf("  pack_B: k0=%llu, kb=%llu, j0=%llu, jb=%llu, ldb=%llu\n",
+               (unsigned long long)k0, (unsigned long long)kb,
+               (unsigned long long)j0, (unsigned long long)jb,
+               (unsigned long long)ldb);
+        
+        // Print first source row
+        printf("    B source [k=%llu, j=%llu..%llu]: [",
+               (unsigned long long)k0, (unsigned long long)j0,
+               (unsigned long long)(j0 + (jb < 8 ? jb : 8) - 1));
+        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++) {
+            printf("%.1f ", B[k0 * ldb + (j0 + j)]);
+        }
+        printf("]\n");
+    }
+    #endif
 
     if (jb < B_STRIDE)
     {
@@ -522,7 +539,7 @@ static pack_strides_t pack_B_panel_simd_strided(
         if (k + 4 < kb)
             PREFETCH_T0(B + (k0 + k + 4) * ldb + j0);
 
-        const float *src_row = B + (k0 + k) * ldb + j0;  // ← use ldb
+        const float *src_row = B + (k0 + k) * ldb + j0; // ← use ldb
         float *dst = Bp + k * B_STRIDE;
 
         size_t j = 0;
@@ -538,6 +555,16 @@ static pack_strides_t pack_B_panel_simd_strided(
         }
     }
 
+        #ifndef NDEBUG
+    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0)) {
+        printf("    B packed [k=0]: [");
+        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++) {
+            printf("%.1f ", Bp[j]);
+        }
+        printf("]\n");
+    }
+    #endif
+
     pack_strides_t strides;
     strides.a_k_stride = 0;
     strides.b_k_stride = B_STRIDE;
@@ -550,20 +577,20 @@ static pack_strides_t pack_B_panel_simd_strided(
 
 /**
  * @brief Dispatch to appropriate micro-kernel based on kernel ID
- * 
+ *
  * This function acts as a unified entry point for all micro-kernels,
  * providing a consistent interface for the execution loop.
- * 
+ *
  * **Dispatch Strategy:**
  * - Simple switch statement (branch predictor friendly)
  * - Composite kernels (16×16, 16×6) implemented as multiple calls
  * - Unused mask parameter (legacy from masked store design)
- * 
+ *
  * **Composite Kernels:**
  * - KERN_16x16: Calls 8×16 twice (rows 0-7, then 8-15)
  * - KERN_16x8: Implemented in kernel file as 2× 8×8 calls
  * - KERN_16x6: Implemented in kernel file as 2× 8×6 calls
- * 
+ *
  * @param kernel_id     Kernel identifier (from gemm_kernel_id_t enum)
  * @param c             Output submatrix pointer
  * @param ldc           Leading dimension of C (stride between rows)
@@ -574,11 +601,11 @@ static pack_strides_t pack_B_panel_simd_strided(
  * @param Kblk          Number of K-iterations to process
  * @param m_block       Actual rows in this tile (≤ MR)
  * @param n_block       Actual columns in this tile (≤ NR)
- * 
+ *
  * @note mask_unused is a legacy parameter (from masked store design)
  * @note All kernels handle partial tiles via scalar loops
  * @note Default case does nothing (should never be reached)
- * 
+ *
  * @see gemm_kernel_id_t
  * @see gemm_kernels_avx2.h
  */
@@ -631,16 +658,16 @@ static inline void dispatch_kernel(
                                      Kblk, m_block, n_block, mask_unused);
         break;
     case KERN_4x8_ADD:
-    gemm_4x8_panel_avx2fma_add(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
-                               Kblk, m_block, n_block, mask_unused);
-    //                                ^^^^^^^ ✅ ADD THIS!
-    break;
+        gemm_4x8_panel_avx2fma_add(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
+                                   Kblk, m_block, n_block, mask_unused);
+        //                                ^^^^^^^ ✅ ADD THIS!
+        break;
 
-case KERN_4x8_STORE:
-    gemm_4x8_panel_avx2fma_store(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
-                                 Kblk, m_block, n_block, mask_unused);
-    //                                  ^^^^^^^ ✅ ADD THIS!
-    break;
+    case KERN_4x8_STORE:
+        gemm_4x8_panel_avx2fma_store(c, ldc, Ap, a_k_stride, Bp, b_k_stride,
+                                     Kblk, m_block, n_block, mask_unused);
+        //                                  ^^^^^^^ ✅ ADD THIS!
+        break;
     case KERN_1x8_ADD:
         gemm_1x8_panel_avx2fma_add(c, Ap, a_k_stride, Bp, b_k_stride,
                                    Kblk, n_block, mask_unused);
@@ -693,7 +720,7 @@ static bool handle_beta_scaling(
     if (beta == 0.0f)
     {
         memset(C, 0, M * N * sizeof(float));
-        return true;  // first_accumulation = true
+        return true; // first_accumulation = true
     }
     else if (beta != 1.0f)
     {
@@ -712,7 +739,7 @@ static bool handle_beta_scaling(
         }
         return false;
     }
-    return false;  // beta == 1.0f
+    return false; // beta == 1.0f
 }
 
 // Helper for strided beta scaling
@@ -747,16 +774,14 @@ static bool handle_beta_scaling_strided(
     return false;
 }
 
-
-
 /**
  * @brief Execute GEMM operation using a pre-computed plan
- * 
+ *
  * This is the main execution engine that orchestrates the entire GEMM
  * computation using pre-computed blocking parameters and workspace.
- * 
+ *
  * **Algorithm Overview:**
- * 
+ *
  * ```
  * 1. Beta pre-scaling (C *= beta, once)
  * 2. FOR each NC tile (j0...j0+NC):
@@ -769,87 +794,105 @@ static bool handle_beta_scaling_strided(
  * 9.           Select kernel (pre-selected for full tiles)
  * 10.          Dispatch kernel (C += Ap * Bp)
  * ```
- * 
+ *
  * **Loop Order Rationale (NC → KC → MC):**
- * 
+ *
  * This specific ordering maximizes cache efficiency:
  * - **NC outer**: Processes vertical strips of B and C
  * - **KC middle**: Packs B once, reuses across all M
  * - **MC inner**: Packs A frequently, but A is smaller
- * 
+ *
  * **Cache Behavior:**
  * - B panels (KC × NR × 4 bytes) stay in L2 (~2 MB)
  * - A panels (MC × KC × 4 bytes) fit in L1 (~48 KB)
  * - C submatrix (MC × NC × 4 bytes) fits in L2
  * - Overall L2 hit rate: ~98% for large matrices
- * 
+ *
  * **Optimization Highlights:**
- * 
+ *
  * 1. **Pre-computed Tile Counts:**
  *    ```c
  *    // OLD: for (jt = 0; jt < (N + NC - 1) / NC; jt++)
  *    // NEW: for (jt = 0; jt < plan->n_nc_tiles; jt++)
  *    ```
  *    Eliminates division (1-2 cycles) from hot path.
- * 
+ *
  * 2. **Pre-selected Kernels:**
  *    ```c
  *    // Fast path (95% of tiles):
  *    kernel_id = first_k ? plan->kern_full_store : plan->kern_full_add;
- *    
+ *
  *    // Slow path (5% of tiles):
  *    gemm_select_kernels(mh, jw, &kern_add, &kern_store, &dummy);
  *    ```
  *    Eliminates kernel selection overhead for full tiles.
- * 
+ *
  * 3. **Alpha Absorption:**
  *    Multiplies A by alpha during packing, reducing total multiply count.
- * 
+ *
  * 4. **Beta Pre-scaling:**
  *    Applies beta to entire C matrix once, not per-tile.
- * 
+ *
  * **ADD vs STORE Modes:**
- * 
+ *
  * - **STORE mode**: C = A*B (used when beta=0, first K-tile)
  * - **ADD mode**: C += A*B (used for K-tiles 1..last, or when beta≠0)
- * 
+ *
  * This eliminates redundant load-add cycles on first K-tile when beta=0.
- * 
+ *
  * **Performance:**
  * - Small overhead (~5%) from packing
  * - 169.8 GFLOPS on Intel i9-14900 (single-core)
  * - 162× faster than naive implementation
  * 
+ * ┌─────────────────────────────────────────────────────────────┐
+ *│ NC Loop (j0 = 0, 256, 512, ...)                             │
+ *│   ┌───────────────────────────────────────────────────────┐ │
+ *│   │ KC Loop (k0 = 0, 256, 512, ...)                       │ │
+ *│   │   ┌─────────────────────────────────────────────────┐ │ │
+ *│   │   │ Pack B panels (ONCE per KC×NC tile!)            │ │ │
+ *│   │   │   Bp[panel_0] = pack(B[k0:k0+KC, j0:j0+NR])     │ │ │
+ *│   │   │   Bp[panel_1] = pack(B[k0:k0+KC, j0+NR:...])    │ │ │
+ *│   │   │   ...                                            │ │ │
+ *│   │   └─────────────────────────────────────────────────┘ │ │
+ *│   │                                                         │ │
+ *│   │   ┌─────────────────────────────────────────────────┐ │ │
+ *│   │   │ MC Loop (i0 = 0, 128, 256, ...)                 │ │ │
+ *│   │   │   ┌───────────────────────────────────────────┐ │ │ │
+ *│   │   │   │ MR Loop (i = i0, i0+16, ...)              │ │ │ │
+ *│   │   │   │   Pack A[i:i+MR, k0:k0+KC] → Ap           │ │ │ │
+ *│   │   │   │                                            │ │ │ │
+ *│   │   │   │   For each N-panel:                       │ │ │ │
+ *│   │   │   │     C[i:i+MR, j:j+NR] +=                  │ │ │ │
+ *│   │   │   │       kernel(Ap, Bp[panel])               │ │ │ │
+ *│   │   │   └───────────────────────────────────────────┘ │ │ │
+ *│   │   └─────────────────────────────────────────────────┘ │ │
+ *│   └───────────────────────────────────────────────────────┘ │
+ *└─────────────────────────────────────────────────────────────┘
+ *
  * @param plan  Execution plan (must not be NULL)
  * @param C     Output matrix (M × N, row-major)
  * @param A     Input matrix A (M × K, row-major)
  * @param B     Input matrix B (K × N, row-major)
  * @param alpha Scalar multiplier for A*B
  * @param beta  Scalar multiplier for C
- * 
+ *
  * @return 0 on success, -1 on error (NULL pointers)
- * 
+ *
  * @pre plan must be created with gemm_plan_create() or gemm_plan_create_with_mode()
  * @pre plan->M, plan->K, plan->N must match actual matrix dimensions
  * @pre C, A, B must be allocated by caller with correct sizes
  * @pre C must not alias A or B (no overlap)
- * 
+ *
  * @note Thread-safe if different threads use different plans/matrices
  * @note Not thread-safe if multiple threads share the same plan (workspace collision)
- * 
+ *
  * @warning Plan dimensions must exactly match matrix dimensions (no validation!)
- * 
+ *
  * @see gemm_plan_create()
  * @see gemm_auto()
  */
-/**
- * @brief Execute GEMM operation using a pre-computed plan (internal implementation)
- */
-/**
- * @brief Execute GEMM operation using a pre-computed plan (internal implementation)
- * 
- * CRITICAL FIX: Multi-pass execution for tiles wider than kernel width
- */
+
 static int gemm_execute_internal(
     gemm_plan_t *plan,
     float *restrict C,
@@ -884,10 +927,36 @@ static int gemm_execute_internal(
                 size_t j = j0 + p * plan->NR;
                 size_t jw = MIN(plan->NR, j0 + jb - j);
 
-                float *Bp_panel = Bp + p * kb * 16;
+                // ✅ Use plan->KC for panel stride, not kb
+                float *Bp_panel = Bp + p * plan->KC * 16;
+                
                 b_strides = pack_B_panel_simd_strided(
                     Bp_panel, B, K, ldb,
                     k0, kb, j, jw);
+                
+                // ✅ DEBUG: Verify packed B for this panel
+                #ifndef NDEBUG
+                if ((M == 1 && K == 8 && N == 1) || 
+                    (M == 7 && K == 5 && N == 9) ||
+                    (M == 7 && K == 9 && N == 11)) {
+                    printf("  Verify pack: Panel %llu, B[k=%llu..%llu, j=%llu..%llu] -> offset %llu (plan->KC=%llu):\n",
+                           (unsigned long long)p,
+                           (unsigned long long)k0, (unsigned long long)(k0 + kb - 1),
+                           (unsigned long long)j, (unsigned long long)(j + jw - 1),
+                           (unsigned long long)(p * plan->KC * 16),
+                           (unsigned long long)plan->KC);
+                    
+                    // Show first 4 K-rows of packed B
+                    printf("    Packed B (first %llu K-rows): ", 
+                           (unsigned long long)(kb < 4 ? kb : 4));
+                    for (size_t kk = 0; kk < (kb < 4 ? kb : 4); kk++) {
+                        printf("[K=%llu: %.1f] ", 
+                               (unsigned long long)kk, 
+                               Bp_panel[kk * 16]);
+                    }
+                    printf("\n");
+                }
+                #endif
             }
 
             for (size_t it = 0; it < tiles.n_mc; it++)
@@ -907,7 +976,7 @@ static int gemm_execute_internal(
                         Ap, A, M, lda,
                         i, mh, k0, kb, alpha, pack_mr);
 
-                    // ✅ CRITICAL FIX: Execute kernels on all N-panels with multi-pass
+                    // Execute kernels on all N-panels
                     for (size_t p = 0; p < n_panels; p++)
                     {
                         size_t j = j0 + p * plan->NR;
@@ -918,27 +987,28 @@ static int gemm_execute_internal(
                         int kernel_width;
                         gemm_select_kernels(mh, jw, &kern_add, &kern_store, &kernel_width);
 
-                        // ✅ MULTI-PASS EXECUTION: Split wide tiles into kernel-width chunks
+                        // Multi-pass execution: Split wide tiles into kernel-width chunks
                         size_t j_offset = 0;
                         while (j_offset < jw)
                         {
-                            // Compute chunk width (clamp to kernel's native width)
                             size_t jw_chunk = MIN((size_t)kernel_width, jw - j_offset);
 
                             // Determine ADD vs STORE mode
                             gemm_kernel_id_t kernel_id;
                             if (kt == 0 && first_accumulation)
                             {
-                                kernel_id = kern_store;  // First K-tile: overwrite
+                                kernel_id = kern_store;
                             }
                             else
                             {
-                                kernel_id = kern_add;    // Subsequent K-tiles: accumulate
+                                kernel_id = kern_add;
                             }
 
                             // Compute adjusted pointers for this chunk
                             float *cptr = C + i * ldc + (j + j_offset);
-                            float *bptr = Bp + p * kb * 16 + j_offset;
+                            
+                            // ✅ CRITICAL FIX: Use plan->KC, not kb!
+                            float *bptr = Bp + p * plan->KC * 16 + j_offset;
 
                             // Dispatch kernel for this chunk
                             dispatch_kernel(
@@ -951,11 +1021,13 @@ static int gemm_execute_internal(
                                 b_strides.b_k_stride,
                                 kb,
                                 mh,
-                                jw_chunk);  // ✅ jw_chunk ≤ kernel_width guaranteed!
+                                jw_chunk);
 
-                            // Advance to next chunk
+
+
                             j_offset += kernel_width;
                         }
+
                     }
                 }
             }
@@ -973,18 +1045,18 @@ int gemm_execute_plan(
     float alpha,
     float beta)
 {
-    if (!plan || !C || !A || !B) return -1;
-    
+    if (!plan || !C || !A || !B)
+        return -1;
+
     // Use precomputed tile counts for max dimensions (fast path)
-    bool first_acc = handle_beta_scaling(C, plan->max_M, plan->max_N, 
+    bool first_acc = handle_beta_scaling(C, plan->max_M, plan->max_N,
                                          plan->max_N, beta);
-    
+
     tile_counts_t tiles = {
         .n_mc = plan->n_mc_tiles_max,
         .n_kc = plan->n_kc_tiles_max,
-        .n_nc = plan->n_nc_tiles_max
-    };
-    
+        .n_nc = plan->n_nc_tiles_max};
+
     return gemm_execute_internal(plan, C, A, B,
                                  plan->max_M, plan->max_K, plan->max_N,
                                  plan->max_N, plan->max_K, plan->max_N,
@@ -997,20 +1069,20 @@ int gemm_execute_plan(
 
 /**
  * @brief Automatic GEMM with Tier 1/Tier 2 dispatch
- * 
+ *
  * Automatically selects between Tier 1 (fixed-size kernels) and
  * Tier 2 (blocked execution) based on matrix dimensions.
- * 
+ *
  * **Dispatch Logic:**
  * 1. Try Tier 1 (gemm_small_dispatch)
  *    - If M,N ≤ 16 and K ≤ 64 and FLOPs ≤ 8192: Use fixed-size kernels
  * 2. Fallback to Tier 2 (gemm_execute_plan)
  *    - Create plan, execute, destroy (one-time use)
- * 
+ *
  * **Usage Note:**
  * For repeated calls with same dimensions, use gemm_plan_create() +
  * gemm_execute_plan() instead to amortize planning cost.
- * 
+ *
  * @param C     Output matrix (M × N, row-major)
  * @param A     Input matrix A (M × K, row-major)
  * @param B     Input matrix B (K × N, row-major)
@@ -1019,9 +1091,9 @@ int gemm_execute_plan(
  * @param N     Number of columns in B and C
  * @param alpha Scalar multiplier for A*B
  * @param beta  Scalar multiplier for C
- * 
+ *
  * @return 0 on success, -1 on error
- * 
+ *
  * @see gemm_plan_create()
  * @see gemm_execute_plan()
  * @see gemm_small_dispatch()
@@ -1056,17 +1128,18 @@ int gemm_execute_plan_strided(
     float alpha,
     float beta)
 {
-    if (!plan || !C || !A || !B) return -1;
-    if (M > plan->max_M || K > plan->max_K || N > plan->max_N) return -1;
-    
+    if (!plan || !C || !A || !B)
+        return -1;
+    if (M > plan->max_M || K > plan->max_K || N > plan->max_N)
+        return -1;
+
     bool first_acc = handle_beta_scaling_strided(C, M, N, ldc, beta);
-    
+
     tile_counts_t tiles = {
         .n_mc = (M + plan->MC - 1) / plan->MC,
         .n_kc = (K + plan->KC - 1) / plan->KC,
-        .n_nc = (N + plan->NC - 1) / plan->NC
-    };
-    
+        .n_nc = (N + plan->NC - 1) / plan->NC};
+
     return gemm_execute_internal(plan, C, A, B,
                                  M, K, N, ldc, lda, ldb,
                                  tiles, alpha, beta, first_acc);
@@ -1074,18 +1147,18 @@ int gemm_execute_plan_strided(
 
 /**
  * @brief GEMM with static workspace allocation
- * 
+ *
  * Uses pre-allocated global workspace (GEMM_STATIC_WORKSPACE_SIZE).
  * Faster than dynamic allocation but limited to small/medium matrices.
- * 
+ *
  * **Advantages:**
  * - Zero allocation overhead (~5-10 µs saved)
  * - Deterministic execution time
- * 
+ *
  * **Limitations:**
  * - Matrix size limited by GEMM_STATIC_WORKSPACE_SIZE
  * - Not thread-safe (global workspace)
- * 
+ *
  * @param C     Output matrix (M × N, row-major)
  * @param A     Input matrix A (M × K, row-major)
  * @param B     Input matrix B (K × N, row-major)
@@ -1094,12 +1167,12 @@ int gemm_execute_plan_strided(
  * @param N     Number of columns in B and C
  * @param alpha Scalar multiplier for A*B
  * @param beta  Scalar multiplier for C
- * 
+ *
  * @return 0 on success, -1 if dimensions too large or allocation fails
- * 
+ *
  * @note Check with gemm_fits_static(M,K,N) before calling
  * @note Not thread-safe (uses global workspace)
- * 
+ *
  * @see gemm_fits_static()
  * @see gemm_dynamic()
  */
@@ -1124,18 +1197,18 @@ int gemm_static(
 
 /**
  * @brief GEMM with dynamic workspace allocation
- * 
+ *
  * Allocates workspace from heap (handles any matrix size).
  * Slightly slower than static mode due to allocation overhead.
- * 
+ *
  * **Advantages:**
  * - No size limitations
  * - Thread-safe (each call gets own workspace)
- * 
+ *
  * **Disadvantages:**
  * - Allocation overhead (~5-10 µs)
  * - Potential memory fragmentation
- * 
+ *
  * @param C     Output matrix (M × N, row-major)
  * @param A     Input matrix A (M × K, row-major)
  * @param B     Input matrix B (K × N, row-major)
@@ -1144,12 +1217,12 @@ int gemm_static(
  * @param N     Number of columns in B and C
  * @param alpha Scalar multiplier for A*B
  * @param beta  Scalar multiplier for C
- * 
+ *
  * @return 0 on success, -1 on allocation failure
- * 
+ *
  * @note Thread-safe (each call allocates own workspace)
  * @note For repeated calls, use gemm_plan_create() + gemm_execute_plan()
- * 
+ *
  * @see gemm_static()
  * @see gemm_plan_create()
  */
@@ -1169,7 +1242,6 @@ int gemm_dynamic(
     return ret;
 }
 
-
 int gemm_strided(
     float *restrict C,
     const float *restrict A,
@@ -1181,7 +1253,7 @@ int gemm_strided(
     gemm_plan_t *plan = gemm_plan_create(M, K, N);
     if (!plan)
         return -1;
-    
+
     int ret = gemm_execute_plan_strided(plan, C, A, B, M, K, N,
                                         ldc, lda, ldb, alpha, beta);
     gemm_plan_destroy(plan);
@@ -1190,13 +1262,13 @@ int gemm_strided(
 
 /**
  * @brief Query blocking parameters for given matrix dimensions
- * 
+ *
  * Returns the blocking parameters that would be selected by the planner
  * for given matrix dimensions. Useful for:
  * - Performance analysis
  * - Workspace size estimation
  * - Debugging blocking strategies
- * 
+ *
  * @param[in]  M  Number of rows in A and C
  * @param[in]  K  Number of columns in A, rows in B
  * @param[in]  N  Number of columns in B and C
@@ -1205,10 +1277,10 @@ int gemm_strided(
  * @param[out] NC N-dimension cache block size
  * @param[out] MR M-dimension register block size
  * @param[out] NR N-dimension register block size
- * 
+ *
  * @note All output parameters must be non-NULL
  * @note Does not create a plan (lightweight query)
- * 
+ *
  * @see gemm_select_blocking()
  * @see gemm_workspace_query()
  */
