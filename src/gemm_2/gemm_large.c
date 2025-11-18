@@ -510,27 +510,6 @@ static pack_strides_t pack_B_panel_simd_strided(
 
     const size_t B_STRIDE = 16;
 
-#ifndef NDEBUG
-    // Simple always-on debug for strided cases
-    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0))
-    {
-        printf("  pack_B: k0=%llu, kb=%llu, j0=%llu, jb=%llu, ldb=%llu\n",
-               (unsigned long long)k0, (unsigned long long)kb,
-               (unsigned long long)j0, (unsigned long long)jb,
-               (unsigned long long)ldb);
-
-        // Print first source row
-        printf("    B source [k=%llu, j=%llu..%llu]: [",
-               (unsigned long long)k0, (unsigned long long)j0,
-               (unsigned long long)(j0 + (jb < 8 ? jb : 8) - 1));
-        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++)
-        {
-            printf("%.1f ", B[k0 * ldb + (j0 + j)]);
-        }
-        printf("]\n");
-    }
-#endif
-
     if (jb < B_STRIDE)
     {
         memset(Bp, 0, kb * B_STRIDE * sizeof(float));
@@ -556,18 +535,6 @@ static pack_strides_t pack_B_panel_simd_strided(
             dst[j] = src_row[j];
         }
     }
-
-#ifndef NDEBUG
-    if ((kb <= 10 && jb <= 10) || (k0 == 0 && j0 == 0))
-    {
-        printf("    B packed [k=0]: [");
-        for (size_t j = 0; j < (jb < 8 ? jb : 8); j++)
-        {
-            printf("%.1f ", Bp[j]);
-        }
-        printf("]\n");
-    }
-#endif
 
     pack_strides_t strides;
     strides.a_k_stride = 0;
