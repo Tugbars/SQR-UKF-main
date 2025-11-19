@@ -968,30 +968,41 @@ static int test_kernel_combination(void)
     float *Ap4 = gemm_aligned_alloc(32, K * 8 * sizeof(float));
     float *Bp = gemm_aligned_alloc(32, K * 16 * sizeof(float));
 
+    // Pack first 8 rows of A
     pack_A_for_test(Ap8, A, 8, K, 8);
+    
+    // Pack last 4 rows of A (starting at row 8)
     pack_A_for_test(Ap4, A + 8 * K, 4, K, 8);
+    
     pack_B_for_test(Bp, B, K, N);
 
     __m256i mask = _mm256_set1_epi32(-1);
 
-    gemm_4x8_panel_avx2fma_store(
-    C_test + 8 * ldc, ldc,
-    Ap4, 8,
-    Bp, 16,
-    K,
-    4,     // m_block (4 rows for this tile)
-    8,     // jb (width)
-    mask);
+    //==========================================================================
+    // ✅ FIX 1: Call 8×8 kernel for first 8 rows
+    //==========================================================================
+    gemm_8x8_panel_avx2fma_store(
+        C_test,      // ← Start at row 0
+        ldc,
+        Ap8, 8,      // ← Packed first 8 rows
+        Bp, 16,
+        K,
+        8, 8,        // m=8, n=8
+        mask);
 
+    //==========================================================================
+    // ✅ FIX 2: Call 4×8 kernel for last 4 rows
+    //==========================================================================
     gemm_4x8_panel_avx2fma_store(
-    C_test + 8 * ldc, ldc,
-    Ap4, 8,
-    Bp, 16,
-    K,
-    4,     // m_block - processing 4 rows
-    8,     // jb - width is 8
-    mask);
+        C_test + 8 * ldc, // ← Start at row 8
+        ldc,
+        Ap4, 8,           // ← Packed last 4 rows
+        Bp, 16,
+        K,
+        4, 8,             // m=4, n=8
+        mask);
 
+    // Reference computation
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
 
     int passed = compare_matrices_verbose(C_test, C_ref, M, N, ldc, 1e-4f, "12x8 combination");
