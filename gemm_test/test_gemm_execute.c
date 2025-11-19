@@ -1230,10 +1230,9 @@ static void apply_block_reflector_reference(
     size_t m, size_t n, size_t ib,
     size_t ldc, size_t ldy)
 {
-    // Allocate workspace
     float *YT = malloc(ib * m * sizeof(float));
     float *TYT = malloc(ib * m * sizeof(float));
-    float *C_temp = malloc(m * n * sizeof(float));
+    float *temp = malloc(ib * n * sizeof(float));
     
     // 1. Compute Y^T (ib × m)
     for (size_t i = 0; i < ib; ++i)
@@ -1241,23 +1240,20 @@ static void apply_block_reflector_reference(
             YT[i * m + j] = Y[j * ldy + i];
     
     // 2. Compute TY^T = T * Y^T (ib × m)
+    //    ✅ FIXED: T is UPPER triangular, so k goes from i to ib
     memset(TYT, 0, ib * m * sizeof(float));
     for (size_t i = 0; i < ib; ++i) {
         for (size_t j = 0; j < m; ++j) {
             float sum = 0.0f;
-            // T is upper triangular
-            for (size_t k = 0; k <= i; ++k) {
+            // ✅ FIX: For upper triangular T[i,k], only k >= i are non-zero
+            for (size_t k = i; k < ib; ++k) {
                 sum += T[i * ib + k] * YT[k * m + j];
             }
             TYT[i * m + j] = sum;
         }
     }
     
-    // 3. Compute Y * (TY^T) (m × m, but we only need m × n after multiplying by C)
-    // Directly compute Y * TYT * C = Y * (TY^T * C)
-    
-    // First: temp = TY^T * C (ib × n)
-    float *temp = malloc(ib * n * sizeof(float));
+    // 3. temp = TY^T * C (ib × n)
     memset(temp, 0, ib * n * sizeof(float));
     for (size_t i = 0; i < ib; ++i) {
         for (size_t j = 0; j < n; ++j) {
@@ -1269,7 +1265,7 @@ static void apply_block_reflector_reference(
         }
     }
     
-    // Second: C = C - Y * temp (m × n)
+    // 4. C = C - Y * temp (m × n)
     for (size_t i = 0; i < m; ++i) {
         for (size_t j = 0; j < n; ++j) {
             float sum = 0.0f;
@@ -1282,7 +1278,6 @@ static void apply_block_reflector_reference(
     
     free(YT);
     free(TYT);
-    free(C_temp);
     free(temp);
 }
 
