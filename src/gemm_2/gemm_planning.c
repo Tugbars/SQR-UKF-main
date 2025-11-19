@@ -648,11 +648,11 @@ gemm_plan_t *gemm_plan_create_with_mode(
     plan->n_nc_tiles_max = (N + plan->NC - 1) / plan->NC;
 
     // Pre-select kernels for full tiles
-    int dummy_width;
+    
     gemm_select_kernels(plan->MR, plan->NR,
                        &plan->kern_full_add,
                        &plan->kern_full_store,
-                       &dummy_width);
+                       &plan->kern_full_width);  
 
     // Allocate panel descriptors
     plan->n_npanels = (N + plan->NR - 1) / plan->NR;

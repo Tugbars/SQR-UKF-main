@@ -1,7 +1,7 @@
 /**
  * @file test_gemm_large.c
  * @brief Comprehensive tests for GEMM execution pipeline
- * 
+ *
  * Tests:
  * - Alpha/beta specializations (1_0, 1_1, general)
  * - K-tile accumulation correctness
@@ -9,7 +9,7 @@
  * - Memory modes (static/dynamic)
  * - Edge tiles vs full tiles
  * - Precomputed plan metadata
- * 
+ *
  * @author TUGBARS
  * @date 2025
  */
@@ -100,7 +100,7 @@ static int matrices_equal(
             float b = B[i * N + j];
             float diff = fabsf(a - b);
             float mag = fmaxf(fabsf(a), fabsf(b));
-            
+
             if (diff > tol && diff > tol * mag)
             {
                 printf("      Mismatch at [%lu,%lu]: expected %.6f, got %.6f (diff=%.2e)\n",
@@ -165,7 +165,8 @@ static int test_alpha_beta_combinations(void)
     init_matrix(A, M, K, 1.0f);
     init_matrix(B, K, N, 2.0f);
 
-    typedef struct {
+    typedef struct
+    {
         float alpha;
         float beta;
         const char *name;
@@ -226,7 +227,7 @@ static int test_alpha_beta_combinations(void)
 static int test_k_tile_accumulation(void)
 {
     // Use K dimension that forces multiple K-tiles
-    const size_t M = 64, K = 600, N = 48;  // K=600 forces ~2-5 K-tiles depending on blocking
+    const size_t M = 64, K = 600, N = 48; // K=600 forces ~2-5 K-tiles depending on blocking
     float *A, *B, *C, *C_ref;
 
     if (!alloc_test_matrices(&A, &B, &C, &C_ref, M, K, N))
@@ -239,7 +240,7 @@ static int test_k_tile_accumulation(void)
     init_matrix(B, K, N, 0.5f);
 
     // Test beta=0.0 (STORE for kt=0, ADD for kt>0)
-    memset(C, 0xFF, M * N * sizeof(float));  // Fill with garbage
+    memset(C, 0xFF, M * N * sizeof(float)); // Fill with garbage
     memset(C_ref, 0, M * N * sizeof(float));
 
     gemm_reference(C_ref, A, B, M, K, N, 1.0f, 0.0f);
@@ -253,7 +254,7 @@ static int test_k_tile_accumulation(void)
     }
 
     int passed = matrices_equal(C, C_ref, M, N, TEST_TOLERANCE);
-    
+
     if (passed)
     {
         printf("      K-tile accumulation (K=%lu): OK\n", (unsigned long)K);
@@ -273,7 +274,8 @@ static int test_k_tile_accumulation(void)
 
 static int test_matrix_sizes(void)
 {
-    typedef struct {
+    typedef struct
+    {
         size_t M, K, N;
         const char *name;
     } size_test_t;
@@ -283,24 +285,24 @@ static int test_matrix_sizes(void)
         {4, 4, 4, "Tiny 4x4x4"},
         {8, 8, 8, "Small 8x8x8"},
         {16, 16, 16, "Medium 16x16x16"},
-        
+
         // Single cache block
         {64, 64, 64, "Single block 64x64x64"},
         {128, 128, 128, "Large single block 128x128x128"},
-        
+
         // Multiple tiles
         {256, 256, 256, "Multiple tiles 256x256x256"},
         {384, 384, 384, "Block-sized 384x384x384"},
-        
+
         // Non-square
         {256, 64, 128, "Tall 256x64x128"},
         {64, 256, 128, "Deep 64x256x128"},
         {64, 128, 256, "Wide 64x128x256"},
-        
+
         // Edge cases (not multiples of block size)
         {100, 50, 75, "Odd sizes 100x50x75"},
         {127, 63, 95, "Prime-ish 127x63x95"},
-        
+
         // Extreme aspect ratios
         {512, 64, 64, "Very tall 512x64x64"},
         {64, 64, 512, "Very wide 64x64x512"},
@@ -362,7 +364,7 @@ static int test_matrix_sizes(void)
 
 static int test_memory_modes(void)
 {
-   
+
     const size_t M = 128, K = 64, N = 96;
     float *A, *B, *C_static, *C_dynamic, *C_ref;
 
@@ -395,7 +397,7 @@ static int test_memory_modes(void)
     {
         memset(C_static, 0, M * N * sizeof(float));
         int ret = gemm_static(C_static, A, B, M, K, N, 1.0f, 0.0f);
-        
+
         if (ret != 0)
         {
             printf("      Static mode: gemm_static returned error %d\n", ret);
@@ -419,7 +421,7 @@ static int test_memory_modes(void)
     // Test dynamic workspace
     memset(C_dynamic, 0, M * N * sizeof(float));
     int ret = gemm_dynamic(C_dynamic, A, B, M, K, N, 1.0f, 0.0f);
-    
+
     int dynamic_passed = 1;
     if (ret != 0)
     {
@@ -441,7 +443,7 @@ static int test_memory_modes(void)
     gemm_aligned_free(C_static);
     gemm_aligned_free(C_dynamic);
     gemm_aligned_free(C_ref);
-  
+
     return 1;
 }
 
@@ -451,7 +453,8 @@ static int test_memory_modes(void)
 
 static int test_edge_cases(void)
 {
-    typedef struct {
+    typedef struct
+    {
         size_t M, K, N;
         float alpha, beta;
         const char *name;
@@ -462,21 +465,21 @@ static int test_edge_cases(void)
         {1, 1, 1, 1.0f, 0.0f, "1x1x1"},
         //{1, 8, 1, 1.0f, 0.0f, "1x8x1"},
         {8, 1, 8, 1.0f, 0.0f, "8x1x8"},
-        
+
         // Edge tile sizes (just below kernel boundaries)
         {7, 8, 8, 1.0f, 0.0f, "7x8x8 (edge M)"},
         {8, 8, 7, 1.0f, 0.0f, "8x8x7 (edge N)"},
         {8, 7, 8, 1.0f, 0.0f, "8x7x8 (edge K)"},
-        
+
         // Just above kernel boundaries
         {9, 8, 8, 1.0f, 0.0f, "9x8x8"},
         {8, 8, 9, 1.0f, 0.0f, "8x8x9"},
         {17, 8, 8, 1.0f, 0.0f, "17x8x8"},
-        
+
         // Alpha=0 (should zero result regardless of A, B)
         {16, 16, 16, 0.0f, 0.0f, "alpha=0, beta=0"},
         {16, 16, 16, 0.0f, 1.0f, "alpha=0, beta=1 (should preserve C)"},
-        
+
         // Beta=0 with garbage in C
         {32, 32, 32, 1.0f, 0.0f, "beta=0 (overwrite garbage)"},
     };
@@ -502,7 +505,7 @@ static int test_edge_cases(void)
 
         init_matrix(A, M, K, 1.0f);
         init_matrix(B, K, N, 2.0f);
-        
+
         // For beta=0 test, fill C with garbage
         if (beta == 0.0f && alpha != 0.0f)
         {
@@ -513,7 +516,7 @@ static int test_edge_cases(void)
         {
             init_matrix(C, M, N, 3.0f);
         }
-        
+
         memcpy(C_ref, C, M * N * sizeof(float));
 
         gemm_reference(C_ref, A, B, M, K, N, alpha, beta);
@@ -588,8 +591,9 @@ static void gemm_reference_strided(
 static int test_strided_basic(void)
 {
     printf("  Testing basic strided operations...\n");
-    
-    typedef struct {
+
+    typedef struct
+    {
         size_t M, K, N;
         size_t ldc, lda, ldb;
         const char *name;
@@ -599,20 +603,20 @@ static int test_strided_basic(void)
         // Minimal strides (contiguous)
         {8, 8, 8, 8, 8, 8, "8x8x8 contiguous (ld=logical)"},
         {16, 16, 16, 16, 16, 16, "16x16x16 contiguous"},
-        
+
         // Single stride larger
         {8, 8, 8, 16, 8, 8, "8x8x8 with ldc=16"},
         {8, 8, 8, 8, 16, 8, "8x8x8 with lda=16"},
         {8, 8, 8, 8, 8, 16, "8x8x8 with ldb=16"},
-        
+
         // All strides larger
         {8, 8, 8, 16, 16, 16, "8x8x8 all strides=16"},
         {16, 16, 16, 32, 32, 32, "16x16x16 all strides=32"},
-        
+
         // Odd stride values
         {7, 9, 11, 20, 15, 25, "7x9x11 with irregular strides"},
         {32, 32, 32, 48, 40, 64, "32x32x32 with large strides"},
-        
+
         // Realistic QR scenario (tall-skinny submatrix)
         {64, 16, 48, 128, 16, 128, "64x16x48 QR trailing update"},
         {128, 8, 64, 256, 8, 256, "128x8x64 panel update"},
@@ -672,11 +676,11 @@ static int test_strided_basic(void)
 
         // Compute reference
         gemm_reference_strided(C_ref, A_full, B_full, M, K, N,
-                              ldc, lda, ldb, 1.0f, 1.0f);
+                               ldc, lda, ldb, 1.0f, 1.0f);
 
         // Compute with strided GEMM
         int ret = gemm_strided(C, A_full, B_full, M, K, N,
-                              ldc, lda, ldb, 1.0f, 1.0f);
+                               ldc, lda, ldb, 1.0f, 1.0f);
 
         if (ret != 0)
         {
@@ -699,7 +703,7 @@ static int test_strided_basic(void)
                 float c_ref = C_ref[i * ldc + j];
                 float diff = fabsf(c - c_ref);
                 float mag = fmaxf(fabsf(c), fabsf(c_ref));
-                
+
                 if (diff > TEST_TOLERANCE && diff > TEST_TOLERANCE * mag)
                 {
                     printf("      %s: Mismatch at [%lu,%lu]: expected %.6f, got %.6f (diff=%.2e)\n",
@@ -734,9 +738,9 @@ static int test_strided_basic(void)
 static int test_strided_alpha_beta(void)
 {
     printf("  Testing strided operations with alpha/beta...\n");
-    
+
     const size_t M = 32, K = 24, N = 40;
-    const size_t ldc = 64, lda = 32, ldb = 64;  // All with extra padding
+    const size_t ldc = 64, lda = 32, ldb = 64; // All with extra padding
 
     float *A_full = (float *)gemm_aligned_alloc(64, M * lda * sizeof(float));
     float *B_full = (float *)gemm_aligned_alloc(64, K * ldb * sizeof(float));
@@ -756,7 +760,7 @@ static int test_strided_alpha_beta(void)
     // Initialize matrices
     memset(A_full, 0, M * lda * sizeof(float));
     memset(B_full, 0, K * ldb * sizeof(float));
-    
+
     for (size_t i = 0; i < M; i++)
         for (size_t k = 0; k < K; k++)
             A_full[i * lda + k] = 1.0f + (float)(i + k) * 0.1f;
@@ -765,7 +769,8 @@ static int test_strided_alpha_beta(void)
         for (size_t j = 0; j < N; j++)
             B_full[k * ldb + j] = 2.0f + (float)(k + j) * 0.1f;
 
-    typedef struct {
+    typedef struct
+    {
         float alpha, beta;
         const char *name;
     } ab_test_t;
@@ -793,11 +798,11 @@ static int test_strided_alpha_beta(void)
 
         // Compute reference
         gemm_reference_strided(C_ref, A_full, B_full, M, K, N,
-                              ldc, lda, ldb, alpha, beta);
+                               ldc, lda, ldb, alpha, beta);
 
         // Compute with strided GEMM
         int ret = gemm_strided(C, A_full, B_full, M, K, N,
-                              ldc, lda, ldb, alpha, beta);
+                               ldc, lda, ldb, alpha, beta);
 
         if (ret != 0)
         {
@@ -816,7 +821,7 @@ static int test_strided_alpha_beta(void)
                 float c_ref = C_ref[i * ldc + j];
                 float diff = fabsf(c - c_ref);
                 float mag = fmaxf(fabsf(c), fabsf(c_ref));
-                
+
                 if (diff > TEST_TOLERANCE && diff > TEST_TOLERANCE * mag)
                 {
                     printf("      %s: Mismatch at [%lu,%lu]: expected %.6f, got %.6f\n",
@@ -854,18 +859,18 @@ static int test_strided_alpha_beta(void)
 static int test_strided_submatrix_qr(void)
 {
     printf("  Testing submatrix extraction (QR scenario)...\n");
-    
+
     // Simulate QR decomposition scenario:
     // Large matrix A[256×256], we want to update A[64:192, 128:256]
     const size_t full_m = 256, full_n = 256;
     const size_t sub_i0 = 64, sub_j0 = 128;
     const size_t sub_m = 128, sub_n = 128;
-    const size_t sub_k = 32;  // Typical block size for QR
+    const size_t sub_k = 32; // Typical block size for QR
 
     // Allocate full matrix
     float *A_full = (float *)gemm_aligned_alloc(64, full_m * full_n * sizeof(float));
     float *A_full_ref = (float *)gemm_aligned_alloc(64, full_m * full_n * sizeof(float));
-    
+
     // Allocate Y and T for QR update (Y is m×k, T is k×k)
     float *Y = (float *)gemm_aligned_alloc(64, sub_m * sub_k * sizeof(float));
     float *T = (float *)gemm_aligned_alloc(64, sub_k * sub_k * sizeof(float));
@@ -883,13 +888,13 @@ static int test_strided_submatrix_qr(void)
     // Initialize full matrix
     for (size_t i = 0; i < full_m * full_n; i++)
         A_full[i] = (float)(i % 1000) * 0.001f;
-    
+
     memcpy(A_full_ref, A_full, full_m * full_n * sizeof(float));
 
     // Initialize Y and T (simulating Householder reflectors)
     for (size_t i = 0; i < sub_m * sub_k; i++)
         Y[i] = ((float)i * 0.01f) / (float)sub_m;
-    
+
     for (size_t i = 0; i < sub_k * sub_k; i++)
         T[i] = 0.0f;
     for (size_t i = 0; i < sub_k; i++)
@@ -903,7 +908,7 @@ static int test_strided_submatrix_qr(void)
     float *Z = (float *)gemm_aligned_alloc(64, sub_k * sub_n * sizeof(float));
     float *W = (float *)gemm_aligned_alloc(64, sub_k * sub_n * sizeof(float));
     float *YT = (float *)gemm_aligned_alloc(64, sub_k * sub_m * sizeof(float));
-    
+
     if (!Z || !W || !YT)
     {
         printf("      Memory allocation failed\n");
@@ -946,10 +951,10 @@ static int test_strided_submatrix_qr(void)
     // Block reflector update: C := C - Y * T * Y^T * C
     // Step 1: Z = Y^T * C
     gemm_auto(Z, YT, C_extracted, sub_k, sub_m, sub_n, 1.0f, 0.0f);
-    
+
     // Step 2: W = T * Z
     gemm_auto(W, T, Z, sub_k, sub_k, sub_n, 1.0f, 0.0f);
-    
+
     // Step 3: C := C - Y * W
     gemm_auto(C_extracted, Y, W, sub_m, sub_k, sub_n, -1.0f, 1.0f);
 
@@ -960,21 +965,21 @@ static int test_strided_submatrix_qr(void)
     //--------------------------------------------------------------------------
     // Optimized: Direct strided GEMM (the fast way - NO PACKING!)
     //--------------------------------------------------------------------------
-    
+
     // Step 1: Z = Y^T * C_sub (strided read of C_sub)
     gemm_strided(Z, YT, C_sub,
-                sub_k, sub_m, sub_n,  // logical dimensions
-                sub_n, sub_m, full_n,  // ldz, ldyt, ldc_sub
-                1.0f, 0.0f);
-    
+                 sub_k, sub_m, sub_n,  // logical dimensions
+                 sub_n, sub_m, full_n, // ldz, ldyt, ldc_sub
+                 1.0f, 0.0f);
+
     // Step 2: W = T * Z (contiguous)
     gemm_auto(W, T, Z, sub_k, sub_k, sub_n, 1.0f, 0.0f);
-    
+
     // Step 3: C_sub := C_sub - Y * W (strided read/write of C_sub)
     gemm_strided(C_sub, Y, W,
-                sub_m, sub_k, sub_n,  // logical dimensions
-                full_n, sub_k, sub_n,  // ldc_sub, ldy, ldw
-                -1.0f, 1.0f);
+                 sub_m, sub_k, sub_n,  // logical dimensions
+                 full_n, sub_k, sub_n, // ldc_sub, ldy, ldw
+                 -1.0f, 1.0f);
 
     //--------------------------------------------------------------------------
     // Compare results
@@ -988,7 +993,7 @@ static int test_strided_submatrix_qr(void)
             float c_ref = C_ref_sub[i * full_n + j];
             float diff = fabsf(c - c_ref);
             float mag = fmaxf(fabsf(c), fabsf(c_ref));
-            
+
             // Use more relaxed tolerance for accumulated error
             if (diff > TEST_TOLERANCE * 10.0f && diff > TEST_TOLERANCE * 10.0f * mag)
             {
@@ -1026,8 +1031,9 @@ static int test_strided_submatrix_qr(void)
 static int test_strided_extreme_cases(void)
 {
     printf("  Testing extreme stride cases...\n");
-    
-    typedef struct {
+
+    typedef struct
+    {
         size_t M, K, N;
         size_t ldc, lda, ldb;
         const char *name;
@@ -1036,14 +1042,14 @@ static int test_strided_extreme_cases(void)
     extreme_test_t cases[] = {
         // Very large strides (sparse matrix-like)
         {4, 4, 4, 128, 128, 128, "4x4x4 with huge strides (128)"},
-        
+
         // Minimal logical size, large physical
         {1, 8, 1, 64, 8, 64, "1x8x1 embedded in 64-wide"},
-        
+
         // Row-major vs column-major like scenarios
         {16, 8, 16, 16, 8, 16, "16x8x16 minimal strides"},
         {16, 8, 16, 32, 16, 32, "16x8x16 doubled strides"},
-        
+
         // Edge tiles with strides
         {7, 5, 9, 16, 8, 16, "7x5x9 odd sizes with strides"},
     };
@@ -1095,10 +1101,10 @@ static int test_strided_extreme_cases(void)
 
         // Compute
         gemm_reference_strided(C_ref, A_full, B_full, M, K, N,
-                              ldc, lda, ldb, 1.0f, 0.5f);
-        
+                               ldc, lda, ldb, 1.0f, 0.5f);
+
         int ret = gemm_strided(C, A_full, B_full, M, K, N,
-                              ldc, lda, ldb, 1.0f, 0.5f);
+                               ldc, lda, ldb, 1.0f, 0.5f);
 
         if (ret != 0)
         {
@@ -1120,7 +1126,7 @@ static int test_strided_extreme_cases(void)
                 float c = C[i * ldc + j];
                 float c_ref = C_ref[i * ldc + j];
                 float diff = fabsf(c - c_ref);
-                
+
                 if (diff > TEST_TOLERANCE * 2.0f)
                 {
                     printf("      %s: Mismatch at [%lu,%lu]: expected %.6f, got %.6f\n",
@@ -1191,28 +1197,84 @@ static int apply_block_reflector_strided(
     // ✅ Z = Y^T * C using strided GEMM
     // Y is m×ib with stride ldy, C is m×n with stride ldc
     // We need Y^T * C = [ib×m] × [m×n] = [ib×n]
-    
+
     // Since YT is already transposed and contiguous, use it directly
-    int ret = gemm_strided(Z, YT, C, 
-                          ib, m, n,           // logical dimensions
-                          n, m, ldc,          // strides: Z is ib×n, YT is ib×m, C has stride ldc
-                          1.0f, 0.0f);
-    if (ret != 0) return ret;
+    int ret = gemm_strided(Z, YT, C,
+                           ib, m, n,  // logical dimensions
+                           n, m, ldc, // strides: Z is ib×n, YT is ib×m, C has stride ldc
+                           1.0f, 0.0f);
+    if (ret != 0)
+        return ret;
 
     // ✅ Z_temp = T * Z (both contiguous)
     ret = gemm_strided(Z_temp, T, Z,
-                      ib, ib, n,
-                      n, ib, n,              // all contiguous
-                      1.0f, 0.0f);
-    if (ret != 0) return ret;
+                       ib, ib, n,
+                       n, ib, n, // all contiguous
+                       1.0f, 0.0f);
+    if (ret != 0)
+        return ret;
 
     // ✅ C = C - Y * Z_temp using strided GEMM
     // Y is m×ib with stride ldy, Z_temp is ib×n (contiguous)
     // C is m×n with stride ldc
     ret = gemm_strided(C, Y, Z_temp,
+                       m, ib, n,
+                       ldc, ldy, n, // C has stride ldc, Y has stride ldy
+                       -1.0f, 1.0f);
+
+    return ret;
+}
+
+/**
+ * @brief Debug version with logging
+ */
+static int apply_block_reflector_strided_debug(
+    float *restrict C,
+    const float *restrict Y,
+    const float *restrict T,
+    uint16_t m, uint16_t n, uint16_t ib,
+    uint16_t ldc,
+    uint16_t ldy,
+    float *restrict Z,
+    float *restrict Z_temp,
+    float *restrict YT)
+{
+    
+    // Transpose Y: YT[ib × m]
+    for (uint16_t i = 0; i < ib; ++i)
+        for (uint16_t j = 0; j < m; ++j)
+            YT[i * m + j] = Y[j * ldy + i];
+   
+    
+    // Z = Y^T * C
+    int ret = gemm_strided(Z, YT, C, 
+                          ib, m, n,
+                          n, m, ldc,
+                          1.0f, 0.0f);
+    if (ret != 0) {
+        printf("    [DEBUG] GEMM 1 failed with ret=%d\n", ret);
+        return ret;
+    }
+    
+    // Z_temp = T * Z
+    ret = gemm_strided(Z_temp, T, Z,
+                      ib, ib, n,
+                      n, ib, n,
+                      1.0f, 0.0f);
+    if (ret != 0) {
+        printf("    [DEBUG] GEMM 2 failed with ret=%d\n", ret);
+        return ret;
+    }
+
+
+    
+    // C = C - Y * Z_temp
+    ret = gemm_strided(C, Y, Z_temp,
                       m, ib, n,
-                      ldc, ldy, n,           // C has stride ldc, Y has stride ldy
+                      ldc, ldy, n,
                       -1.0f, 1.0f);
+    
+   
     
     return ret;
 }
@@ -1233,49 +1295,58 @@ static void apply_block_reflector_reference(
     float *YT = malloc(ib * m * sizeof(float));
     float *TYT = malloc(ib * m * sizeof(float));
     float *temp = malloc(ib * n * sizeof(float));
-    
+
     // 1. Compute Y^T (ib × m)
     for (size_t i = 0; i < ib; ++i)
         for (size_t j = 0; j < m; ++j)
             YT[i * m + j] = Y[j * ldy + i];
-    
+
     // 2. Compute TY^T = T * Y^T (ib × m)
     //    ✅ FIXED: T is UPPER triangular, so k goes from i to ib
     memset(TYT, 0, ib * m * sizeof(float));
-    for (size_t i = 0; i < ib; ++i) {
-        for (size_t j = 0; j < m; ++j) {
+    for (size_t i = 0; i < ib; ++i)
+    {
+        for (size_t j = 0; j < m; ++j)
+        {
             float sum = 0.0f;
             // ✅ FIX: For upper triangular T[i,k], only k >= i are non-zero
-            for (size_t k = i; k < ib; ++k) {
+            for (size_t k = i; k < ib; ++k)
+            {
                 sum += T[i * ib + k] * YT[k * m + j];
             }
             TYT[i * m + j] = sum;
         }
     }
-    
+
     // 3. temp = TY^T * C (ib × n)
     memset(temp, 0, ib * n * sizeof(float));
-    for (size_t i = 0; i < ib; ++i) {
-        for (size_t j = 0; j < n; ++j) {
+    for (size_t i = 0; i < ib; ++i)
+    {
+        for (size_t j = 0; j < n; ++j)
+        {
             float sum = 0.0f;
-            for (size_t k = 0; k < m; ++k) {
+            for (size_t k = 0; k < m; ++k)
+            {
                 sum += TYT[i * m + k] * C[k * ldc + j];
             }
             temp[i * n + j] = sum;
         }
     }
-    
+
     // 4. C = C - Y * temp (m × n)
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t j = 0; j < n; ++j) {
+    for (size_t i = 0; i < m; ++i)
+    {
+        for (size_t j = 0; j < n; ++j)
+        {
             float sum = 0.0f;
-            for (size_t k = 0; k < ib; ++k) {
+            for (size_t k = 0; k < ib; ++k)
+            {
                 sum += Y[i * ldy + k] * temp[k * n + j];
             }
             C[i * ldc + j] -= sum;
         }
     }
-    
+
     free(YT);
     free(TYT);
     free(temp);
@@ -1287,11 +1358,12 @@ static void apply_block_reflector_reference(
 static int test_block_reflector(void)
 {
     printf("\n=== Testing Block Reflector (QR BLAS-3) ===\n");
-    
+
     int all_passed = 1;
-    
+
     // Test configuration: (m, n, ib, ldc_offset, ldy_offset)
-    struct {
+    struct
+    {
         uint16_t m, n, ib;
         uint16_t ldc_offset, ldy_offset; // Extra padding for strided access
         const char *name;
@@ -1303,117 +1375,155 @@ static int test_block_reflector(void)
         {32, 24, 8, 16, 12, "32×24 block, ib=8 (strided)"},
         {48, 48, 12, 4, 4, "48×48 block, ib=12 (small stride)"},
     };
-    
-    for (size_t tc = 0; tc < sizeof(test_cases) / sizeof(test_cases[0]); ++tc) {
+
+    for (size_t tc = 0; tc < sizeof(test_cases) / sizeof(test_cases[0]); ++tc)
+    {
         uint16_t m = test_cases[tc].m;
         uint16_t n = test_cases[tc].n;
         uint16_t ib = test_cases[tc].ib;
         uint16_t ldc = n + test_cases[tc].ldc_offset;
         uint16_t ldy = ib + test_cases[tc].ldy_offset;
-        
+
         printf("\n  Test: %s\n", test_cases[tc].name);
         printf("    m=%u, n=%u, ib=%u, ldc=%u, ldy=%u\n", m, n, ib, ldc, ldy);
-        
+
         // Allocate matrices with padding for strided access
         float *C_test = calloc(m * ldc, sizeof(float));
         float *C_ref = calloc(m * ldc, sizeof(float));
         float *Y = calloc(m * ldy, sizeof(float));
         float *T = calloc(ib * ib, sizeof(float));
-        
+
         // Workspace for strided version
-        float *Z = malloc(ib * n * sizeof(float));
-        float *Z_temp = malloc(ib * n * sizeof(float));
-        float *YT = malloc(ib * m * sizeof(float));
-        
-        if (!C_test || !C_ref || !Y || !T || !Z || !Z_temp || !YT) {
+        float *Z = calloc(ib * n, sizeof(float));      //  Zero-init
+        float *Z_temp = calloc(ib * n, sizeof(float)); //  Zero-init
+        float *YT = calloc(ib * m, sizeof(float));     //  Zero-init
+
+        if (!C_test || !C_ref || !Y || !T || !Z || !Z_temp || !YT)
+        {
             printf("    ERROR: Allocation failed\n");
             all_passed = 0;
             continue;
         }
-        
+
         //======================================================================
         // Initialize test data
         //======================================================================
-        
+
         // C: Random initial values in the m×n submatrix
         srand(42 + tc);
-        for (uint16_t i = 0; i < m; ++i) {
-            for (uint16_t j = 0; j < n; ++j) {
+        for (uint16_t i = 0; i < m; ++i)
+        {
+            for (uint16_t j = 0; j < n; ++j)
+            {
                 float val = ((rand() % 100) - 50) * 0.01f; // Range [-0.5, 0.5]
                 C_test[i * ldc + j] = val;
                 C_ref[i * ldc + j] = val;
             }
         }
-        
+
         // Y: Householder vectors (unit lower triangular structure typical in QR)
-        for (uint16_t i = 0; i < m; ++i) {
-            for (uint16_t j = 0; j < ib && j < m; ++j) {
-                if (i < j) {
+        for (uint16_t i = 0; i < m; ++i)
+        {
+            for (uint16_t j = 0; j < ib && j < m; ++j)
+            {
+                if (i < j)
+                {
                     Y[i * ldy + j] = 0.0f; // Strictly upper triangular part is zero
-                } else if (i == j) {
+                }
+                else if (i == j)
+                {
                     Y[i * ldy + j] = 1.0f; // Diagonal is 1
-                } else {
+                }
+                else
+                {
                     Y[i * ldy + j] = ((rand() % 100) - 50) * 0.005f; // Small random below diagonal
                 }
             }
         }
-        
+
         // T: Upper triangular T factor (typical in blocked Householder)
         // Initialize with small random values in upper triangle
-        for (uint16_t i = 0; i < ib; ++i) {
-            for (uint16_t j = 0; j < ib; ++j) {
-                if (j >= i) {
+        for (uint16_t i = 0; i < ib; ++i)
+        {
+            for (uint16_t j = 0; j < ib; ++j)
+            {
+                if (j >= i)
+                {
                     T[i * ib + j] = ((rand() % 100) - 50) * 0.01f;
-                    if (i == j) T[i * ib + j] -= 1.0f; // Make diagonal negative (typical for Householder)
-                } else {
+                    if (i == j)
+                        T[i * ib + j] -= 1.0f; // Make diagonal negative (typical for Householder)
+                }
+                else
+                {
                     T[i * ib + j] = 0.0f; // Lower triangle is zero
                 }
             }
         }
-        
+
         //======================================================================
         // Apply reflectors
         //======================================================================
-        
+        int ret = 0;
         // Test version (using gemm_strided)
-        int ret = apply_block_reflector_strided(
-            C_test, Y, T, m, n, ib, ldc, ldy,
-            Z, Z_temp, YT);
-        
-        if (ret != 0) {
+        if (m == 16 && n == 16 && ib == 4)
+        {
+            ret = apply_block_reflector_strided_debug(
+                C_test, Y, T, m, n, ib, ldc, ldy,
+                Z, Z_temp, YT);
+        }
+        else
+        {
+            ret = apply_block_reflector_strided(
+                C_test, Y, T, m, n, ib, ldc, ldy,
+                Z, Z_temp, YT);
+        }
+
+        if (ret != 0)
+        {
             printf("    ERROR: apply_block_reflector_strided returned %d\n", ret);
             all_passed = 0;
-            free(C_test); free(C_ref); free(Y); free(T);
-            free(Z); free(Z_temp); free(YT);
+            free(C_test);
+            free(C_ref);
+            free(Y);
+            free(T);
+            free(Z);
+            free(Z_temp);
+            free(YT);
             continue;
         }
-        
+
         // Reference version (naive implementation)
         apply_block_reflector_reference(C_ref, Y, T, m, n, ib, ldc, ldy);
-        
+
         //======================================================================
         // Compare results
         //======================================================================
-        
+
         int errors = 0;
         float max_error = 0.0f;
         float max_rel_error = 0.0f;
-        
-        for (uint16_t i = 0; i < m; ++i) {
-            for (uint16_t j = 0; j < n; ++j) {
+
+        for (uint16_t i = 0; i < m; ++i)
+        {
+            for (uint16_t j = 0; j < n; ++j)
+            {
                 float test_val = C_test[i * ldc + j];
                 float ref_val = C_ref[i * ldc + j];
                 float abs_err = fabsf(test_val - ref_val);
                 float rel_err = fabsf(ref_val) > 1e-6f ? abs_err / fabsf(ref_val) : abs_err;
-                
-                if (abs_err > max_error) max_error = abs_err;
-                if (rel_err > max_rel_error) max_rel_error = rel_err;
-                
+
+                if (abs_err > max_error)
+                    max_error = abs_err;
+                if (rel_err > max_rel_error)
+                    max_rel_error = rel_err;
+
                 // Tolerance scaled by problem size (accumulated FP errors)
                 float tol = 1e-4f * sqrtf(m * ib); // Scales with sqrt(operations)
-                
-                if (abs_err > tol && rel_err > 1e-4f) {
-                    if (errors < 5) { // Print first 5 errors
+
+                if (abs_err > tol && rel_err > 1e-4f)
+                {
+                    if (errors < 5)
+                    { // Print first 5 errors
                         printf("    ERROR at [%u,%u]: test=%.6f, ref=%.6f, diff=%.6e\n",
                                i, j, test_val, ref_val, abs_err);
                     }
@@ -1421,16 +1531,19 @@ static int test_block_reflector(void)
                 }
             }
         }
-        
-        if (errors > 0) {
+
+        if (errors > 0)
+        {
             printf("    FAILED: %d errors, max_abs_err=%.6e, max_rel_err=%.6e\n",
                    errors, max_error, max_rel_error);
             all_passed = 0;
-        } else {
+        }
+        else
+        {
             printf("    PASSED: max_abs_err=%.6e, max_rel_err=%.6e\n",
                    max_error, max_rel_error);
         }
-        
+
         free(C_test);
         free(C_ref);
         free(Y);
@@ -1439,7 +1552,7 @@ static int test_block_reflector(void)
         free(Z_temp);
         free(YT);
     }
-    
+
     return all_passed;
 }
 
@@ -1449,19 +1562,16 @@ static int test_block_reflector(void)
 static int test_strided_gemm_suite(void)
 {
     printf("\n=== Strided GEMM Test Suite ===\n");
-    
+
     int all_passed = 1;
-    
+
     all_passed &= test_strided_basic();
     all_passed &= test_strided_alpha_beta();
     all_passed &= test_strided_submatrix_qr();
     all_passed &= test_strided_extreme_cases();
-    
+
     return all_passed;
 }
-
-
-
 
 //==============================================================================
 // MAIN TEST RUNNER
@@ -1483,10 +1593,9 @@ int run_gemm_execute_tests(test_results_t *results)
     RUN_TEST(results, test_matrix_sizes);
     RUN_TEST(results, test_memory_modes);
     RUN_TEST(results, test_edge_cases);
-   // RUN_TEST(results, test_precomputed_metadata);
-    RUN_TEST(results, test_strided_gemm_suite);  
-    RUN_TEST(results, test_block_reflector); 
-
+    // RUN_TEST(results, test_precomputed_metadata);
+    RUN_TEST(results, test_strided_gemm_suite);
+    RUN_TEST(results, test_block_reflector);
 
     print_test_results("GEMM Execution Pipeline", results);
 

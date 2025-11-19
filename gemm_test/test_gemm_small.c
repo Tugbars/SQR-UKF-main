@@ -28,13 +28,12 @@
 
 // Portable size_t format for old MinGW
 #ifdef _WIN32
-    #define SIZE_FMT "%llu"
-    #define SIZE_CAST(x) ((unsigned long long)(x))
+#define SIZE_FMT "%llu"
+#define SIZE_CAST(x) ((unsigned long long)(x))
 #else
-    #define SIZE_FMT "%zu"
-    #define SIZE_CAST(x) (x)
+#define SIZE_FMT "%zu"
+#define SIZE_CAST(x) (x)
 #endif
-
 
 //==============================================================================
 // REFERENCE IMPLEMENTATION - Naive Triple Loop
@@ -48,9 +47,9 @@
  * This is the gold standard - optimized kernels must match this.
  */
 static void gemm_naive(
-    float * restrict C,
-    const float * restrict A,
-    const float * restrict B,
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
     size_t M, size_t K, size_t N,
     size_t ldc,
     float alpha, float beta)
@@ -106,7 +105,7 @@ static int matrices_equal(
     float rel_tol)
 {
     int all_match = 1;
-    
+
     for (size_t i = 0; i < M; i++)
     {
         for (size_t j = 0; j < N; j++)
@@ -129,7 +128,7 @@ static int matrices_equal(
                 // Use relative tolerance
                 float max_val = fmaxf(fabsf(a), fabsf(b));
                 float rel_err = diff / max_val;
-                
+
                 if (rel_err > rel_tol)
                 {
                     all_match = 0;
@@ -137,7 +136,7 @@ static int matrices_equal(
             }
         }
     }
-    
+
     return all_match;
 }
 
@@ -256,7 +255,7 @@ static int test_4x4_zeros(void)
 
     matrix_set_zeros(A, 4, 4, 4);
     matrix_set_zeros(B, 4, 4, 4);
-    matrix_set_value(C, 4, 4, 4, 999.0f);      // Junk data
+    matrix_set_value(C, 4, 4, 4, 999.0f); // Junk data
     matrix_set_value(C_ref, 4, 4, 4, 999.0f);
 
     gemm_4x4_inline(C, A, B, 1.0f, 0.0f);
@@ -313,7 +312,7 @@ static int test_4x4_alpha_beta_exhaustive(void)
     for (size_t i = 0; i < n_alpha_beta_cases; i++)
     {
         float C[16], C_ref[16];
-        matrix_set_value(C, 4, 4, 4, 2.0f);     // Non-zero initial value
+        matrix_set_value(C, 4, 4, 4, 2.0f); // Non-zero initial value
         matrix_set_value(C_ref, 4, 4, 4, 2.0f);
 
         float alpha = alpha_beta_cases[i].alpha;
@@ -382,7 +381,7 @@ static int test_6x6_ldc_noncontiguous(void)
 
     matrix_set_sequential(A, 6, 6, 6);
     matrix_set_sequential(B, 6, 6, 6);
-    matrix_set_zeros(C, 6, 8, 8);     // ldc=8
+    matrix_set_zeros(C, 6, 8, 8); // ldc=8
     matrix_set_zeros(C_ref, 6, 8, 8);
 
     gemm_6x6_inline(C, A, B, 8, 1.0f, 0.0f);
@@ -532,7 +531,7 @@ static int test_dispatcher_rejects_4x4_noncontiguous(void)
 {
     printf("  Testing: Dispatcher rejects 4×4 with ldc=8\n");
 
-    float A[16] = {0}, B[16] = {0}, C[64] = {0};  // ✅ Zero-initialize
+    float A[16] = {0}, B[16] = {0}, C[64] = {0}; // ✅ Zero-initialize
 
     int result = gemm_small_dispatch(C, A, B, 4, 4, 4, 8, 1.0f, 0.0f);
 
@@ -591,12 +590,11 @@ static int test_dispatcher_routes_8x8(void)
     return matrices_equal(C, C_ref, 8, 8, 8, 1e-5f);
 }
 
-
 static int test_dispatcher_rejects_large(void)
 {
     printf("  Testing: Dispatcher rejects 9×9\n");
 
-    float A[81] = {0}, B[81] = {0}, C[81] = {0};  // ✅ Zero-initialize
+    float A[81] = {0}, B[81] = {0}, C[81] = {0}; // ✅ Zero-initialize
 
     int result = gemm_small_dispatch(C, A, B, 9, 9, 9, 9, 1.0f, 0.0f);
 
@@ -614,7 +612,7 @@ static int test_dispatcher_rejects_high_ops(void)
 {
     printf("  Testing: Dispatcher rejects 4×4×100 (too many ops)\n");
 
-    float A[400] = {0}, B[400] = {0}, C[16] = {0};  // ✅ Zero-initialize
+    float A[400] = {0}, B[400] = {0}, C[16] = {0}; // ✅ Zero-initialize
 
     int result = gemm_small_dispatch(C, A, B, 4, 100, 4, 4, 1.0f, 0.0f);
 
@@ -636,7 +634,7 @@ static int test_8x6_basic(void)
 {
     printf("  Testing: 8×6 basic correctness\n");
 
-    float A[8*8], B[8*6], C[8*6], C_ref[8*6];
+    float A[8 * 8], B[8 * 6], C[8 * 6], C_ref[8 * 6];
 
     matrix_set_sequential(A, 8, 8, 8);
     matrix_set_sequential(B, 8, 6, 6);
@@ -653,7 +651,7 @@ static int test_8x6_alpha_beta(void)
 {
     printf("  Testing: 8×6 alpha/beta combinations\n");
 
-    float A[8*8], B[8*6];
+    float A[8 * 8], B[8 * 6];
     matrix_set_sequential(A, 8, 8, 8);
     matrix_set_sequential(B, 8, 6, 6);
 
@@ -661,7 +659,7 @@ static int test_8x6_alpha_beta(void)
 
     for (size_t i = 0; i < n_alpha_beta_cases; i++)
     {
-        float C[8*6], C_ref[8*6];
+        float C[8 * 6], C_ref[8 * 6];
         matrix_set_value(C, 8, 6, 6, 2.0f);
         matrix_set_value(C_ref, 8, 6, 6, 2.0f);
 
@@ -689,7 +687,7 @@ static int test_8x6_arbitrary_K(void)
 {
     printf("  Testing: 8×6 with K=10\n");
 
-    float A[8*10], B[10*6], C[8*6], C_ref[8*6];
+    float A[8 * 10], B[10 * 6], C[8 * 6], C_ref[8 * 6];
 
     matrix_set_sequential(A, 8, 10, 10);
     matrix_set_sequential(B, 10, 6, 6);
@@ -710,7 +708,7 @@ static int test_6x8_basic(void)
 {
     printf("  Testing: 6×8 basic correctness\n");
 
-    float A[6*8], B[8*8], C[6*8], C_ref[6*8];
+    float A[6 * 8], B[8 * 8], C[6 * 8], C_ref[6 * 8];
 
     matrix_set_sequential(A, 6, 8, 8);
     matrix_set_sequential(B, 8, 8, 8);
@@ -727,7 +725,7 @@ static int test_6x8_alpha_beta(void)
 {
     printf("  Testing: 6×8 alpha/beta combinations\n");
 
-    float A[6*8], B[8*8];
+    float A[6 * 8], B[8 * 8];
     matrix_set_sequential(A, 6, 8, 8);
     matrix_set_sequential(B, 8, 8, 8);
 
@@ -735,7 +733,7 @@ static int test_6x8_alpha_beta(void)
 
     for (size_t i = 0; i < n_alpha_beta_cases; i++)
     {
-        float C[6*8], C_ref[6*8];
+        float C[6 * 8], C_ref[6 * 8];
         matrix_set_value(C, 6, 8, 8, 2.0f);
         matrix_set_value(C_ref, 6, 8, 8, 2.0f);
 
@@ -767,14 +765,14 @@ static int test_8x4_identity(void)
 {
     printf("  Testing: 8×4 with identity-like data\n");
 
-    float A[8*8], B[8*4], C[8*4], C_ref[8*4];
+    float A[8 * 8], B[8 * 4], C[8 * 4], C_ref[8 * 4];
 
     // A = I (8×8 identity, but we only use first 8 columns for 8×K)
     matrix_set_identity(A, 8, 8);
-    
+
     // B = Sequential (8×4)
     matrix_set_sequential(B, 8, 4, 4);
-    
+
     // C = zeros
     matrix_set_zeros(C, 8, 4, 4);
     matrix_set_zeros(C_ref, 8, 4, 4);
@@ -790,7 +788,7 @@ static int test_8x4_alpha_beta_cases(void)
 {
     printf("  Testing: 8×4 alpha/beta combinations\n");
 
-    float A[8*8], B[8*4];
+    float A[8 * 8], B[8 * 4];
     matrix_set_sequential(A, 8, 8, 8);
     matrix_set_sequential(B, 8, 4, 4);
 
@@ -798,7 +796,7 @@ static int test_8x4_alpha_beta_cases(void)
 
     for (size_t i = 0; i < n_alpha_beta_cases; i++)
     {
-        float C[8*4], C_ref[8*4];
+        float C[8 * 4], C_ref[8 * 4];
         matrix_set_value(C, 8, 4, 4, 2.0f);
         matrix_set_value(C_ref, 8, 4, 4, 2.0f);
 
@@ -822,12 +820,11 @@ static int test_8x4_alpha_beta_cases(void)
     return all_passed;
 }
 
-
 static int test_8x4_arbitrary_K(void)
 {
     printf("  Testing: 8×4 with K=12 (arbitrary inner dimension)\n");
 
-    float A[8*12], B[12*4], C[8*4], C_ref[8*4];
+    float A[8 * 12], B[12 * 4], C[8 * 4], C_ref[8 * 4];
 
     matrix_set_sequential(A, 8, 12, 12);
     matrix_set_sequential(B, 12, 4, 4);
@@ -848,7 +845,7 @@ static int test_4x8_basic(void)
 {
     printf("  Testing: 4×8 basic correctness\n");
 
-    float A[4*8], B[8*8], C[4*8], C_ref[4*8];
+    float A[4 * 8], B[8 * 8], C[4 * 8], C_ref[4 * 8];
 
     matrix_set_sequential(A, 4, 8, 8);
     matrix_set_sequential(B, 8, 8, 8);
@@ -935,13 +932,16 @@ int main(void)
 {
     test_results_t results;
     int ret = run_gemm_small_tests(&results);
-    
-    if (ret == 0) {
+
+    if (ret == 0)
+    {
         printf("\n🎉 " TEST_PASS " All tests passed!\n\n");
-    } else {
+    }
+    else
+    {
         printf("\n❌ " TEST_FAIL " %d test(s) failed\n\n", results.failed);
     }
-    
+
     return ret;
 }
 #endif

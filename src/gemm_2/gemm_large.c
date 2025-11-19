@@ -1261,11 +1261,10 @@ static int gemm_execute_internal(
 
                         if (mh == plan->MR && jw == plan->NR)
                         {
-                            // ✅ Fast path: Full tile (~95% of tiles)
-                            // Use pre-selected kernels from planning phase
+                            //  Fast path: Use pre-selected kernels
                             kern_add = plan->kern_full_add;
                             kern_store = plan->kern_full_store;
-                            kernel_width = (int)plan->NR;
+                            kernel_width = plan->kern_full_width; 
                         }
                         else
                         {

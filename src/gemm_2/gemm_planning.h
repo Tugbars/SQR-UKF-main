@@ -381,6 +381,8 @@ typedef struct gemm_plan {
      *  For subsequent K-tiles, we always use ADD mode to accumulate results.
      */
     gemm_kernel_id_t kern_full_store;
+
+    int kern_full_width;  //  Native width of selected kernel
     
     //==========================================================================
     // MEMORY MODE (Static vs Dynamic Allocation)

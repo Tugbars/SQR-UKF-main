@@ -373,13 +373,13 @@ static int test_kernel_4x8(void)
 
     // Correct argument order for 4x8
     gemm_4x8_panel_avx2fma_store(
-    C_test, ldc,
-    Ap, 8,
-    Bp, 16,
-    K,
-    4,     // m_block (number of rows to actually write)
-    8,     // jb (width)
-    mask);
+        C_test, ldc,
+        Ap, 8,
+        Bp, 16,
+        K,
+        4, // m_block (number of rows to actually write)
+        8, // jb (width)
+        mask);
 
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 0);
 
@@ -393,13 +393,13 @@ static int test_kernel_4x8(void)
     }
 
     gemm_4x8_panel_avx2fma_add(
-    C_test, ldc,
-    Ap, 8,
-    Bp, 16,
-    K,
-    4,     // m_block (number of rows to actually write)
-    8,     // jb (width)
-    mask);
+        C_test, ldc,
+        Ap, 8,
+        Bp, 16,
+        K,
+        4, // m_block (number of rows to actually write)
+        8, // jb (width)
+        mask);
     ref_gemm_simple(C_ref, ldc, A, K, B, N, M, K, N, 1);
 
     passed &= compare_matrices_verbose(C_test, C_ref, M, N, ldc, 1e-5f, "4x8 ADD");
@@ -970,10 +970,10 @@ static int test_kernel_combination(void)
 
     // Pack first 8 rows of A
     pack_A_for_test(Ap8, A, 8, K, 8);
-    
+
     // Pack last 4 rows of A (starting at row 8)
     pack_A_for_test(Ap4, A + 8 * K, 4, K, 8);
-    
+
     pack_B_for_test(Bp, B, K, N);
 
     __m256i mask = _mm256_set1_epi32(-1);
@@ -982,12 +982,12 @@ static int test_kernel_combination(void)
     // ✅ FIX 1: Call 8×8 kernel for first 8 rows
     //==========================================================================
     gemm_8x8_panel_avx2fma_store(
-        C_test,      // ← Start at row 0
+        C_test, // ← Start at row 0
         ldc,
-        Ap8, 8,      // ← Packed first 8 rows
+        Ap8, 8, // ← Packed first 8 rows
         Bp, 16,
         K,
-        8, 8,        // m=8, n=8
+        8, 8, // m=8, n=8
         mask);
 
     //==========================================================================
@@ -996,10 +996,10 @@ static int test_kernel_combination(void)
     gemm_4x8_panel_avx2fma_store(
         C_test + 8 * ldc, // ← Start at row 8
         ldc,
-        Ap4, 8,           // ← Packed last 4 rows
+        Ap4, 8, // ← Packed last 4 rows
         Bp, 16,
         K,
-        4, 8,             // m=4, n=8
+        4, 8, // m=4, n=8
         mask);
 
     // Reference computation
@@ -1159,4 +1159,3 @@ int main(void)
     return run_gemm_kernel_tests(&results);
 }
 #endif
-
