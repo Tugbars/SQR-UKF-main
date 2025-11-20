@@ -341,6 +341,10 @@ typedef struct
     uint16_t num_blocks; ///< Number of blocks = ⌈min(m,n) / ib⌉
                          ///< - Total reflector storage panels
                          ///< - Example: 256×128 with ib=32 → num_blocks = 4
+
+    bool use_recursive;      ///< Enable recursive panel factorization
+    uint16_t rec_threshold;  ///< Base case for recursion
+    bool use_gemm_trailing;  ///< Use GEMM for trailing (future)
     
     size_t Y_block_stride; ///< Stride between Y blocks (in floats)
                            ///< - Y_block_stride = m_max × ib
