@@ -58,6 +58,7 @@ typedef struct cholupdate_workspace_s
 // WORKSPACE API
 //==============================================================================
 
+
 cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
 {
     if (n_max == 0)
@@ -88,20 +89,15 @@ cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
         if ((size_t)n_max + k_max > UINT16_MAX)
             goto cleanup_fail;
 
-        const size_t m_rows = (size_t)n_max + k_max;  // QR rows: n+k
+        const size_t m_rows = (size_t)n_max + k_max;
         const uint16_t qr_m = (uint16_t)m_rows;
-        const uint16_t qr_n = n_max;                   // QR cols: n
+        const uint16_t qr_n = n_max;
 
-        ALLOC_BUF(M, m_rows * n_max);     // (n+k)×n
-          ALLOC_BUF(R, m_rows * n_max);              // ✅ FIX: (n+k)×n, not n×n
+        ALLOC_BUF(M, m_rows * n_max);
+        ALLOC_BUF(R, m_rows * n_max);  // (n+k)×n, NOT n×n
         ALLOC_BUF(Utmp, (size_t)n_max * n_max);
 
-        ws->qr_ws = qr_workspace_alloc_ex(
-            qr_m,    // m_max = n+k rows
-            qr_n,    // n_max = n cols
-            0,       // auto block size
-            false    // don't store reflectors
-        );
+        ws->qr_ws = qr_workspace_alloc_ex(qr_m, qr_n, 0, false);
 
         if (!ws->qr_ws)
             goto cleanup_fail;
@@ -154,7 +150,7 @@ static int cholupdate_rank1_update(float *restrict L,
                                    uint16_t n,
                                    bool is_upper)
 {
-#if LINALG_SIMD_ENABLE
+#if __AVX2__
     const int use_avx = n >= (uint32_t)CHOLK_AVX_MIN_N;
 #else
     const int use_avx = 0;
@@ -172,7 +168,6 @@ static int cholupdate_rank1_update(float *restrict L,
         const float Ljj = L[dj];
         const float xj = x[j];
 
-        // ✅ FIX: Correct Givens rotation for rank-1 update
         const double Ljj_sq = (double)Ljj * Ljj;
         const double xj_sq = (double)xj * xj;
         const double r_sq = Ljj_sq + xj_sq;
@@ -181,8 +176,8 @@ static int cholupdate_rank1_update(float *restrict L,
             return -EDOM;
 
         const float r = (float)sqrt(r_sq);
-        const float c = Ljj / r;      // ✅ FIX: Was r/Ljj
-        const float s = xj / r;       // ✅ FIX: Was xj/Ljj
+        const float c = Ljj / r;
+        const float s = xj / r;
 
         L[dj] = r;
 
@@ -197,15 +192,13 @@ static int cholupdate_rank1_update(float *restrict L,
                                             : (size_t)k * n + j;
                 const float Lkj = L[off];
                 const float xk = x[k];
-                
-                // ✅ FIX: Use c and s, not 1/c
                 L[off] = c * Lkj + s * xk;
                 x[k] = c * xk - s * Lkj;
             }
             continue;
         }
 
-#if LINALG_SIMD_ENABLE
+#if __AVX2__
         uint32_t k = j + 1;
 
 #if CHOLK_USE_ALIGNED_SIMD
@@ -252,7 +245,6 @@ static int cholupdate_rank1_update(float *restrict L,
 
             __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
 
-            // ✅ FIX: L = c*L + s*x, x_new = c*x - s*L_old
             __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
             __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
 
@@ -286,6 +278,7 @@ static int cholupdate_rank1_update(float *restrict L,
     return 0;
 }
 
+
 //==============================================================================
 // RANK-1 DOWNDATE (Hyperbolic rotation)
 //==============================================================================
@@ -295,7 +288,7 @@ static int cholupdate_rank1_downdate(float *restrict L,
                                      uint16_t n,
                                      bool is_upper)
 {
-#if LINALG_SIMD_ENABLE
+#if __AVX2__
     const int use_avx = n >= (uint32_t)CHOLK_AVX_MIN_N;
 #else
     const int use_avx = 0;
@@ -340,7 +333,7 @@ static int cholupdate_rank1_downdate(float *restrict L,
             continue;
         }
 
-#if LINALG_SIMD_ENABLE
+#if __AVX2__
         uint32_t k = j + 1;
 
 #if CHOLK_USE_ALIGNED_SIMD
@@ -431,12 +424,14 @@ static int cholupdatek_tiled_ws(cholupdate_workspace *ws,
                                 uint16_t n, uint16_t k,
                                 bool is_upper, int add)
 {
-    if (!ws || !L || !X)
+    if (!ws || !L)
         return -EINVAL;
     if (n == 0)
         return -EINVAL;
     if (k == 0)
         return 0;
+    if (!X)
+        return -EINVAL;
     if (add != +1 && add != -1)
         return -EINVAL;
     if (n > ws->n_max || k > ws->k_max)
@@ -489,20 +484,51 @@ static void copy_upper_nxn(float *restrict dst,
     }
 }
 
+//==============================================================================
+// FIX 1: Sign correction after QR extraction
+//==============================================================================
+
+static void copy_upper_nxn_with_positive_diag(float *restrict dst,
+                                               const float *restrict src,
+                                               uint16_t n, uint16_t ld_src)
+{
+    for (uint16_t i = 0; i < n; ++i)
+    {
+        const float *row = src + (size_t)i * ld_src;
+        float *dst_row = dst + (size_t)i * n;
+
+        // Zero below diagonal
+        for (uint16_t j = 0; j < i; ++j)
+            dst_row[j] = 0.0f;
+
+        // Copy upper triangle
+        memcpy(dst_row + i, row + i, (size_t)(n - i) * sizeof(float));
+
+        // ✅ FIX: Enforce positive diagonal by negating row if needed
+        if (dst_row[i] < 0.0f)
+        {
+            for (uint16_t j = i; j < n; ++j)
+                dst_row[j] = -dst_row[j];
+        }
+    }
+}
+
 int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
                            float *restrict L_or_U,
                            const float *restrict X,
                            uint16_t n, uint16_t k,
                            bool is_upper, int add)
 {
-    if (!ws || !L_or_U || !X)
+    if (!ws || !L_or_U)
         return -EINVAL;
     if (n == 0)
         return -EINVAL;
     if (k == 0)
         return 0;
+    if (!X)
+        return -EINVAL;
     if (add != +1)
-        return -EINVAL;  // QR can only do updates
+        return -EINVAL;
     if (n > ws->n_max || k > ws->k_max)
         return -EOVERFLOW;
     if (!ws->qr_ws)
@@ -520,10 +546,6 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
     float *R = ws->R;
     float *Utmp = ws->Utmp;
 
-    // Build M = [U; X^T] ∈ R^((n+k)×n) - VERTICAL stacking
-    // M[0:n, :] = U
-    // M[n:n+k, :] = X^T
-
     if (is_upper)
     {
         for (uint16_t i = 0; i < n; ++i)
@@ -539,7 +561,6 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
     }
     else
     {
-        // Extract U = L^T from lower triangular L
         for (uint16_t i = 0; i < n; ++i)
         {
             float *dst = M + (size_t)i * n;
@@ -554,7 +575,6 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
         }
     }
 
-    // Copy X^T into rows [n : n+k]
     for (uint16_t i = 0; i < k; ++i)
     {
         float *dst = M + (size_t)(n + i) * n;
@@ -564,19 +584,17 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
             dst[j] = src[(size_t)j * k];
     }
 
-    // QR: M = QR, where M is (n+k)×n
     int rc = qr_ws_blocked_inplace(ws->qr_ws, M, NULL, R, m_rows, n, true);
     if (rc)
         return rc;
 
-    // Extract R (n×n) as new Cholesky factor
     if (is_upper)
     {
-        copy_upper_nxn(L_or_U, R, n, n);
+        copy_upper_nxn_with_positive_diag(L_or_U, R, n, n);
     }
     else
     {
-        copy_upper_nxn(Utmp, R, n, n);
+        copy_upper_nxn_with_positive_diag(Utmp, R, n, n);
 
         for (uint16_t i = 0; i < n; ++i)
         {
@@ -640,12 +658,14 @@ int cholupdatek_auto_ws(cholupdate_workspace *ws,
                         uint16_t n, uint16_t k,
                         bool is_upper, int add)
 {
-    if (!ws || !L_or_U || !X)
+    if (!ws || !L_or_U)
         return -EINVAL;
     if (n == 0)
         return -EINVAL;
     if (k == 0)
         return 0;
+    if (!X)
+        return -EINVAL;
     if (add != +1 && add != -1)
         return -EINVAL;
 
@@ -656,6 +676,7 @@ int cholupdatek_auto_ws(cholupdate_workspace *ws,
     else
         return cholupdatek_tiled_ws(ws, L_or_U, X, n, k, is_upper, add);
 }
+
 
 //==============================================================================
 // EXPLICIT PATH SELECTION

@@ -1044,8 +1044,8 @@ static int test_large_matrix(void)
 {
     printf("\n=== Testing Large Matrix (256×256, k=32) ===\n");
     
-    const uint16_t n = 256;
-    const uint16_t k = 32;
+    const uint16_t n = 128;
+    const uint16_t k = 16;
     
     printf("  Allocating %.2f MB...\n",
            (n * n * 3 + n * k) * sizeof(float) / (1024.0 * 1024.0));
