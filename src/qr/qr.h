@@ -352,6 +352,8 @@ typedef struct
                            ///< - Constant across all blocks
                            ///< - Block k offset: k * T_block_stride
 
+    float *C_temp;  // Temporary buffer for trailing matrix updates
+
     //==========================================================================
     // STATISTICS
     //==========================================================================

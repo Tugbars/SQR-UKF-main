@@ -529,7 +529,7 @@ static void panel_factor_recursive(
     build_T_matrix(Y_left, tau, T_workspace, m, ib1, ib1);
 
     // Apply block reflector to right columns
-    float *right_cols = &panel[ib1];  // Start at column ib1, row 0
+    float *right_cols = &panel[0 * lda + ib1];  // Start at column ib1, row 0
 
     // Copy right columns to contiguous buffer
     float *C_contig = Z_workspace;
@@ -1029,7 +1029,9 @@ qr_workspace *qr_workspace_alloc_ex(uint16_t m_max, uint16_t n_max,
     ws->panel_T_temp = (float *)gemm_aligned_alloc(32,
                                                    ws->ib * ws->ib * sizeof(float));
 
-    size_t panel_z_size = m_max * (ws->ib / 2) + 2 * (ws->ib / 2) * (ws->ib / 2);
+    uint16_t half_up = (ws->ib + 1) / 2;   // ceil(ib/2)
+    size_t panel_z_size =
+    (size_t)m_max * half_up + 2u * (size_t)half_up * half_up;
     ws->panel_Z_temp = (float *)gemm_aligned_alloc(32, panel_z_size * sizeof(float));
 
     ws->C_temp = (float *)gemm_aligned_alloc(32, (size_t)m_max * n_max * sizeof(float));
