@@ -145,6 +145,8 @@ inline void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT dst,
 #endif
 }
 
+
+
 static inline void transpose_scalar_block(const float *RESTRICT src, float *RESTRICT dst,
                                           size_t R, size_t C, size_t i, size_t j,
                                           size_t rb, size_t cb)

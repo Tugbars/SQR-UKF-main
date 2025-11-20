@@ -281,6 +281,7 @@ void transpose_upper_to_lower_blocked(const float *restrict U,
                                       float *restrict L,
                                       uint16_t n);
 
+
 #ifdef __cplusplus
 }
 #endif

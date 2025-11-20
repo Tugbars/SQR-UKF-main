@@ -37,6 +37,51 @@
 #define CHOLK_MM256_STORE_PS(ptr, val) _mm256_storeu_ps(ptr, val)
 #endif
 
+#if __AVX2__
+/**
+ * @brief 8x8 matrix transpose in AVX2 registers
+ * 
+ * Input:  8 rows (r0-r7), each containing 8 floats
+ * Output: 8 rows (r0-r7), transposed (rows become columns)
+ */
+static inline void transpose8x8_ps(__m256 *r0, __m256 *r1, __m256 *r2, __m256 *r3,
+                                   __m256 *r4, __m256 *r5, __m256 *r6, __m256 *r7)
+{
+    __m256 t0, t1, t2, t3, t4, t5, t6, t7;
+    __m256 tt0, tt1, tt2, tt3, tt4, tt5, tt6, tt7;
+
+    // Step 1: Interleave 32-bit elements
+    t0 = _mm256_unpacklo_ps(*r0, *r1);
+    t1 = _mm256_unpackhi_ps(*r0, *r1);
+    t2 = _mm256_unpacklo_ps(*r2, *r3);
+    t3 = _mm256_unpackhi_ps(*r2, *r3);
+    t4 = _mm256_unpacklo_ps(*r4, *r5);
+    t5 = _mm256_unpackhi_ps(*r4, *r5);
+    t6 = _mm256_unpacklo_ps(*r6, *r7);
+    t7 = _mm256_unpackhi_ps(*r6, *r7);
+
+    // Step 2: Interleave 64-bit elements
+    tt0 = _mm256_shuffle_ps(t0, t2, 0x44);
+    tt1 = _mm256_shuffle_ps(t0, t2, 0xEE);
+    tt2 = _mm256_shuffle_ps(t1, t3, 0x44);
+    tt3 = _mm256_shuffle_ps(t1, t3, 0xEE);
+    tt4 = _mm256_shuffle_ps(t4, t6, 0x44);
+    tt5 = _mm256_shuffle_ps(t4, t6, 0xEE);
+    tt6 = _mm256_shuffle_ps(t5, t7, 0x44);
+    tt7 = _mm256_shuffle_ps(t5, t7, 0xEE);
+
+    // Step 3: Interleave 128-bit lanes
+    *r0 = _mm256_permute2f128_ps(tt0, tt4, 0x20);
+    *r1 = _mm256_permute2f128_ps(tt1, tt5, 0x20);
+    *r2 = _mm256_permute2f128_ps(tt2, tt6, 0x20);
+    *r3 = _mm256_permute2f128_ps(tt3, tt7, 0x20);
+    *r4 = _mm256_permute2f128_ps(tt0, tt4, 0x31);
+    *r5 = _mm256_permute2f128_ps(tt1, tt5, 0x31);
+    *r6 = _mm256_permute2f128_ps(tt2, tt6, 0x31);
+    *r7 = _mm256_permute2f128_ps(tt3, tt7, 0x31);
+}
+#endif
+
 //==============================================================================
 // WORKSPACE STRUCTURE
 //==============================================================================
@@ -47,6 +92,7 @@ typedef struct cholupdate_workspace_s
     uint16_t k_max;
 
     float *xbuf;  // n_max
+    float *Xc;    // ✅ NEW: n_max × k_max, column-major copy of X
     float *M;     // (n+k)×n for QR path (vertical stacking)
     float *R;     // n×n for QR result
     float *Utmp;  // n×n for transpose operations
@@ -85,6 +131,13 @@ cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
 
     ALLOC_BUF(xbuf, n_max);
 
+    // Allocate column-major workspace for X
+    if (k_max > 0)
+    {
+        ALLOC_BUF(Xc, (size_t)n_max * k_max);
+    }
+
+
     if (k_max > 0)
     {
         if ((size_t)n_max + k_max > UINT16_MAX)
@@ -112,6 +165,7 @@ cholupdate_workspace *cholupdate_workspace_alloc(uint16_t n_max, uint16_t k_max)
 
 cleanup_fail:
     if (ws->xbuf) gemm_aligned_free(ws->xbuf);
+    if (ws->Xc) gemm_aligned_free(ws->Xc);  //  NEW
     if (ws->M) gemm_aligned_free(ws->M);
     if (ws->R) gemm_aligned_free(ws->R);
     if (ws->Utmp) gemm_aligned_free(ws->Utmp);
@@ -126,6 +180,7 @@ void cholupdate_workspace_free(cholupdate_workspace *ws)
         return;
 
     gemm_aligned_free(ws->xbuf);
+    gemm_aligned_free(ws->Xc);  // ✅ NEW
     gemm_aligned_free(ws->M);
     gemm_aligned_free(ws->R);
     gemm_aligned_free(ws->Utmp);
@@ -148,33 +203,6 @@ static int cholupdate_rank1_update(float *restrict L,
                                    uint16_t n,
                                    bool is_upper)
 {
-    // ✅ OPTIMIZATION: Convert lower → upper for better SIMD (n ≥ 64)
-    if (!is_upper && n >= 64)
-    {
-        float *U_tmp = (float*)gemm_aligned_alloc(32, (size_t)n * n * sizeof(float));
-        if (U_tmp)
-        {
-            // Transpose L → U (cache-blocked)
-            transpose_lower_to_upper_blocked(L, U_tmp, n);
-            
-            // Run update on upper triangular (fast contiguous access)
-            int ret = cholupdate_rank1_update(U_tmp, x, n, true);
-            
-            if (ret == 0)
-            {
-                // Transpose back U → L
-                transpose_upper_to_lower_blocked(U_tmp, L, n);
-            }
-            
-            gemm_aligned_free(U_tmp);
-            return ret;
-        }
-        // Fall through to original code if allocation fails
-    }
-    
-    //==========================================================================
-    // ORIGINAL RANK-1 UPDATE CODE
-    //==========================================================================
     
 #if __AVX2__
     const int use_avx = n >= (uint32_t)CHOLK_AVX_MIN_N;
@@ -243,45 +271,90 @@ static int cholupdate_rank1_update(float *restrict L,
         const __m256 c_v = _mm256_set1_ps(c);
         const __m256 s_v = _mm256_set1_ps(s);
 
-        for (; k + 7 < n; k += 8)
+        // ✅ OPTIMIZED: Different strategies for upper vs lower triangular
+        if (is_upper)
         {
-            float *baseL = is_upper ? &L[(size_t)j * n + k]
-                                    : &L[(size_t)k * n + j];
-            __m256 Lkj;
-
-            if (is_upper)
+            for (; k + 7 < n; k += 8)
             {
-                Lkj = _mm256_loadu_ps(baseL);
-            }
-            else
-            {
-                int idx[8];
-                for (int t = 0; t < 8; ++t)
-                    idx[t] = t * (int)n;
-                __m256i idx_vec = _mm256_loadu_si256((const __m256i *)idx);
-                Lkj = _mm256_i32gather_ps(baseL, idx_vec, sizeof(float));
-            }
+                float *baseL = &L[(size_t)j * n + k];
+                __m256 Lkj = _mm256_loadu_ps(baseL);
+                __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
 
-            __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+                __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
 
-            __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
-            __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
-
-            CHOLK_MM256_STORE_PS(&x[k], xk_new);
-
-            if (is_upper)
-            {
+                CHOLK_MM256_STORE_PS(&x[k], xk_new);
                 _mm256_storeu_ps(baseL, Lkj_new);
             }
+        }
+        else
+        {
+            // ✅ Lower triangular: 8x8 register transpose
+            if (j + 8 <= n)
+            {
+                for (; k + 7 < n; k += 8)
+                {
+                    float *base = &L[(size_t)k * n + j];
+                    
+                    __m256 r0 = _mm256_loadu_ps(base + 0 * n);
+                    __m256 r1 = _mm256_loadu_ps(base + 1 * n);
+                    __m256 r2 = _mm256_loadu_ps(base + 2 * n);
+                    __m256 r3 = _mm256_loadu_ps(base + 3 * n);
+                    __m256 r4 = _mm256_loadu_ps(base + 4 * n);
+                    __m256 r5 = _mm256_loadu_ps(base + 5 * n);
+                    __m256 r6 = _mm256_loadu_ps(base + 6 * n);
+                    __m256 r7 = _mm256_loadu_ps(base + 7 * n);
+                    
+                    transpose8x8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
+                    
+                    __m256 Lkj = r0;
+                    __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+                    
+                    __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                    __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
+                    
+                    CHOLK_MM256_STORE_PS(&x[k], xk_new);
+                    
+                    r0 = Lkj_new;
+                    transpose8x8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
+                    
+                    _mm256_storeu_ps(base + 0 * n, r0);
+                    _mm256_storeu_ps(base + 1 * n, r1);
+                    _mm256_storeu_ps(base + 2 * n, r2);
+                    _mm256_storeu_ps(base + 3 * n, r3);
+                    _mm256_storeu_ps(base + 4 * n, r4);
+                    _mm256_storeu_ps(base + 5 * n, r5);
+                    _mm256_storeu_ps(base + 6 * n, r6);
+                    _mm256_storeu_ps(base + 7 * n, r7);
+                }
+            }
             else
             {
-                float tmp[8];
-                _mm256_storeu_ps(tmp, Lkj_new);
-                for (int t = 0; t < 8; ++t)
-                    baseL[(size_t)t * n] = tmp[t];
+                // Fallback near edge
+                for (; k + 7 < n; k += 8)
+                {
+                    float *baseL = &L[(size_t)k * n + j];
+                    int idx[8];
+                    for (int t = 0; t < 8; ++t)
+                        idx[t] = t * (int)n;
+                    __m256i idx_vec = _mm256_loadu_si256((const __m256i *)idx);
+                    __m256 Lkj = _mm256_i32gather_ps(baseL, idx_vec, sizeof(float));
+                    
+                    __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+                    __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                    __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
+                    
+                    CHOLK_MM256_STORE_PS(&x[k], xk_new);
+                    
+                    float tmp[8];
+                    _mm256_storeu_ps(tmp, Lkj_new);
+                    for (int t = 0; t < 8; ++t)
+                        baseL[(size_t)t * n] = tmp[t];
+                }
             }
         }
 
+        // Scalar tail
         for (; k < n; ++k)
         {
             const size_t off = is_upper ? (size_t)j * n + k
@@ -455,6 +528,36 @@ static int cholupdatek_tiled_ws(cholupdate_workspace *ws,
     if (n > ws->n_max || k > ws->k_max)
         return -EOVERFLOW;
 
+    // ✅ OPTIMIZATION: Transpose X to column-major ONCE
+    float *Xc = ws->Xc;
+    
+    for (uint16_t p = 0; p < k; ++p)
+    {
+        float *dst = Xc + (size_t)p * n;
+        const float *src = X + p;
+        
+#if __AVX2__
+        uint16_t i = 0;
+        
+        for (; i + 7 < n; i += 8)
+        {
+            __m256i idx = _mm256_setr_epi32(
+                0 * (int)k, 1 * (int)k, 2 * (int)k, 3 * (int)k,
+                4 * (int)k, 5 * (int)k, 6 * (int)k, 7 * (int)k
+            );
+            const float *src_base = src + (size_t)i * k;
+            __m256 vals = _mm256_i32gather_ps(src_base, idx, sizeof(float));
+            _mm256_storeu_ps(dst + i, vals);
+        }
+        
+        for (; i < n; ++i)
+            dst[i] = src[(size_t)i * k];
+#else
+        for (uint16_t i = 0; i < n; ++i)
+            dst[i] = src[(size_t)i * k];
+#endif
+    }
+
     const uint16_t T = (CHOLK_COL_TILE == 0) ? 32 : (uint16_t)CHOLK_COL_TILE;
     float *xbuf = ws->xbuf;
 
@@ -466,39 +569,11 @@ static int cholupdatek_tiled_ws(cholupdate_workspace *ws,
 
         for (uint16_t t = 0; t < jb; ++t)
         {
-            const float *xcol = X + (p0 + t);
+            // ✅ NOW: Contiguous column access (no gather!)
+            const float *xcol = Xc + (size_t)(p0 + t) * n;
             
-            // ✅ OPTIMIZED: Vectorized column extraction
-#if __AVX2__
-            if (k >= 8)
-            {
-                uint16_t r = 0;
-                
-                // SIMD extraction (8 elements at a time)
-                for (; r + 7 < n; r += 8)
-                {
-                    // Build gather indices for strided load
-                    __m256i idx = _mm256_setr_epi32(
-                        0 * k, 1 * k, 2 * k, 3 * k,
-                        4 * k, 5 * k, 6 * k, 7 * k
-                    );
-                    
-                    const float *src = xcol + (size_t)r * k;
-                    __m256 vals = _mm256_i32gather_ps(src, idx, sizeof(float));
-                    _mm256_storeu_ps(&xbuf[r], vals);
-                }
-                
-                // Scalar tail
-                for (; r < n; ++r)
-                    xbuf[r] = xcol[(size_t)r * k];
-            }
-            else
-#endif
-            {
-                // Scalar fallback (or k too small for SIMD)
-                for (uint16_t r = 0; r < n; ++r)
-                    xbuf[r] = xcol[(size_t)r * k];
-            }
+            // Fast contiguous copy
+            memcpy(xbuf, xcol, (size_t)n * sizeof(float));
 
             if (add > 0)
                 rc = cholupdate_rank1_update(L, xbuf, n, is_upper);
@@ -677,18 +752,15 @@ static inline int choose_cholupdate_method(uint16_t n, uint16_t k, int add)
     return 0;
 }
 
-//==============================================================================
-// AUTO-DISPATCH
-//==============================================================================
 
 //==============================================================================
 // CACHE-BLOCKED TILED RANK-K (FOR n ≥ 256)
 //==============================================================================
 
 /**
- * @brief Row-blocked rank-1 update for better cache behavior
+ * @brief Row-blocked rank-1 update with AVX2 vectorization within blocks
  * 
- * Processes rows in cache-friendly blocks while maintaining correctness
+ * Processes rows in cache-friendly blocks while using SIMD for throughput
  */
 static int cholupdate_rank1_update_blocked(float *restrict L,
                                            float *restrict x,
@@ -696,12 +768,21 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
                                            bool is_upper,
                                            uint16_t block_size)
 {
-    // For each column j, we update L[j:n, j] and x[j+1:n]
-    // The key insight: we can process the updates to L in row blocks
-    // because within a column, row updates are independent
-    
+#if __AVX2__
+    const int use_avx = n >= (uint32_t)CHOLK_AVX_MIN_N;
+#else
+    const int use_avx = 0;
+#endif
+
     for (uint32_t j = 0; j < n; ++j)
     {
+        // Prefetch ahead
+        if (j + 4 < n)
+        {
+            const size_t prefetch_idx = (size_t)(j + 4) * n + (j + 4);
+            _mm_prefetch((const char *)&L[prefetch_idx], _MM_HINT_T0);
+        }
+
         const size_t dj = (size_t)j * n + j;
         const float Ljj = L[dj];
         const float xj = x[j];
@@ -722,15 +803,160 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
         if (xj == 0.0f)
             continue;
 
-        // ✅ BLOCKED: Process remaining elements in cache-friendly blocks
         const uint32_t n_remain = n - j - 1;
         
+        // ✅ BLOCKED + VECTORIZED: Process in cache-friendly blocks with AVX2
         for (uint32_t b0 = 0; b0 < n_remain; b0 += block_size)
         {
             const uint32_t bend = (b0 + block_size <= n_remain) ? (b0 + block_size) : n_remain;
+            uint32_t k = j + 1 + b0;
             
-            // Process block [j+1+b0 : j+1+bend]
-            for (uint32_t k = j + 1 + b0; k < j + 1 + bend; ++k)
+            // ✅ AVX2 path within block
+            if (use_avx && (k + 8 <= j + 1 + bend))
+            {
+#if __AVX2__
+#if CHOLK_USE_ALIGNED_SIMD
+                // Align to 32-byte boundary within this block
+                while ((k < j + 1 + bend) && ((uintptr_t)(&x[k]) & 31u))
+                {
+                    const size_t off = is_upper ? (size_t)j * n + k
+                                                : (size_t)k * n + j;
+                    const float Lkj = L[off];
+                    const float xk = x[k];
+                    L[off] = c * Lkj + s * xk;
+                    x[k] = c * xk - s * Lkj;
+                    ++k;
+                }
+#endif
+
+                const __m256 c_v = _mm256_set1_ps(c);
+                const __m256 s_v = _mm256_set1_ps(s);
+
+                // Vectorized loop within block
+                for (; k + 7 < j + 1 + bend; k += 8)
+                {
+                    float *baseL = is_upper ? &L[(size_t)j * n + k]
+                                            : &L[(size_t)k * n + j];
+                    __m256 Lkj;
+
+                     // ✅ OPTIMIZED: Different strategies for upper vs lower triangular
+                if (is_upper)
+                {
+                    // Upper triangular: contiguous load
+                    for (; k + 7 < j + 1 + bend; k += 8)
+                    {
+                        float *baseL = &L[(size_t)j * n + k];
+                        __m256 Lkj = _mm256_loadu_ps(baseL);
+                        __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+
+                        __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                        __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
+
+                        CHOLK_MM256_STORE_PS(&x[k], xk_new);
+                        _mm256_storeu_ps(baseL, Lkj_new);
+                    }
+                }
+                else
+                {
+                    // ✅ Lower triangular: 8x8 register transpose to avoid gathers
+                    // Check if we have room for 8x8 block (need j+8 <= n for safe loads)
+                    if (j + 8 <= n)
+                    {
+                        for (; k + 7 < j + 1 + bend; k += 8)
+                        {
+                            float *base = &L[(size_t)k * n + j];
+                            
+                            // Load 8 rows × 8 columns (all contiguous)
+                            __m256 r0 = _mm256_loadu_ps(base + 0 * n);
+                            __m256 r1 = _mm256_loadu_ps(base + 1 * n);
+                            __m256 r2 = _mm256_loadu_ps(base + 2 * n);
+                            __m256 r3 = _mm256_loadu_ps(base + 3 * n);
+                            __m256 r4 = _mm256_loadu_ps(base + 4 * n);
+                            __m256 r5 = _mm256_loadu_ps(base + 5 * n);
+                            __m256 r6 = _mm256_loadu_ps(base + 6 * n);
+                            __m256 r7 = _mm256_loadu_ps(base + 7 * n);
+                            
+                            // Transpose: now r0 contains column j (the 8 elements we need)
+                            transpose8x8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
+                            
+                            // r0 now holds L[k:k+8, j]
+                            __m256 Lkj = r0;
+                            __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+                            
+                            // Apply rotation
+                            __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                            __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
+                            
+                            CHOLK_MM256_STORE_PS(&x[k], xk_new);
+                            
+                            // Write back: put updated column back and transpose again
+                            r0 = Lkj_new;
+                            transpose8x8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
+                            
+                            // Store back 8 rows (only first element of each row changed)
+                            _mm256_storeu_ps(base + 0 * n, r0);
+                            _mm256_storeu_ps(base + 1 * n, r1);
+                            _mm256_storeu_ps(base + 2 * n, r2);
+                            _mm256_storeu_ps(base + 3 * n, r3);
+                            _mm256_storeu_ps(base + 4 * n, r4);
+                            _mm256_storeu_ps(base + 5 * n, r5);
+                            _mm256_storeu_ps(base + 6 * n, r6);
+                            _mm256_storeu_ps(base + 7 * n, r7);
+                        }
+                    }
+                    else
+                    {
+                        // Fallback: near edge of matrix, use gather (rare path)
+                        for (; k + 7 < j + 1 + bend; k += 8)
+                        {
+                            float *baseL = &L[(size_t)k * n + j];
+                            int idx[8];
+                            for (int t = 0; t < 8; ++t)
+                                idx[t] = t * (int)n;
+                            __m256i idx_vec = _mm256_loadu_si256((const __m256i *)idx);
+                            __m256 Lkj = _mm256_i32gather_ps(baseL, idx_vec, sizeof(float));
+                            
+                            __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+                            __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                            __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
+                            
+                            CHOLK_MM256_STORE_PS(&x[k], xk_new);
+                            
+                            float tmp[8];
+                            _mm256_storeu_ps(tmp, Lkj_new);
+                            for (int t = 0; t < 8; ++t)
+                                baseL[(size_t)t * n] = tmp[t];
+                        }
+                    }
+                }
+
+                    __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
+
+                    // Fused multiply-add: Lkj_new = c * Lkj + s * xk
+                    __m256 Lkj_new = _mm256_fmadd_ps(c_v, Lkj, _mm256_mul_ps(s_v, xk));
+                    // xk_new = c * xk - s * Lkj
+                    __m256 xk_new = _mm256_fnmadd_ps(s_v, Lkj, _mm256_mul_ps(c_v, xk));
+
+                    CHOLK_MM256_STORE_PS(&x[k], xk_new);
+
+                    if (is_upper)
+                    {
+                        _mm256_storeu_ps(baseL, Lkj_new);
+                    }
+                    else
+                    {
+                        // Scatter for lower-triangular
+                        float tmp[8];
+                        _mm256_storeu_ps(tmp, Lkj_new);
+                        for (int t = 0; t < 8; ++t)
+                            baseL[(size_t)t * n] = tmp[t];
+                    }
+                }
+#endif
+            }
+            
+            // ✅ Scalar tail (end of block or remainder)
+            for (; k < j + 1 + bend; ++k)
             {
                 const size_t off = is_upper ? (size_t)j * n + k
                                             : (size_t)k * n + j;
@@ -748,6 +974,9 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
 /**
  * @brief Cache-blocked tiled rank-k for large matrices
  */
+/**
+ * @brief Cache-blocked tiled rank-k with X transpose optimization
+ */
 static int cholupdatek_tiled_ws_blocked(cholupdate_workspace *ws,
                                         float *restrict L,
                                         const float *restrict X,
@@ -757,6 +986,51 @@ static int cholupdatek_tiled_ws_blocked(cholupdate_workspace *ws,
     // Use regular version for small matrices
     if (n < 256)
         return cholupdatek_tiled_ws(ws, L, X, n, k, is_upper, add);
+    
+    if (!ws || !L)
+        return -EINVAL;
+    if (n == 0)
+        return -EINVAL;
+    if (k == 0)
+        return 0;
+    if (!X)
+        return -EINVAL;
+    if (add != +1 && add != -1)
+        return -EINVAL;
+    if (n > ws->n_max || k > ws->k_max)
+        return -EOVERFLOW;
+    
+    // ✅ OPTIMIZATION: Transpose X to column-major ONCE
+    float *Xc = ws->Xc;
+    
+    for (uint16_t p = 0; p < k; ++p)
+    {
+        float *dst = Xc + (size_t)p * n;
+        const float *src = X + p;
+        
+#if __AVX2__
+        uint16_t i = 0;
+        
+        // Vectorized transpose: gather from row-major X, store contiguous
+        for (; i + 7 < n; i += 8)
+        {
+            __m256i idx = _mm256_setr_epi32(
+                0 * (int)k, 1 * (int)k, 2 * (int)k, 3 * (int)k,
+                4 * (int)k, 5 * (int)k, 6 * (int)k, 7 * (int)k
+            );
+            const float *src_base = src + (size_t)i * k;
+            __m256 vals = _mm256_i32gather_ps(src_base, idx, sizeof(float));
+            _mm256_storeu_ps(dst + i, vals);
+        }
+        
+        // Scalar tail
+        for (; i < n; ++i)
+            dst[i] = src[(size_t)i * k];
+#else
+        for (uint16_t i = 0; i < n; ++i)
+            dst[i] = src[(size_t)i * k];
+#endif
+    }
     
     // For large matrices, use blocked version
     const uint16_t BLOCK_SIZE = 128;  // L2 cache-sized block (~64KB)
@@ -771,38 +1045,17 @@ static int cholupdatek_tiled_ws_blocked(cholupdate_workspace *ws,
 
         for (uint16_t t = 0; t < jb; ++t)
         {
-            const float *xcol = X + (p0 + t);
+            // ✅ NOW: Contiguous column access (no gather!)
+            const float *xcol = Xc + (size_t)(p0 + t) * n;
             
-            // Extract column (vectorized as before)
-#if __AVX2__
-            if (k >= 8)
-            {
-                uint16_t r = 0;
-                for (; r + 7 < n; r += 8)
-                {
-                    __m256i idx = _mm256_setr_epi32(
-                        0 * k, 1 * k, 2 * k, 3 * k,
-                        4 * k, 5 * k, 6 * k, 7 * k
-                    );
-                    const float *src = xcol + (size_t)r * k;
-                    __m256 vals = _mm256_i32gather_ps(src, idx, sizeof(float));
-                    _mm256_storeu_ps(&xbuf[r], vals);
-                }
-                for (; r < n; ++r)
-                    xbuf[r] = xcol[(size_t)r * k];
-            }
-            else
-#endif
-            {
-                for (uint16_t r = 0; r < n; ++r)
-                    xbuf[r] = xcol[(size_t)r * k];
-            }
+            // Fast contiguous copy (compiler will AVX-ize this automatically)
+            memcpy(xbuf, xcol, (size_t)n * sizeof(float));
 
             // ✅ Use blocked rank-1 update
             if (add > 0)
                 rc = cholupdate_rank1_update_blocked(L, xbuf, n, is_upper, BLOCK_SIZE);
             else
-                rc = cholupdate_rank1_downdate(L, xbuf, n, is_upper);  // Downdate doesn't need blocking
+                rc = cholupdate_rank1_downdate(L, xbuf, n, is_upper);
 
             if (rc)
                 return rc;
