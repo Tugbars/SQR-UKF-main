@@ -841,14 +841,21 @@ static int apply_block_reflector_strided(
 // MAIN QR ALGORITHM
 //==============================================================================
 
-int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
-                          uint16_t m, uint16_t n, bool only_R)
-{
-    if (!ws || !A || !R)
-        return -EINVAL;
-    if (m > ws->m_max || n > ws->n_max)
-        return -EINVAL;
+//==============================================================================
+// PHASE 1: BLOCKED QR FACTORIZATION
+//==============================================================================
 
+/**
+ * @brief Perform blocked QR factorization, storing reflectors in A and Y/T
+ * 
+ * @param ws Workspace
+ * @param A [in/out] Matrix to factor [m×n], gets overwritten with R and reflectors
+ * @param m Number of rows
+ * @param n Number of columns
+ * @return Number of blocks processed, or negative error code
+ */
+static int qr_factor_blocked(qr_workspace *ws, float *A, uint16_t m, uint16_t n)
+{
     const uint16_t kmax = MIN(m, n);
     uint16_t block_count = 0;
 
@@ -880,7 +887,7 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
                    block_size * block_size * sizeof(float));
         }
 
-        // ✅ FIXED: Apply to trailing matrix
+        // Apply to trailing matrix
         if (cols_right > 0)
         {
             for (uint16_t j = 0; j < block_size && (k + j) < m; ++j)
@@ -888,14 +895,13 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
                 // Reflector j affects rows [k+j .. m-1]
                 uint16_t reflector_len = m - (k + j);
 
-                // ✅ CRITICAL FIX: Extract reflector from A (not ws->Y!)
-                // Reflector is stored in A[k+j:m-1, k+j] with implicit v[0]=1
+                // Extract reflector from A (stored in lower triangle)
                 float *col_j = &A[(k + j) * n + (k + j)];
 
                 ws->tmp[0] = 1.0f; // Implicit first component
                 for (uint16_t i = 1; i < reflector_len; ++i)
                 {
-                    ws->tmp[i] = col_j[i * n]; // Extract from A's lower triangle
+                    ws->tmp[i] = col_j[i * n];
                 }
 
                 // Apply to trailing matrix in column blocks
@@ -920,44 +926,144 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
         block_count++;
     }
 
-    // Extract R
-    for (uint16_t i = 0; i < m; ++i)
-        for (uint16_t j = 0; j < n; ++j)
-            R[i * n + j] = (i <= j) ? A[i * n + j] : 0.0f;
+    return block_count;
+}
 
-    // Form Q (unchanged - uses stored Y which is correct)
+//==============================================================================
+// PHASE 2: EXTRACT R MATRIX
+//==============================================================================
+
+/**
+ * @brief Extract upper triangular R from factored matrix A
+ * 
+ * @param R [out] Output R matrix [m×n]
+ * @param A [in] Factored matrix (R in upper triangle)
+ * @param m Number of rows
+ * @param n Number of columns
+ */
+static void qr_extract_r(float *restrict R, const float *restrict A,
+                         uint16_t m, uint16_t n)
+{
+    for (uint16_t i = 0; i < m; ++i)
+    {
+        for (uint16_t j = 0; j < n; ++j)
+        {
+            R[i * n + j] = (i <= j) ? A[i * n + j] : 0.0f;
+        }
+    }
+}
+
+//==============================================================================
+// PHASE 3: FORM ORTHOGONAL Q MATRIX
+//==============================================================================
+
+/**
+ * @brief Form orthogonal matrix Q from stored Householder reflectors
+ * 
+ * Applies reflectors in reverse order: Q = H(1) * H(2) * ... * H(k)
+ * Uses block reflector representation: H = I - Y*T*Y^T
+ * 
+ * @param ws Workspace containing stored Y and T matrices
+ * @param Q [out] Output Q matrix [m×m]
+ * @param m Number of rows
+ * @param n Number of columns (original matrix)
+ * @param block_count Number of blocks to process
+ * @return 0 on success, negative error code on failure
+ */
+static int qr_form_q(qr_workspace *ws, float *Q, uint16_t m, uint16_t n,
+                     uint16_t block_count)
+{
+    if (!ws->Y_stored || !ws->T_stored)
+        return -EINVAL;
+
+    const uint16_t kmax = MIN(m, n);
+
+    // Initialize Q = I
+    memset(Q, 0, (size_t)m * m * sizeof(float));
+    for (uint16_t i = 0; i < m; ++i)
+        Q[i * m + i] = 1.0f;
+
+    // Apply blocks in reverse order
+    for (int blk = block_count - 1; blk >= 0; blk--)
+    {
+        uint16_t k = blk * ws->ib;
+        uint16_t block_size = MIN(ws->ib, kmax - k);
+        uint16_t rows_below = m - k;
+
+        size_t y_offset = blk * ws->Y_block_stride;
+        size_t t_offset = blk * ws->T_block_stride;
+
+        // Load stored Y matrix for this block
+        memset(ws->Y, 0, (size_t)m * ws->ib * sizeof(float));
+        for (uint16_t i = 0; i < rows_below; ++i)
+            for (uint16_t j = 0; j < block_size; ++j)
+                ws->Y[(k + i) * ws->ib + j] =
+                    ws->Y_stored[y_offset + i * block_size + j];
+
+        // Load stored T matrix for this block
+        memcpy(ws->T, &ws->T_stored[t_offset],
+               block_size * block_size * sizeof(float));
+
+        // Apply block reflector: Q = Q * (I - Y*T*Y^T)
+        int ret = apply_block_reflector_clean(
+            Q, ws->Y, ws->T,
+            m, m, block_size, ws->ib,
+            ws->Z, ws->Z_temp, ws->YT);
+
+        if (ret != 0)
+            return ret;
+    }
+
+    return 0;
+}
+
+//==============================================================================
+// MAIN WRAPPER (UNCHANGED SIGNATURE)
+//==============================================================================
+
+/**
+ * @brief Blocked QR decomposition with in-place factorization
+ * 
+ * Computes A = Q*R where Q is orthogonal and R is upper triangular.
+ * 
+ * @param ws Pre-allocated workspace
+ * @param A [in/out] Input matrix [m×n], gets overwritten during factorization
+ * @param Q [out] Orthogonal matrix [m×m] (if !only_R)
+ * @param R [out] Upper triangular matrix [m×n]
+ * @param m Number of rows
+ * @param n Number of columns
+ * @param only_R If true, skip Q formation (faster for least squares)
+ * @return 0 on success, negative error code on failure
+ */
+int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
+                          uint16_t m, uint16_t n, bool only_R)
+{
+    if (!ws || !A || !R)
+        return -EINVAL;
+    if (m > ws->m_max || n > ws->n_max)
+        return -EINVAL;
+
+    //==========================================================================
+    // Phase 1: Factorization (A → R + reflectors)
+    //==========================================================================
+    
+    int block_count = qr_factor_blocked(ws, A, m, n);
+    if (block_count < 0)
+        return block_count;
+
+    //==========================================================================
+    // Phase 2: Extract R
+    //==========================================================================
+    
+    qr_extract_r(R, A, m, n);
+
+    //==========================================================================
+    // Phase 3: Form Q (optional)
+    //==========================================================================
+    
     if (!only_R && Q)
     {
-        memset(Q, 0, (size_t)m * m * sizeof(float));
-        for (uint16_t i = 0; i < m; ++i)
-            Q[i * m + i] = 1.0f;
-
-        for (int blk = block_count - 1; blk >= 0; blk--)
-        {
-            uint16_t k = blk * ws->ib;
-            uint16_t block_size = MIN(ws->ib, kmax - k);
-            uint16_t rows_below = m - k;
-
-            size_t y_offset = blk * ws->Y_block_stride;
-            size_t t_offset = blk * ws->T_block_stride;
-
-            memset(ws->Y, 0, (size_t)m * ws->ib * sizeof(float));
-            for (uint16_t i = 0; i < rows_below; ++i)
-                for (uint16_t j = 0; j < block_size; ++j)
-                    ws->Y[(k + i) * ws->ib + j] =
-                        ws->Y_stored[y_offset + i * block_size + j];
-
-            memcpy(ws->T, &ws->T_stored[t_offset],
-                   block_size * block_size * sizeof(float));
-
-            int ret = apply_block_reflector_clean(
-                Q, ws->Y, ws->T,
-                m, m, block_size, ws->ib,
-                ws->Z, ws->Z_temp, ws->YT);
-
-            if (ret != 0)
-                return ret;
-        }
+        return qr_form_q(ws, Q, m, n, block_count);
     }
 
     return 0;
