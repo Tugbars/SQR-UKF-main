@@ -14,6 +14,7 @@
         "stdio.h": "c",
         "typeinfo": "c",
         "gemm_planning.h": "c",
-        "assert.h": "c"
+        "assert.h": "c",
+        "gemm_utils.h": "c"
     }
 }

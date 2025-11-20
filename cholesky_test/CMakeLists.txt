@@ -115,6 +115,7 @@ set(CHOLUPDATE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 
 set(CHOLUPDATE_SOURCES 
     ${CHOLUPDATE_DIR}/cholupdate.c
+    ${CHOLUPDATE_DIR}/tran_pack.c
 )
 
 add_library(cholupdate_lib STATIC ${CHOLUPDATE_SOURCES})

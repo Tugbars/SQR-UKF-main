@@ -40,7 +40,7 @@
 #endif
 
 /* ---------- your existing micro-kernels (kept verbatim) ---------- */
-static inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT dst,
+inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT dst,
                                     size_t src_stride, size_t dst_stride)
 {
     __m256 r0 = _mm256_loadu_ps(src + 0 * src_stride);
@@ -109,7 +109,7 @@ static inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT d
 #endif
 }
 
-static inline void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT dst,
+inline void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT dst,
                                     size_t src_stride, size_t dst_stride)
 {
     __m128 a0 = _mm_loadu_ps(src + 0 * src_stride);
@@ -267,3 +267,223 @@ static inline void pack_T_Kx16(const float *RESTRICT B, uint16_t Ktot, uint16_t 
     }
 }
 
+/**
+ * @brief Transpose lower-triangular to upper-triangular using tiled AVX2
+ * 
+ * L (lower) → U = L^T (upper)
+ * Only transposes the lower triangle (including diagonal)
+ * 
+ * @note Uses your optimized 8×8 AVX2 kernel where possible
+ */
+void transpose_lower_to_upper_blocked(const float *restrict L,
+                                             float *restrict U,
+                                             uint16_t n)
+{
+    const size_t TS = 32;  // Match your TRAN_TILE
+    
+    // Zero entire U first
+    memset(U, 0, (size_t)n * n * sizeof(float));
+    
+    // Tile over the matrix
+    for (size_t i0 = 0; i0 < n; i0 += TS)
+    {
+        const size_t ib = (i0 + TS <= n) ? TS : (n - i0);
+        const size_t ib8 = ib & ~(size_t)7;
+        
+        // Only process tiles in lower triangle: j0 ≤ i0
+        for (size_t j0 = 0; j0 <= i0 && j0 < n; j0 += TS)
+        {
+            const size_t jb = (j0 + TS <= n) ? TS : (n - j0);
+            const size_t jb8 = jb & ~(size_t)7;
+            
+            // Determine if this tile is fully/partially in lower triangle
+            const size_t i_end = i0 + ib;
+            const size_t j_end = j0 + jb;
+            
+            if (j_end <= i0)
+            {
+                // ✅ Tile is FULLY below diagonal - use fast 8×8 kernel
+                for (size_t i = 0; i < ib8; i += 8)
+                {
+                    for (size_t j = 0; j < jb8; j += 8)
+                    {
+                        transpose8x8_avx(
+                            L + (i0 + i) * n + (j0 + j),
+                            U + (j0 + j) * n + (i0 + i),
+                            n, n
+                        );
+                    }
+                }
+                
+                // 8×4 SSE tail for columns
+                for (size_t i = 0; i < ib8; i += 8)
+                {
+                    const size_t j_rem = jb - jb8;
+                    if (j_rem >= 4)
+                    {
+                        transpose8x4_sse(
+                            L + (i0 + i) * n + (j0 + jb8),
+                            U + (j0 + jb8) * n + (i0 + i),
+                            n, n
+                        );
+                    }
+                }
+                
+                // Scalar remainder
+                const size_t i_tail = ib - ib8;
+                const size_t j_tail = jb - (jb8 + ((jb - jb8) & ~(size_t)3));
+                
+                if (j_tail)
+                {
+                    for (size_t i = 0; i < ib8; ++i)
+                    {
+                        for (size_t j = jb - j_tail; j < jb; ++j)
+                        {
+                            U[(j0 + j) * n + (i0 + i)] = L[(i0 + i) * n + (j0 + j)];
+                        }
+                    }
+                }
+                
+                if (i_tail)
+                {
+                    for (size_t i = ib - i_tail; i < ib; ++i)
+                    {
+                        for (size_t j = 0; j < jb; ++j)
+                        {
+                            U[(j0 + j) * n + (i0 + i)] = L[(i0 + i) * n + (j0 + j)];
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // ⚠️ Tile crosses diagonal - use careful scalar code
+                for (size_t i = 0; i < ib; ++i)
+                {
+                    const size_t row = i0 + i;
+                    
+                    // Only transpose up to diagonal (col ≤ row)
+                    const size_t j_max = (row >= j0) ? ((row - j0) < jb ? (row - j0 + 1) : jb) : 0;
+                    
+                    for (size_t j = 0; j < j_max; ++j)
+                    {
+                        const size_t col = j0 + j;
+                        if (col <= row)  // Safety check
+                        {
+                            U[col * n + row] = L[row * n + col];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * @brief Transpose upper-triangular to lower-triangular using tiled AVX2
+ * 
+ * U (upper) → L = U^T (lower)
+ * Only transposes the upper triangle (including diagonal)
+ */
+void transpose_upper_to_lower_blocked(const float *restrict U,
+                                             float *restrict L,
+                                             uint16_t n)
+{
+    const size_t TS = 32;
+    
+    // Zero entire L first
+    memset(L, 0, (size_t)n * n * sizeof(float));
+    
+    // Tile over the matrix
+    for (size_t i0 = 0; i0 < n; i0 += TS)
+    {
+        const size_t ib = (i0 + TS <= n) ? TS : (n - i0);
+        const size_t ib8 = ib & ~(size_t)7;
+        
+        // Only process tiles in upper triangle: j0 ≥ i0
+        for (size_t j0 = i0; j0 < n; j0 += TS)
+        {
+            const size_t jb = (j0 + TS <= n) ? TS : (n - j0);
+            const size_t jb8 = jb & ~(size_t)7;
+            
+            const size_t i_end = i0 + ib;
+            const size_t j_end = j0 + jb;
+            
+            if (i_end <= j0)
+            {
+                // ✅ Tile is FULLY above diagonal - use fast 8×8 kernel
+                for (size_t i = 0; i < ib8; i += 8)
+                {
+                    for (size_t j = 0; j < jb8; j += 8)
+                    {
+                        transpose8x8_avx(
+                            U + (i0 + i) * n + (j0 + j),
+                            L + (j0 + j) * n + (i0 + i),
+                            n, n
+                        );
+                    }
+                }
+                
+                // 8×4 tail
+                for (size_t i = 0; i < ib8; i += 8)
+                {
+                    const size_t j_rem = jb - jb8;
+                    if (j_rem >= 4)
+                    {
+                        transpose8x4_sse(
+                            U + (i0 + i) * n + (j0 + jb8),
+                            L + (j0 + jb8) * n + (i0 + i),
+                            n, n
+                        );
+                    }
+                }
+                
+                // Scalar remainder
+                const size_t i_tail = ib - ib8;
+                const size_t j_tail = jb - (jb8 + ((jb - jb8) & ~(size_t)3));
+                
+                if (j_tail)
+                {
+                    for (size_t i = 0; i < ib8; ++i)
+                    {
+                        for (size_t j = jb - j_tail; j < jb; ++j)
+                        {
+                            L[(j0 + j) * n + (i0 + i)] = U[(i0 + i) * n + (j0 + j)];
+                        }
+                    }
+                }
+                
+                if (i_tail)
+                {
+                    for (size_t i = ib - i_tail; i < ib; ++i)
+                    {
+                        for (size_t j = 0; j < jb; ++j)
+                        {
+                            L[(j0 + j) * n + (i0 + i)] = U[(i0 + i) * n + (j0 + j)];
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // ⚠️ Tile crosses diagonal - use careful scalar code
+                for (size_t i = 0; i < ib; ++i)
+                {
+                    const size_t row = i0 + i;
+                    
+                    // Only transpose from diagonal onwards (col ≥ row)
+                    const size_t j_start = (row >= j0) ? (row - j0) : 0;
+                    
+                    for (size_t j = j_start; j < jb; ++j)
+                    {
+                        const size_t col = j0 + j;
+                        if (col >= row)  // Safety check
+                        {
+                            L[col * n + row] = U[row * n + col];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

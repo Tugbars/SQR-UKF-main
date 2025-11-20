@@ -14,6 +14,7 @@
 #include <immintrin.h>
 #include "linalg_simd.h"
 #include "../qr/qr.h"
+#include "tran_pack.h"
 #include "../gemm_2/gemm_utils.h"
 
 #ifndef CHOLK_COL_TILE
@@ -137,9 +138,6 @@ size_t cholupdate_workspace_bytes(const cholupdate_workspace *ws)
     return ws ? ws->total_bytes : 0;
 }
 
-//==============================================================================
-// RANK-1 UPDATE (Gill-Golub-Murray-Saunders)
-//==============================================================================
 
 //==============================================================================
 // RANK-1 UPDATE FIX (Gill-Golub-Murray-Saunders)
@@ -150,6 +148,34 @@ static int cholupdate_rank1_update(float *restrict L,
                                    uint16_t n,
                                    bool is_upper)
 {
+    // ✅ OPTIMIZATION: Convert lower → upper for better SIMD (n ≥ 64)
+    if (!is_upper && n >= 64)
+    {
+        float *U_tmp = (float*)gemm_aligned_alloc(32, (size_t)n * n * sizeof(float));
+        if (U_tmp)
+        {
+            // Transpose L → U (cache-blocked)
+            transpose_lower_to_upper_blocked(L, U_tmp, n);
+            
+            // Run update on upper triangular (fast contiguous access)
+            int ret = cholupdate_rank1_update(U_tmp, x, n, true);
+            
+            if (ret == 0)
+            {
+                // Transpose back U → L
+                transpose_upper_to_lower_blocked(U_tmp, L, n);
+            }
+            
+            gemm_aligned_free(U_tmp);
+            return ret;
+        }
+        // Fall through to original code if allocation fails
+    }
+    
+    //==========================================================================
+    // ORIGINAL RANK-1 UPDATE CODE
+    //==========================================================================
+    
 #if __AVX2__
     const int use_avx = n >= (uint32_t)CHOLK_AVX_MIN_N;
 #else
@@ -229,18 +255,11 @@ static int cholupdate_rank1_update(float *restrict L,
             }
             else
             {
-#ifdef __AVX2__
                 int idx[8];
                 for (int t = 0; t < 8; ++t)
                     idx[t] = t * (int)n;
                 __m256i idx_vec = _mm256_loadu_si256((const __m256i *)idx);
                 Lkj = _mm256_i32gather_ps(baseL, idx_vec, sizeof(float));
-#else
-                float tmp[8];
-                for (int t = 0; t < 8; ++t)
-                    tmp[t] = baseL[(size_t)t * n];
-                Lkj = _mm256_loadu_ps(tmp);
-#endif
             }
 
             __m256 xk = CHOLK_MM256_LOAD_PS(&x[k]);
@@ -277,7 +296,6 @@ static int cholupdate_rank1_update(float *restrict L,
 
     return 0;
 }
-
 
 //==============================================================================
 // RANK-1 DOWNDATE (Hyperbolic rotation)
@@ -449,8 +467,38 @@ static int cholupdatek_tiled_ws(cholupdate_workspace *ws,
         for (uint16_t t = 0; t < jb; ++t)
         {
             const float *xcol = X + (p0 + t);
-            for (uint16_t r = 0; r < n; ++r)
-                xbuf[r] = xcol[(size_t)r * k];
+            
+            // ✅ OPTIMIZED: Vectorized column extraction
+#if __AVX2__
+            if (k >= 8)
+            {
+                uint16_t r = 0;
+                
+                // SIMD extraction (8 elements at a time)
+                for (; r + 7 < n; r += 8)
+                {
+                    // Build gather indices for strided load
+                    __m256i idx = _mm256_setr_epi32(
+                        0 * k, 1 * k, 2 * k, 3 * k,
+                        4 * k, 5 * k, 6 * k, 7 * k
+                    );
+                    
+                    const float *src = xcol + (size_t)r * k;
+                    __m256 vals = _mm256_i32gather_ps(src, idx, sizeof(float));
+                    _mm256_storeu_ps(&xbuf[r], vals);
+                }
+                
+                // Scalar tail
+                for (; r < n; ++r)
+                    xbuf[r] = xcol[(size_t)r * k];
+            }
+            else
+#endif
+            {
+                // Scalar fallback (or k too small for SIMD)
+                for (uint16_t r = 0; r < n; ++r)
+                    xbuf[r] = xcol[(size_t)r * k];
+            }
 
             if (add > 0)
                 rc = cholupdate_rank1_update(L, xbuf, n, is_upper);
@@ -463,25 +511,6 @@ static int cholupdatek_tiled_ws(cholupdate_workspace *ws,
     }
 
     return 0;
-}
-
-//==============================================================================
-// QR-BASED UPDATE (UPDATE ONLY, VERTICAL STACKING)
-//==============================================================================
-
-static void copy_upper_nxn(float *restrict dst,
-                          const float *restrict src,
-                          uint16_t n, uint16_t ld_src)
-{
-    for (uint16_t i = 0; i < n; ++i)
-    {
-        const float *row = src + (size_t)i * ld_src;
-
-        for (uint16_t j = 0; j < i; ++j)
-            dst[(size_t)i * n + j] = 0.0f;
-
-        memcpy(dst + (size_t)i * n + i, row + i, (size_t)(n - i) * sizeof(float));
-    }
 }
 
 //==============================================================================
@@ -652,6 +681,141 @@ static inline int choose_cholupdate_method(uint16_t n, uint16_t k, int add)
 // AUTO-DISPATCH
 //==============================================================================
 
+//==============================================================================
+// CACHE-BLOCKED TILED RANK-K (FOR n ≥ 256)
+//==============================================================================
+
+/**
+ * @brief Row-blocked rank-1 update for better cache behavior
+ * 
+ * Processes rows in cache-friendly blocks while maintaining correctness
+ */
+static int cholupdate_rank1_update_blocked(float *restrict L,
+                                           float *restrict x,
+                                           uint16_t n,
+                                           bool is_upper,
+                                           uint16_t block_size)
+{
+    // For each column j, we update L[j:n, j] and x[j+1:n]
+    // The key insight: we can process the updates to L in row blocks
+    // because within a column, row updates are independent
+    
+    for (uint32_t j = 0; j < n; ++j)
+    {
+        const size_t dj = (size_t)j * n + j;
+        const float Ljj = L[dj];
+        const float xj = x[j];
+
+        const double Ljj_sq = (double)Ljj * Ljj;
+        const double xj_sq = (double)xj * xj;
+        const double r_sq = Ljj_sq + xj_sq;
+
+        if (r_sq <= 0.0 || !isfinite(r_sq))
+            return -EDOM;
+
+        const float r = (float)sqrt(r_sq);
+        const float c = Ljj / r;
+        const float s = xj / r;
+
+        L[dj] = r;
+
+        if (xj == 0.0f)
+            continue;
+
+        // ✅ BLOCKED: Process remaining elements in cache-friendly blocks
+        const uint32_t n_remain = n - j - 1;
+        
+        for (uint32_t b0 = 0; b0 < n_remain; b0 += block_size)
+        {
+            const uint32_t bend = (b0 + block_size <= n_remain) ? (b0 + block_size) : n_remain;
+            
+            // Process block [j+1+b0 : j+1+bend]
+            for (uint32_t k = j + 1 + b0; k < j + 1 + bend; ++k)
+            {
+                const size_t off = is_upper ? (size_t)j * n + k
+                                            : (size_t)k * n + j;
+                const float Lkj = L[off];
+                const float xk = x[k];
+                L[off] = c * Lkj + s * xk;
+                x[k] = c * xk - s * Lkj;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Cache-blocked tiled rank-k for large matrices
+ */
+static int cholupdatek_tiled_ws_blocked(cholupdate_workspace *ws,
+                                        float *restrict L,
+                                        const float *restrict X,
+                                        uint16_t n, uint16_t k,
+                                        bool is_upper, int add)
+{
+    // Use regular version for small matrices
+    if (n < 256)
+        return cholupdatek_tiled_ws(ws, L, X, n, k, is_upper, add);
+    
+    // For large matrices, use blocked version
+    const uint16_t BLOCK_SIZE = 128;  // L2 cache-sized block (~64KB)
+    const uint16_t T = (CHOLK_COL_TILE == 0) ? 32 : (uint16_t)CHOLK_COL_TILE;
+    float *xbuf = ws->xbuf;
+
+    int rc = 0;
+
+    for (uint16_t p0 = 0; p0 < k; p0 += T)
+    {
+        const uint16_t jb = (uint16_t)((p0 + T <= k) ? T : (k - p0));
+
+        for (uint16_t t = 0; t < jb; ++t)
+        {
+            const float *xcol = X + (p0 + t);
+            
+            // Extract column (vectorized as before)
+#if __AVX2__
+            if (k >= 8)
+            {
+                uint16_t r = 0;
+                for (; r + 7 < n; r += 8)
+                {
+                    __m256i idx = _mm256_setr_epi32(
+                        0 * k, 1 * k, 2 * k, 3 * k,
+                        4 * k, 5 * k, 6 * k, 7 * k
+                    );
+                    const float *src = xcol + (size_t)r * k;
+                    __m256 vals = _mm256_i32gather_ps(src, idx, sizeof(float));
+                    _mm256_storeu_ps(&xbuf[r], vals);
+                }
+                for (; r < n; ++r)
+                    xbuf[r] = xcol[(size_t)r * k];
+            }
+            else
+#endif
+            {
+                for (uint16_t r = 0; r < n; ++r)
+                    xbuf[r] = xcol[(size_t)r * k];
+            }
+
+            // ✅ Use blocked rank-1 update
+            if (add > 0)
+                rc = cholupdate_rank1_update_blocked(L, xbuf, n, is_upper, BLOCK_SIZE);
+            else
+                rc = cholupdate_rank1_downdate(L, xbuf, n, is_upper);  // Downdate doesn't need blocking
+
+            if (rc)
+                return rc;
+        }
+    }
+
+    return 0;
+}
+
+//==============================================================================
+// UPDATE AUTO-DISPATCH TO USE BLOCKED VERSION
+//==============================================================================
+
 int cholupdatek_auto_ws(cholupdate_workspace *ws,
                         float *restrict L_or_U,
                         const float *restrict X,
@@ -674,7 +838,7 @@ int cholupdatek_auto_ws(cholupdate_workspace *ws,
     if (method == 1)
         return cholupdatek_blockqr_ws(ws, L_or_U, X, n, k, is_upper, add);
     else
-        return cholupdatek_tiled_ws(ws, L_or_U, X, n, k, is_upper, add);
+        return cholupdatek_tiled_ws_blocked(ws, L_or_U, X, n, k, is_upper, add);  // ✅ Use blocked version
 }
 
 

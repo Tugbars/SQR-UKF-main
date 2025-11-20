@@ -73,31 +73,6 @@ static double relative_error(const float *A, const float *B, uint16_t m, uint16_
 }
 
 /**
- * @brief Print matrix for debugging
- */
-static void print_matrix_debug(const char *name, const float *M,
-                               uint16_t rows, uint16_t cols, uint16_t max_display)
-{
-    printf("%s (%dx%d):\n", name, rows, cols);
-    uint16_t display_rows = MIN(rows, max_display);
-    uint16_t display_cols = MIN(cols, max_display);
-
-    for (uint16_t i = 0; i < display_rows; i++)
-    {
-        for (uint16_t j = 0; j < display_cols; j++)
-        {
-            printf("%8.4f ", M[i * cols + j]);
-        }
-        if (cols > max_display)
-            printf("...");
-        printf("\n");
-    }
-    if (rows > max_display)
-        printf("...\n");
-    printf("\n");
-}
-
-/**
  * @brief Generate random symmetric positive definite matrix via A*A^T
  */
 static void generate_spd_matrix(float *A, uint16_t n, unsigned int seed)

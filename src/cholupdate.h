@@ -555,6 +555,7 @@ int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
                            const float *restrict X,
                            uint16_t n, uint16_t k,
                            bool is_upper, int add);
+                           
 
 //==============================================================================
 // USAGE RECOMMENDATIONS
