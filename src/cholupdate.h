@@ -390,6 +390,171 @@ int cholupdatek_blas3(float *restrict L_or_U,
                       const float *restrict X,
                       uint16_t n, uint16_t k,
                       bool is_upper, int add);
+//==============================================================================
+// WORKSPACE-BASED API (RECOMMENDED FOR HOT PATHS)
+//==============================================================================
+
+/**
+ * @brief Smart rank-k Cholesky update with automatic algorithm selection
+ *
+ * @param ws Pre-allocated workspace (must be sized for n, k)
+ * @param L_or_U In-place Cholesky factor (n×n, row-major)
+ * @param X Update matrix (n×k, row-major)
+ * @param n Matrix dimension (must be ≤ ws->n_max)
+ * @param k Rank of update (must be ≤ ws->k_max)
+ * @param is_upper True for upper-triangular (U^T U), false for lower (L L^T)
+ * @param add +1 for update (add X X^T), -1 for downdate (subtract X X^T)
+ *
+ * @return 0 on success, negative errno on failure:
+ *         -EINVAL: Invalid arguments (NULL pointers, n=0, invalid add)
+ *         -EOVERFLOW: Dimensions exceed workspace capacity
+ *         -EDOM: Downdate would make matrix indefinite
+ *         -ENOMEM: Internal allocation failure (QR workspace)
+ *
+ * @details
+ * **Algorithm selection heuristics:**
+ * - k=1: Always use specialized rank-1 kernel (optimal)
+ * - k<8 or n<32: Use tiled rank-1 (good cache, low overhead)
+ * - k≥8 and n≥32: Use blocked QR (BLAS-3 efficiency wins)
+ * - Decision considers QR's adaptive block size selection
+ *
+ * **Performance characteristics:**
+ * - Rank-1 path: ~2-4 GFLOPS (SIMD-optimized, cache-friendly)
+ * - QR path: ~15-25 GFLOPS (GEMM-dominated, BLAS-3)
+ * - Crossover: k≈8 where QR overhead is compensated by GEMM speed
+ *
+ * **Memory:**
+ * - ZERO allocations in hot path (all buffers from workspace)
+ * - Workspace must be sized for max(n, k) you'll use
+ * - Thread-safe if each thread has own workspace
+ *
+ * **Numerical stability:**
+ * - Updates use hyperbolic rotations (Givens-like)
+ * - QR uses Householder reflections (LAPACK-quality)
+ * - Both methods maintain positive definiteness rigorously
+ * - Downdates check for indefiniteness and fail safely (-EDOM)
+ *
+ * @example
+ * @code
+ * // Allocate workspace once
+ * cholupdate_workspace *ws = cholupdate_workspace_alloc(64, 16);
+ * 
+ * // Rank-1 update: adds x*x^T to L*L^T
+ * float x[64];
+ * cholupdatek_auto_ws(ws, L, x, 64, 1, false, +1);
+ * 
+ * // Rank-8 update: adds X*X^T to L*L^T (will use QR path)
+ * float X[64*8];
+ * cholupdatek_auto_ws(ws, L, X, 64, 8, false, +1);
+ * 
+ * // Rank-4 downdate: subtracts X*X^T from L*L^T
+ * int rc = cholupdatek_auto_ws(ws, L, X, 64, 4, false, -1);
+ * if (rc == -EDOM) {
+ *     printf("Downdate failed: matrix would become indefinite\n");
+ * }
+ * 
+ * cholupdate_workspace_free(ws);
+ * @endcode
+ *
+ * @note **RECOMMENDED API** for performance-critical code
+ * @note HOT PATH: Zero allocations, optimal algorithm selection
+ * @note Reuse workspace across calls for maximum efficiency
+ * @note L_or_U is modified in-place (overwritten with new factor)
+ */
+int cholupdatek_auto_ws(cholupdate_workspace *ws,
+                        float *restrict L_or_U,
+                        const float *restrict X,
+                        uint16_t n, uint16_t k,
+                        bool is_upper, int add);
+
+/**
+ * @brief Tiled rank-k update (explicit algorithm selection)
+ *
+ * @param ws Pre-allocated workspace
+ * @param L In-place Cholesky factor (n×n)
+ * @param X Update matrix (n×k, row-major)
+ * @param n Matrix dimension (must be ≤ ws->n_max)
+ * @param k Rank of update (must be ≤ ws->k_max)
+ * @param is_upper True for upper-triangular, false for lower
+ * @param add +1 for update, -1 for downdate
+ *
+ * @return 0 on success, negative errno on failure
+ *
+ * @details
+ * Forces use of tiled rank-1 algorithm regardless of k.
+ * Useful for:
+ * - Benchmarking (compare tiled vs QR)
+ * - Small k where tiling is optimal
+ * - Avoiding QR overhead for specific use cases
+ *
+ * **When to use:**
+ * - k < 8: Tiled is typically optimal
+ * - Small matrices (n < 32): Lower overhead than QR
+ * - Cache-sensitive applications: Better locality than QR setup
+ *
+ * **When NOT to use:**
+ * - k ≥ 8 on reasonably sized matrices: QR is faster
+ * - Most applications: Use cholupdatek_auto_ws() instead
+ *
+ * @note Use cholupdatek_auto_ws() unless you have specific reasons
+ * @note Algorithm: k sequential rank-1 updates, tiled for cache
+ * @note Cost: O(n²k), dominated by SIMD rank-1 kernel
+ */
+int cholupdatek_ws(cholupdate_workspace *ws,
+                   float *restrict L,
+                   const float *restrict X,
+                   uint16_t n, uint16_t k,
+                   bool is_upper, int add);
+
+/**
+ * @brief Blocked QR rank-k update (explicit algorithm selection)
+ *
+ * @param ws Pre-allocated workspace (must include QR workspace)
+ * @param L_or_U In-place Cholesky factor (n×n)
+ * @param X Update matrix (n×k, row-major)
+ * @param n Matrix dimension (must be ≤ ws->n_max)
+ * @param k Rank of update (must be > 0 and ≤ ws->k_max)
+ * @param is_upper True for upper-triangular, false for lower
+ * @param add +1 for update, -1 for downdate
+ *
+ * @return 0 on success, negative errno on failure
+ *
+ * @details
+ * Forces use of blocked QR algorithm regardless of k.
+ * Useful for:
+ * - Benchmarking (compare QR vs tiled)
+ * - Large k where QR is optimal (k ≥ 8)
+ * - Testing QR path explicitly
+ *
+ * **Algorithm:**
+ * 1. Build augmented matrix M = [U | ±X]
+ * 2. Compute QR decomposition M = QR (GEMM-accelerated)
+ * 3. Extract new Cholesky factor from R[1:n, 1:n]
+ *
+ * **Performance:**
+ * - Cost: O(n²(n+k)) operations, GEMM-dominated
+ * - Throughput: ~15-25 GFLOPS on modern CPUs
+ * - Best for: k ≥ 8 and n ≥ 32
+ *
+ * **When to use:**
+ * - Testing/benchmarking QR path
+ * - k ≥ 8: QR typically faster than tiled
+ * - Known to be optimal for your problem size
+ *
+ * **When NOT to use:**
+ * - k < 8: Tiled is usually faster
+ * - Small matrices (n < 32): QR overhead dominates
+ * - Most applications: Use cholupdatek_auto_ws() instead
+ *
+ * @note Use cholupdatek_auto_ws() unless you have specific reasons
+ * @note Requires workspace with k_max > 0 (QR buffers allocated)
+ * @note k=1 works but is inefficient (use tiled path instead)
+ */
+int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
+                           float *restrict L_or_U,
+                           const float *restrict X,
+                           uint16_t n, uint16_t k,
+                           bool is_upper, int add);
 
 //==============================================================================
 // USAGE RECOMMENDATIONS
