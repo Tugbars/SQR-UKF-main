@@ -1597,6 +1597,40 @@ static int apply_block_reflector_clean(
 }
 
 
+/**
+ * @brief Apply block reflector to strided matrix C
+ * 
+ * **Purpose:** Handle C with non-trivial stride (common in trailing updates)
+ * 
+ * **Difference from _clean version:**
+ * - _clean: C is contiguous (stride = N), can use GEMM directly
+ * - _strided: C has stride ldc ≠ N, need strided GEMM or naive fallback
+ * 
+ * **Implementation:**
+ * Uses naive_gemm_strided() which handles arbitrary strides
+ * Slower than optimized GEMM but necessary for correctness
+ * 
+ * **When This Is Needed:**
+ * - Trailing matrix updates where C is submatrix of larger matrix
+ * - Q formation where working on columns of Q with spacing
+ * 
+ * @param[in,out] C      Matrix to update [M × N], stride ldc
+ * @param[in]     Y      Householder vectors [M × IB], stride ldy
+ * @param[in]     T      Compact WY factor [IB × IB]
+ * @param[in]     m      Number of rows
+ * @param[in]     n      Number of columns
+ * @param[in]     ib     Number of reflectors
+ * @param[in]     ldc    Leading dimension of C
+ * @param[in]     ldy    Leading dimension of Y
+ * @param[out]    Z      Workspace [IB × N]
+ * @param[out]    Z_temp Workspace [IB × N]
+ * @param[out]    YT     Workspace [IB × M]
+ * 
+ * @return 0 on success
+ * 
+ * @note Uses strided GEMM (slower than contiguous case)
+ * @note Consider copying C to contiguous buffer if called repeatedly
+ */
 static int apply_block_reflector_strided(
     float *restrict C,
     const float *restrict Y,
@@ -1608,39 +1642,45 @@ static int apply_block_reflector_strided(
     float *restrict Z_temp,
     float *restrict YT)
 {
-    // Transpose Y: YT[ib × m]
+    //==========================================================================
+    // Transpose Y: YT[IB × M]
+    //==========================================================================
+    
     for (uint16_t i = 0; i < ib; ++i)
         for (uint16_t j = 0; j < m; ++j)
             YT[i * m + j] = Y[j * ldy + i];
 
-    // ✅ Z = Y^T * C using strided GEMM
-    // Y is m×ib with stride ldy, C is m×n with stride ldc
-    // We need Y^T * C = [ib×m] × [m×n] = [ib×n]
+    //==========================================================================
+    // Z = Yᵀ·C using strided GEMM
+    //==========================================================================
+    // YT is contiguous [IB × M], C has stride ldc
     
-    // Since YT is already transposed and contiguous, use it directly
     naive_gemm_strided(Z, YT, C, 
-                          ib, m, n,           // logical dimensions
-                          n, m, ldc,          // strides: Z is ib×n, YT is ib×m, C has stride ldc
-                          1.0f, 0.0f);
+                      ib, m, n,
+                      n, m, ldc,
+                      1.0f, 0.0f);
 
-    // ✅ Z_temp = T * Z (both contiguous)
+    //==========================================================================
+    // Z_temp = T·Z (both contiguous)
+    //==========================================================================
+    
     naive_gemm_strided(Z_temp, T, Z,
                       ib, ib, n,
-                      n, ib, n,              // all contiguous
+                      n, ib, n,
                       1.0f, 0.0f);
     
-
-    // ✅ C = C - Y * Z_temp using strided GEMM
-    // Y is m×ib with stride ldy, Z_temp is ib×n (contiguous)
-    // C is m×n with stride ldc
+    //==========================================================================
+    // C = C - Y·Z_temp using strided GEMM
+    //==========================================================================
+    // Y has stride ldy, C has stride ldc, Z_temp is contiguous
+    
     naive_gemm_strided(C, Y, Z_temp,
                       m, ib, n,
-                      ldc, ldy, n,           // C has stride ldc, Y has stride ldy
+                      ldc, ldy, n,
                       -1.0f, 1.0f);
     
     return 0;
 }
-
 
 //==============================================================================
 // LEFT-LOOKING BLOCKED QR FACTORIZATION
