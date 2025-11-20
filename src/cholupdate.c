@@ -298,7 +298,7 @@ static int cholupdate_rank1_core(float *restrict L,
     const float sign = (add >= 0) ? 1.0f : -1.0f;
 
 #if LINALG_SIMD_ENABLE
-    const int use_avx = linalg_has_avx2() && n >= (uint32_t)CHOLK_AVX_MIN_N;
+    const int use_avx =  n >= (uint32_t)CHOLK_AVX_MIN_N;
 #else
     const int use_avx = 0;
 #endif
@@ -967,19 +967,6 @@ int cholupdatek_ws(cholupdate_workspace *ws,
     return cholupdatek_tiled_ws(ws, L, X, n, k, is_upper, add);
 }
 
-/**
- * @brief Blocked QR update (explicit path selection)
- *
- * @note Use cholupdatek_auto_ws() unless you have specific reasons
- */
-int cholupdatek_blockqr_ws(cholupdate_workspace *ws,
-                           float *restrict L_or_U,
-                           const float *restrict X,
-                           uint16_t n, uint16_t k,
-                           bool is_upper, int add)
-{
-    return cholupdatek_blockqr_ws(ws, L_or_U, X, n, k, is_upper, add);
-}
 
 //==============================================================================
 // LEGACY API (BACKWARD COMPATIBLE - ALLOCATES TEMPORARY WORKSPACE)
