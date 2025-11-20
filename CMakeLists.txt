@@ -13,6 +13,7 @@ message(STATUS "=== SQR-UKF Root Configuration ===")
 
 option(BUILD_GEMM_TESTS "Build GEMM test suite" ON)
 option(BUILD_QR_TESTS "Build QR test suite" ON)
+option(BUILD_CHOLUPDATE_TESTS "Build Cholesky Update test suite" ON)
 
 # ============================================================================
 # CONDITIONAL SUBDIRECTORIES
@@ -32,12 +33,20 @@ else()
     message(STATUS ">>> QR tests DISABLED")
 endif()
 
+if(BUILD_CHOLUPDATE_TESTS)
+    message(STATUS ">>> Adding Cholesky Update tests subdirectory")
+    add_subdirectory(cholesky_test)
+else()
+    message(STATUS ">>> Cholesky Update tests DISABLED")
+endif()
+
 # ============================================================================
 # SUMMARY
 # ============================================================================
 
 message(STATUS "========================================")
 message(STATUS "Build configuration:")
-message(STATUS "  GEMM tests: ${BUILD_GEMM_TESTS}")
-message(STATUS "  QR tests:   ${BUILD_QR_TESTS}")
+message(STATUS "  GEMM tests:       ${BUILD_GEMM_TESTS}")
+message(STATUS "  QR tests:         ${BUILD_QR_TESTS}")
+message(STATUS "  CholUpdate tests: ${BUILD_CHOLUPDATE_TESTS}")
 message(STATUS "========================================")
