@@ -37,6 +37,16 @@
 #define CHOLK_MM256_STORE_PS(ptr, val) _mm256_storeu_ps(ptr, val)
 #endif
 
+// At top of file, after includes:
+static inline uint16_t choose_block_size(uint16_t n)
+{
+    if (n < 256) return 64;        // L1-friendly
+    if (n < 512) return 128;       // L2-friendly
+    if (n < 1024) return 192;      // L2/L3 boundary
+    if (n < 2048) return 256;      // Streaming from L3
+    return 384;                    // Large, amortize overhead
+}
+
 #if __AVX2__
 /**
  * @brief 8x8 matrix transpose in AVX2 registers
@@ -212,10 +222,21 @@ static int cholupdate_rank1_update(float *restrict L,
 
     for (uint32_t j = 0; j < n; ++j)
     {
+        // ✅ IMPROVED: More aggressive prefetching
         if (j + 4 < n)
         {
             const size_t prefetch_idx = (size_t)(j + 4) * n + (j + 4);
             _mm_prefetch((const char *)&L[prefetch_idx], _MM_HINT_T0);
+        }
+        
+        // ✅ NEW: Prefetch the row/column we're about to process
+        if (j + 1 < n)
+        {
+            const size_t prefetch_work = is_upper ? (size_t)j * n + (j + 8)
+                                                  : (size_t)(j + 8) * n + j;
+            if (j + 8 < n)
+                _mm_prefetch((const char *)&L[prefetch_work], _MM_HINT_T0);
+            _mm_prefetch((const char *)&x[j + 1], _MM_HINT_T0);
         }
 
         const size_t dj = (size_t)j * n + j;
@@ -235,8 +256,8 @@ static int cholupdate_rank1_update(float *restrict L,
 
         L[dj] = r;
 
-        if (xj == 0.0f)
-            continue;
+        // ✅ REMOVED: if (xj == 0.0f) continue;
+        // When xj=0, s=0 and update is harmless (Lkj'=Lkj, xk'=xk)
 
         if (!use_avx || (j + 8 >= n))
         {
@@ -268,10 +289,10 @@ static int cholupdate_rank1_update(float *restrict L,
         }
 #endif
 
+        // ✅ HOISTED: Compute c_v/s_v ONCE per column (not inside branches)
         const __m256 c_v = _mm256_set1_ps(c);
         const __m256 s_v = _mm256_set1_ps(s);
 
-        // ✅ OPTIMIZED: Different strategies for upper vs lower triangular
         if (is_upper)
         {
             for (; k + 7 < n; k += 8)
@@ -289,7 +310,6 @@ static int cholupdate_rank1_update(float *restrict L,
         }
         else
         {
-            // ✅ Lower triangular: 8x8 register transpose
             if (j + 8 <= n)
             {
                 for (; k + 7 < n; k += 8)
@@ -757,16 +777,6 @@ static inline int choose_cholupdate_method(uint16_t n, uint16_t k, int add)
 // CACHE-BLOCKED TILED RANK-K (FOR n ≥ 256)
 //==============================================================================
 
-/**
- * @brief Row-blocked rank-1 update with AVX2 vectorization within blocks
- * 
- * Processes rows in cache-friendly blocks while using SIMD for throughput
- */
-/**
- * @brief Row-blocked rank-1 update with AVX2 vectorization within blocks
- * 
- * Processes rows in cache-friendly blocks while using SIMD for throughput
- */
 static int cholupdate_rank1_update_blocked(float *restrict L,
                                            float *restrict x,
                                            uint16_t n,
@@ -781,11 +791,21 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
 
     for (uint32_t j = 0; j < n; ++j)
     {
-        // Prefetch ahead
+        // ✅ IMPROVED: More aggressive prefetching
         if (j + 4 < n)
         {
             const size_t prefetch_idx = (size_t)(j + 4) * n + (j + 4);
             _mm_prefetch((const char *)&L[prefetch_idx], _MM_HINT_T0);
+        }
+        
+        // ✅ NEW: Prefetch the row/column we're about to process
+        if (j + 1 < n)
+        {
+            const size_t prefetch_work = is_upper ? (size_t)j * n + (j + 8)
+                                                  : (size_t)(j + 8) * n + j;
+            if (j + 8 < n)
+                _mm_prefetch((const char *)&L[prefetch_work], _MM_HINT_T0);
+            _mm_prefetch((const char *)&x[j + 1], _MM_HINT_T0);
         }
 
         const size_t dj = (size_t)j * n + j;
@@ -805,24 +825,27 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
 
         L[dj] = r;
 
-        if (xj == 0.0f)
-            continue;
+        // ✅ REMOVED: if (xj == 0.0f) continue;
+        // When xj=0, s=0 and update is harmless (Lkj'=Lkj, xk'=xk)
 
         const uint32_t n_remain = n - j - 1;
         
-        // ✅ BLOCKED + VECTORIZED: Process in cache-friendly blocks with AVX2
+        // ✅ HOISTED: Compute c_v/s_v ONCE per column (not per block)
+#if __AVX2__
+        const __m256 c_v = _mm256_set1_ps(c);
+        const __m256 s_v = _mm256_set1_ps(s);
+#endif
+        
         for (uint32_t b0 = 0; b0 < n_remain; b0 += block_size)
         {
             const uint32_t bend = (b0 + block_size <= n_remain) ? (b0 + block_size) : n_remain;
             uint32_t k = j + 1 + b0;
             const uint32_t k_end = j + 1 + bend;
             
-            // ✅ AVX2 path within block
             if (use_avx)
             {
 #if __AVX2__
 #if CHOLK_USE_ALIGNED_SIMD
-                // Align to 32-byte boundary within this block
                 while ((k < k_end) && ((uintptr_t)(&x[k]) & 31u))
                 {
                     const size_t off = is_upper ? (size_t)j * n + k
@@ -835,12 +858,10 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
                 }
 #endif
 
-                const __m256 c_v = _mm256_set1_ps(c);
-                const __m256 s_v = _mm256_set1_ps(s);
+                // ✅ NOTE: c_v and s_v already computed above, reused here
 
                 if (is_upper)
                 {
-                    // Upper triangular: contiguous loads/stores
                     for (; k + 7 < k_end; k += 8)
                     {
                         float *baseL = &L[(size_t)j * n + k];
@@ -856,7 +877,6 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
                 }
                 else
                 {
-                    // Lower triangular: 8x8 register transpose
                     if (j + 8 <= n)
                     {
                         for (; k + 7 < k_end; k += 8)
@@ -895,12 +915,10 @@ static int cholupdate_rank1_update_blocked(float *restrict L,
                             _mm256_storeu_ps(base + 7 * n, r7);
                         }
                     }
-                    // else: let scalar tail handle edge case
                 }
 #endif
             }
             
-            // ✅ Scalar tail (remainder within block)
             for (; k < k_end; ++k)
             {
                 const size_t off = is_upper ? (size_t)j * n + k
@@ -978,7 +996,7 @@ static int cholupdatek_tiled_ws_blocked(cholupdate_workspace *ws,
     }
     
     // For large matrices, use blocked version
-    const uint16_t BLOCK_SIZE = 128;  // L2 cache-sized block (~64KB)
+    const uint16_t BLOCK_SIZE = choose_block_size(n);
     const uint16_t T = (CHOLK_COL_TILE == 0) ? 32 : (uint16_t)CHOLK_COL_TILE;
     float *xbuf = ws->xbuf;
 
