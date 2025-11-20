@@ -1705,62 +1705,59 @@ static int apply_block_reflector_strided(
 static int apply_stored_block_to_panel(
     qr_workspace *ws,
     float *A,
-    uint16_t panel_col,
-    uint16_t panel_width,
-    uint16_t block_idx,
     uint16_t m,
     uint16_t n,
-    uint16_t kmax)
+    uint16_t panel_col,
+    uint16_t blk_idx)
 {
-    // Compute dimensions of the stored block
-    uint16_t blk_k = block_idx * ws->ib;
-    uint16_t blk_size = MIN(ws->ib, kmax - blk_k);
-    uint16_t blk_rows_below = m - blk_k;
-    
-    // The reflector affects rows [blk_k : m-1]
-    // The panel spans columns [panel_col : panel_col+panel_width-1]
-    // So we update A[blk_k:m-1, panel_col:panel_col+panel_width-1]
-    
-    uint16_t update_rows = blk_rows_below;
-    uint16_t update_cols = panel_width;
-    
-    if (update_rows == 0 || update_cols == 0)
+    if (!ws->Y_stored || !ws->T_stored)
+        return -EINVAL;
+
+    uint16_t blk_k = blk_idx * ws->ib;
+    if (blk_k >= m)
         return 0;
+
+    uint16_t blk_size = MIN(ws->ib, MIN(m, n) - blk_k);
+    uint16_t blk_rows_below = m - blk_k;
+    uint16_t update_rows = blk_rows_below;
+    uint16_t update_cols = MIN(ws->ib, n - panel_col);
+
+    if (update_cols == 0)
+        return 0;
+
+    size_t y_offset = blk_idx * ws->Y_block_stride;
+    size_t t_offset = blk_idx * ws->T_block_stride;
+
+    //==========================================================================
+    // ✅ FIX: Build Y_sub at correct offset (no leading zeros needed)
+    //==========================================================================
+    // Y_sub is update_rows × ib, directly aligned with panel rows
     
-    // Load stored Y and T for this block
-    size_t y_offset = block_idx * ws->Y_block_stride;
-    size_t t_offset = block_idx * ws->T_block_stride;
+    float *Y_sub = ws->Y;  // Reuse ws->Y buffer, but as local matrix
     
-    // Y is stored in packed format: [blk_rows_below × blk_size]
-    // We need to load it into ws->Y with proper layout
-    memset(ws->Y, 0, (size_t)m * ws->ib * sizeof(float));
-    
+    // Copy reflectors directly to start of buffer (no offset)
     for (uint16_t i = 0; i < blk_rows_below; ++i)
         for (uint16_t j = 0; j < blk_size; ++j)
-            ws->Y[(blk_k + i) * ws->ib + j] = 
-                ws->Y_stored[y_offset + i * blk_size + j];
-    
+            Y_sub[i * ws->ib + j] = ws->Y_stored[y_offset + i * blk_size + j];
+
     // Load T matrix
-    memcpy(ws->T, &ws->T_stored[t_offset],
-           blk_size * blk_size * sizeof(float));
-    
-    // Apply block reflector to panel: A[blk_k:m, panel_col:panel_col+width]
-    // This is a strided GEMM operation because the panel is within A
-    
+    memcpy(ws->T, &ws->T_stored[t_offset], blk_size * blk_size * sizeof(float));
+
+    // Apply block reflector
     float *panel_ptr = &A[blk_k * n + panel_col];
-    
+
     return apply_block_reflector_strided(
-        panel_ptr,           // Panel to update (strided within A)
-        ws->Y,               // Householder vectors [m × blk_size]
-        ws->T,               // T matrix [blk_size × blk_size]
-        update_rows,         // Number of rows to update
-        update_cols,         // Number of columns in panel
-        blk_size,            // Block size
-        n,                   // Stride of panel (columns in A)
-        ws->ib,              // Stride of Y
-        ws->Z,               // Workspace
-        ws->Z_temp,          // Workspace
-        ws->YT);             // Workspace
+    panel_ptr,      // C: pointer to panel (same)
+    Y_sub,          // Y: pointer to LOCAL buffer (row 0 aligned) ✅
+    ws->T,
+    update_rows,    // m (same)
+    update_cols,    // n (same)
+    blk_size,       // ib (same)
+    n,              // ldc (same)
+    ws->ib,         // ldy (same)
+    ws->Z,
+    ws->Z_temp,
+    ws->YT);
 }
 
 /**
@@ -1794,19 +1791,20 @@ static int qr_factor_blocked_left_looking(qr_workspace *ws, float *A,
         //======================================================================
         // LEFT-LOOKING STEP: Apply all previous block reflectors to panel k
         //======================================================================
-        
+
         for (uint16_t prev_blk = 0; prev_blk < block_count; prev_blk++)
-        {
-            int ret = apply_stored_block_to_panel(
-                ws, A,
-                k,              // Panel starts at column k
-                block_size,     // Panel width
-                prev_blk,       // Which previous block to apply
-                m, n, kmax);
-            
-            if (ret != 0)
-                return ret;
-        }
+{
+    int ret = apply_stored_block_to_panel(
+        ws,
+        A,
+        m,
+        n,
+        k,         // ✅ Current panel column position
+        prev_blk); // ✅ Which previous block to apply
+
+    if (ret != 0)
+        return ret;
+}
 
         //======================================================================
         // Factor the updated panel

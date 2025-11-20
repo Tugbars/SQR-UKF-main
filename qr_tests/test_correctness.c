@@ -1055,6 +1055,259 @@ cleanup:
     return passed;
 }
 
+/**
+ * @brief Test left-looking algorithm (1 block, 8×8)
+ */
+static int test_left_looking_single_block(void)
+{
+    printf("\n=== Testing Left-Looking QR (8×8, ib=8, 1 block) ===\n");
+    
+    const uint16_t m = 8, n = 8;
+    
+    float *A_left = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *A_right = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q_left = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *Q_right = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R_left = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *R_right = gemm_aligned_alloc(32, m * n * sizeof(float));
+    
+    if (!A_left || !A_right || !Q_left || !Q_right || !R_left || !R_right)
+    {
+        printf("  ERROR: Allocation failed\n");
+        goto cleanup;
+    }
+    
+    // Initialize well-conditioned matrix
+    srand(88888);
+    for (int i = 0; i < m * n; i++)
+    {
+        float val = ((float)(rand() % 200) - 100.0f) / 10.0f;
+        A_left[i] = val;
+        A_right[i] = val;  // Same input for both
+    }
+    
+    // Add diagonal dominance
+    for (int i = 0; i < 8; i++)
+    {
+        A_left[i * 8 + i] += 10.0f;
+        A_right[i * 8 + i] += 10.0f;
+    }
+    
+    // Save original
+    float A_orig[64];
+    memcpy(A_orig, A_left, sizeof(A_orig));
+    
+    // Allocate workspace with ib=8 (single block) and reflector storage
+    qr_workspace *ws = qr_workspace_alloc_ex(m, n, 8, true);
+    if (!ws)
+    {
+        printf("  ERROR: Workspace allocation failed\n");
+        goto cleanup;
+    }
+    
+    printf("  Running LEFT-LOOKING QR (ib=8)...\n");
+    int ret_left = qr_ws_blocked_inplace_ex(ws, A_left, Q_left, R_left, 
+                                            m, n, false, true);
+    
+    if (ret_left != 0)
+    {
+        printf("  ERROR: Left-looking QR failed with code %d\n", ret_left);
+        qr_workspace_free(ws);
+        goto cleanup;
+    }
+    
+    printf("  Running RIGHT-LOOKING QR (ib=8) for comparison...\n");
+    int ret_right = qr_ws_blocked_inplace_ex(ws, A_right, Q_right, R_right,
+                                             m, n, false, false);
+    
+    if (ret_right != 0)
+    {
+        printf("  ERROR: Right-looking QR failed with code %d\n", ret_right);
+        qr_workspace_free(ws);
+        goto cleanup;
+    }
+    
+    qr_workspace_free(ws);
+    
+    // Verify both algorithms
+    int passed = 1;
+    
+    printf("\n  LEFT-LOOKING verification:\n");
+    passed &= is_upper_triangular(R_left, m, n, 1e-5);
+    passed &= check_orthogonality(Q_left, m, 1e-5, "Left-looking 8×8");
+    passed &= check_reconstruction(A_orig, Q_left, R_left, m, n, 1e-4, "Left-looking 8×8");
+    
+    printf("\n  RIGHT-LOOKING verification:\n");
+    passed &= check_reconstruction(A_orig, Q_right, R_right, m, n, 1e-4, "Right-looking 8×8");
+    
+    // Compare R matrices (should be very close, allowing for sign differences)
+    printf("\n  Comparing R matrices (left vs right)...\n");
+    double r_diff = 0.0;
+    for (int i = 0; i < m * n; i++)
+    {
+        double diff = fabs(R_left[i]) - fabs(R_right[i]);
+        r_diff += diff * diff;
+    }
+    r_diff = sqrt(r_diff);
+    
+    printf("  ||abs(R_left) - abs(R_right)||_F = %.6e\n", r_diff);
+    
+    if (r_diff > 1e-3)
+    {
+        printf("  WARNING: R matrices differ significantly!\n");
+        passed = 0;
+    }
+    
+cleanup:
+    gemm_aligned_free(A_left);
+    gemm_aligned_free(A_right);
+    gemm_aligned_free(Q_left);
+    gemm_aligned_free(Q_right);
+    gemm_aligned_free(R_left);
+    gemm_aligned_free(R_right);
+    
+    return passed;
+}
+
+/**
+ * @brief Test left-looking algorithm (2 blocks, 8×8)
+ */
+static int test_left_looking_two_blocks(void)
+{
+    printf("\n=== Testing Left-Looking QR (8×8, ib=4, 2 blocks) ===\n");
+    
+    const uint16_t m = 8, n = 8;
+    
+    float *A_left = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *A_right = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *Q_left = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *Q_right = gemm_aligned_alloc(32, m * m * sizeof(float));
+    float *R_left = gemm_aligned_alloc(32, m * n * sizeof(float));
+    float *R_right = gemm_aligned_alloc(32, m * n * sizeof(float));
+    
+    if (!A_left || !A_right || !Q_left || !Q_right || !R_left || !R_right)
+    {
+        printf("  ERROR: Allocation failed\n");
+        goto cleanup;
+    }
+    
+    // Initialize well-conditioned matrix
+    srand(99999);
+    for (int i = 0; i < m * n; i++)
+    {
+        float val = ((float)(rand() % 200) - 100.0f) / 10.0f;
+        A_left[i] = val;
+        A_right[i] = val;
+    }
+    
+    // Add diagonal dominance
+    for (int i = 0; i < 8; i++)
+    {
+        A_left[i * 8 + i] += 10.0f;
+        A_right[i * 8 + i] += 10.0f;
+    }
+    
+    // Save original
+    float A_orig[64];
+    memcpy(A_orig, A_left, sizeof(A_orig));
+    
+    // Allocate workspace with ib=4 (two blocks) and reflector storage
+    qr_workspace *ws = qr_workspace_alloc_ex(m, n, 4, true);
+    if (!ws)
+    {
+        printf("  ERROR: Workspace allocation failed\n");
+        goto cleanup;
+    }
+    
+    printf("  Running LEFT-LOOKING QR (ib=4, 2 blocks)...\n");
+    printf("  Block 0: columns 0-3\n");
+    printf("  Block 1: columns 4-7 (applies reflectors from block 0 first)\n");
+    
+    int ret_left = qr_ws_blocked_inplace_ex(ws, A_left, Q_left, R_left,
+                                            m, n, false, true);
+    
+    if (ret_left != 0)
+    {
+        printf("  ERROR: Left-looking QR failed with code %d\n", ret_left);
+        qr_workspace_free(ws);
+        goto cleanup;
+    }
+    
+    printf("  Running RIGHT-LOOKING QR (ib=4, 2 blocks) for comparison...\n");
+    int ret_right = qr_ws_blocked_inplace_ex(ws, A_right, Q_right, R_right,
+                                             m, n, false, false);
+    
+    if (ret_right != 0)
+    {
+        printf("  ERROR: Right-looking QR failed with code %d\n", ret_right);
+        qr_workspace_free(ws);
+        goto cleanup;
+    }
+    
+    qr_workspace_free(ws);
+    
+    // Verify both algorithms
+    int passed = 1;
+    
+    printf("\n  LEFT-LOOKING verification:\n");
+    passed &= is_upper_triangular(R_left, m, n, 1e-5);
+    passed &= check_orthogonality(Q_left, m, 1e-5, "Left-looking 2-block");
+    passed &= check_reconstruction(A_orig, Q_left, R_left, m, n, 1e-4, "Left-looking 2-block");
+    
+    printf("\n  RIGHT-LOOKING verification:\n");
+    passed &= check_reconstruction(A_orig, Q_right, R_right, m, n, 1e-4, "Right-looking 2-block");
+    
+    // Compare R matrices
+    printf("\n  Comparing R matrices (left vs right)...\n");
+    double r_diff = 0.0;
+    for (int i = 0; i < m * n; i++)
+    {
+        double diff = fabs(R_left[i]) - fabs(R_right[i]);
+        r_diff += diff * diff;
+    }
+    r_diff = sqrt(r_diff);
+    
+    printf("  ||abs(R_left) - abs(R_right)||_F = %.6e\n", r_diff);
+    
+    if (r_diff > 1e-3)
+    {
+        printf("  WARNING: R matrices differ significantly!\n");
+        
+        // Debug: show differences
+        printf("\n  R_left (first 4x4):\n");
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                printf("%8.4f ", R_left[i * 8 + j]);
+            }
+            printf("\n");
+        }
+        
+        printf("\n  R_right (first 4x4):\n");
+        for (int i = 0; i < 4; i++)
+        {
+            for (int j = 0; j < 4; j++)
+            {
+                printf("%8.4f ", R_right[i * 8 + j]);
+            }
+            printf("\n");
+        }
+        
+        passed = 0;
+    }
+    
+cleanup:
+    gemm_aligned_free(A_left);
+    gemm_aligned_free(A_right);
+    gemm_aligned_free(Q_left);
+    gemm_aligned_free(Q_right);
+    gemm_aligned_free(R_left);
+    gemm_aligned_free(R_right);
+    
+    return passed;
+}
+
 //==============================================================================
 // MAIN TEST RUNNER
 //==============================================================================
@@ -1197,6 +1450,20 @@ int run_qr_tests(test_results_t *results)
         results->failed++;
         printf("✗ Reference comparison FAILED\n");
     }
+
+    results->total++;
+    if (test_left_looking_single_block())
+    {
+        results->passed++;
+        printf("✓ Left-looking single block test PASSED\n");
+    }
+    else
+    {
+        results->failed++;
+        printf("✗ Left-looking single block test FAILED\n");
+    }
+
+
 
     printf("\n=================================================\n");
     printf("QR Tests: %d/%d passed\n", results->passed, results->total);
