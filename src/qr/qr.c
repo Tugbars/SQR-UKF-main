@@ -20,7 +20,63 @@
 static void build_T_matrix(const float *Y, const float *tau, float *T,
                            uint16_t m, uint16_t ib, uint16_t ldy);
 
-#define GEMM_CALL gemm_dynamic
+                           //==============================================================================
+// NAIVE CONTIGUOUS GEMM (for debugging)
+//==============================================================================
+
+/**
+ * @brief Naive contiguous GEMM: C = alpha*A*B + beta*C
+ * 
+ * Assumes all matrices are contiguous (row-major, stride = n)
+ * 
+ * @param C Output matrix [m × n]
+ * @param A Input matrix [m × k]
+ * @param B Input matrix [k × n]
+ * @param m Number of rows in A and C
+ * @param k Number of columns in A, rows in B
+ * @param n Number of columns in B and C
+ * @param alpha Scalar for A*B
+ * @param beta Scalar for C
+ */
+static int naive_gemm_contiguous(
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
+    uint16_t m, uint16_t k, uint16_t n,
+    float alpha, float beta)
+{
+    // C = beta * C
+    if (beta == 0.0f)
+    {
+        for (uint16_t i = 0; i < m; ++i)
+            for (uint16_t j = 0; j < n; ++j)
+                C[i * n + j] = 0.0f;
+    }
+    else if (beta != 1.0f)
+    {
+        for (uint16_t i = 0; i < m; ++i)
+            for (uint16_t j = 0; j < n; ++j)
+                C[i * n + j] *= beta;
+    }
+
+    // C += alpha * A * B
+    for (uint16_t i = 0; i < m; ++i)
+    {
+        for (uint16_t j = 0; j < n; ++j)
+        {
+            double sum = 0.0;
+            for (uint16_t p = 0; p < k; ++p)
+            {
+                sum += (double)A[i * k + p] * (double)B[p * n + j];
+            }
+            C[i * n + j] += alpha * (float)sum;
+        }
+    }
+    
+    return 0;  // Success
+}
+
+#define GEMM_CALL naive_gemm_contiguous
 
 #ifdef MIN
 #undef MIN
@@ -30,6 +86,62 @@ static void build_T_matrix(const float *Y, const float *tau, float *T,
 #endif
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+//==============================================================================
+// NAIVE STRIDED GEMM (for debugging)
+//==============================================================================
+
+/**
+ * @brief Naive strided GEMM: C = alpha*A*B + beta*C
+ * 
+ * @param C Output matrix [m × n], stride ldc
+ * @param A Input matrix [m × k], stride lda
+ * @param B Input matrix [k × n], stride ldb
+ * @param m Number of rows in A and C
+ * @param k Number of columns in A, rows in B
+ * @param n Number of columns in B and C
+ * @param ldc Stride of C (elements between rows)
+ * @param lda Stride of A
+ * @param ldb Stride of B
+ * @param alpha Scalar for A*B
+ * @param beta Scalar for C
+ */
+static void naive_gemm_strided(
+    float *restrict C,
+    const float *restrict A,
+    const float *restrict B,
+    uint16_t m, uint16_t k, uint16_t n,
+    uint16_t ldc, uint16_t lda, uint16_t ldb,
+    float alpha, float beta)
+{
+    // C = beta * C
+    if (beta == 0.0f)
+    {
+        for (uint16_t i = 0; i < m; ++i)
+            for (uint16_t j = 0; j < n; ++j)
+                C[i * ldc + j] = 0.0f;
+    }
+    else if (beta != 1.0f)
+    {
+        for (uint16_t i = 0; i < m; ++i)
+            for (uint16_t j = 0; j < n; ++j)
+                C[i * ldc + j] *= beta;
+    }
+
+    // C += alpha * A * B
+    for (uint16_t i = 0; i < m; ++i)
+    {
+        for (uint16_t j = 0; j < n; ++j)
+        {
+            double sum = 0.0;
+            for (uint16_t p = 0; p < k; ++p)
+            {
+                sum += (double)A[i * lda + p] * (double)B[p * ldb + j];
+            }
+            C[i * ldc + j] += alpha * (float)sum;
+        }
+    }
+}
 
 //==============================================================================
 // GEMM PLAN MANAGEMENT
