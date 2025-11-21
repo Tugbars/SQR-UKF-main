@@ -8,6 +8,8 @@
  * - Vectorized TRSM for diagonal blocks (AVX2 optimized)
  * - Zero custom packing code (GEMM handles it)
  * - Clean separation: TRSM = triangular solve, GEMM = updates
+ * - ✅ FIXED: Uses gemm_strided() for correct submatrix handling
+ * - ✅ FIXED: Compatible with refactored lup() from lup_blas3.c
  *
  * ALGORITHM: LU + Blocked GETRI
  * 1. LU factorization with pivoting: A = P*L*U
@@ -29,6 +31,8 @@
 
 #include "linalg_simd.h"
 #include "../gemm/gemm.h"
+#include "../gemm/gemm_utils.h" // ✅ For gemm_aligned_alloc/free
+#include "lup_blas3.h"          // ✅ For refactored lup()
 
 #ifndef INV_NRHS_TILE
 #define INV_NRHS_TILE 128
@@ -332,13 +336,26 @@ static void forward_trsm_blocked_L(const float *restrict LU, uint16_t n,
         uint16_t m2 = (uint16_t)(n - (i0 + ib));
         if (m2 > 0)
         {
-            const float *L21 = LU + (size_t)(i0 + ib) * n + i0; // [m2 × ib]
-            const float *B1 = RHS + (size_t)i0 * jb;            // [ib × jb]
-            float *B2 = RHS + (size_t)(i0 + ib) * jb;           // [m2 × jb]
+            const float *L21 = LU + (size_t)(i0 + ib) * n + i0; // [m2 × ib], stride n
+            const float *B1 = RHS + (size_t)i0 * jb;            // [ib × jb], stride jb
+            float *B2 = RHS + (size_t)(i0 + ib) * jb;           // [m2 × jb], stride jb
 
-            // ✅ USE GEMM: B2 -= L21 * B1
+            // ✅ USE gemm_strided: B2 -= L21 * B1
             // B2[m2×jb] -= L21[m2×ib] * B1[ib×jb]
-            gemm_auto(B2, L21, B1, m2, ib, jb, -1.0f, 1.0f);
+            int rc = gemm_strided(
+                B2,    // C (output)
+                L21,   // A (submatrix of LU, stride = n)
+                B1,    // B (submatrix of RHS, stride = jb)
+                m2,    // M
+                ib,    // K
+                jb,    // N
+                jb,    // ldc (stride of RHS)
+                n,     // lda (stride of LU) ← ✅ CRITICAL!
+                jb,    // ldb (stride of RHS)
+                -1.0f, // alpha (subtract)
+                1.0f); // beta (accumulate)
+
+            (void)rc; // Error handling in production code
         }
     }
 }
@@ -390,13 +407,27 @@ static int backward_trsm_blocked_U(const float *restrict LU, uint16_t n,
         // =====================================================================
         if (i0 > 0)
         {
-            const float *U01 = LU + (size_t)0 * n + i0; // [i0 × ib]
-            const float *B1 = RHS + (size_t)i0 * jb;    // [ib × jb]
-            float *B0 = RHS + (size_t)0 * jb;           // [i0 × jb]
+            const float *U01 = LU + (size_t)0 * n + i0; // [i0 × ib], stride n
+            const float *B1 = RHS + (size_t)i0 * jb;    // [ib × jb], stride jb
+            float *B0 = RHS + (size_t)0 * jb;           // [i0 × jb], stride jb
 
-            // ✅ USE GEMM: B0 -= U01 * B1
+            // ✅ USE gemm_strided: B0 -= U01 * B1
             // B0[i0×jb] -= U01[i0×ib] * B1[ib×jb]
-            gemm_auto(B0, U01, B1, i0, ib, jb, -1.0f, 1.0f);
+            rc = gemm_strided(
+                B0,    // C (output)
+                U01,   // A (submatrix of LU, stride = n)
+                B1,    // B (submatrix of RHS, stride = jb)
+                i0,    // M
+                ib,    // K
+                jb,    // N
+                jb,    // ldc (stride of RHS)
+                n,     // lda (stride of LU) ← ✅ CRITICAL!
+                jb,    // ldb (stride of RHS)
+                -1.0f, // alpha (subtract)
+                1.0f); // beta (accumulate)
+
+            if (rc != 0)
+                return rc;
         }
     }
 
@@ -411,7 +442,7 @@ static int backward_trsm_blocked_U(const float *restrict LU, uint16_t n,
  * @brief Compute matrix inverse using LU + blocked BLAS-3 substitution
  *
  * @details Algorithm:
- * 1. Compute LU factorization with pivoting: A = P*L*U
+ * 1. Compute LU factorization with pivoting: A = P*L*U (uses refactored lup())
  * 2. For each RHS tile (columns of I):
  *    a. Apply pivots: RHS' = P * I
  *    b. Forward solve: Y = inv(L) * RHS'
@@ -432,55 +463,8 @@ int inv(float *restrict Ai_out, const float *restrict A, uint16_t n)
         return -EINVAL;
 
     // =========================================================================
-    // Small matrix fast path
+    // Allocate matrices
     // =========================================================================
-    if (n < LINALG_SMALL_N_THRESH)
-    {
-        float LU[(size_t)n * n];
-        uint8_t P[n];
-
-        if (lup(A, LU, P, n) != 0)
-            return -ENOTSUP;
-
-        const uint16_t tile = 32;
-        float *RHS = (float *)gemm_aligned_alloc(32, (size_t)n * tile * sizeof(float));
-        if (!RHS)
-            return -ENOMEM;
-
-        for (uint16_t col0 = 0; col0 < n; col0 += tile)
-        {
-            uint16_t jb = (uint16_t)((col0 + tile <= n) ? tile : (n - col0));
-
-            // Build identity tile
-            memset(RHS, 0, (size_t)n * jb * sizeof(float));
-            for (uint16_t t = 0; t < jb; ++t)
-                RHS[(size_t)(col0 + t) * jb + t] = 1.0f;
-
-            apply_pivots_to_rhs(RHS, n, jb, P);
-            forward_trsm_blocked_L(LU, n, RHS, jb);
-
-            int rc = backward_trsm_blocked_U(LU, n, RHS, jb);
-            if (rc)
-            {
-                gemm_aligned_free(RHS);
-                return rc;
-            }
-
-            // Copy tile to output
-            for (uint16_t r = 0; r < n; ++r)
-                memcpy(Ai_out + (size_t)r * n + col0,
-                       RHS + (size_t)r * jb,
-                       (size_t)jb * sizeof(float));
-        }
-
-        gemm_aligned_free(RHS);
-        return 0;
-    }
-
-    // =========================================================================
-    // General case: LU + blocked BLAS-3 with GEMM acceleration
-    // =========================================================================
-
     float *LU = (float *)gemm_aligned_alloc(32, (size_t)n * n * sizeof(float));
     uint8_t *P = (uint8_t *)gemm_aligned_alloc(32, (size_t)n * sizeof(uint8_t));
 
@@ -493,7 +477,9 @@ int inv(float *restrict Ai_out, const float *restrict A, uint16_t n)
         return -ENOMEM;
     }
 
-    // Compute LU factorization
+    // =========================================================================
+    // Compute LU factorization (uses refactored lup_blas3.c)
+    // =========================================================================
     if (lup(A, LU, P, n) != 0)
     {
         gemm_aligned_free(LU);
@@ -501,7 +487,9 @@ int inv(float *restrict Ai_out, const float *restrict A, uint16_t n)
         return -ENOTSUP;
     }
 
+    // =========================================================================
     // Allocate RHS tile buffer
+    // =========================================================================
     const uint16_t NRHS = (uint16_t)INV_NRHS_TILE;
     float *RHS = (float *)gemm_aligned_alloc(32, (size_t)n * NRHS * sizeof(float));
 
@@ -512,7 +500,9 @@ int inv(float *restrict Ai_out, const float *restrict A, uint16_t n)
         return -ENOMEM;
     }
 
+    // =========================================================================
     // Process identity matrix in tiles
+    // =========================================================================
     for (uint16_t col0 = 0; col0 < n; col0 += NRHS)
     {
         uint16_t jb = (uint16_t)((col0 + NRHS <= n) ? NRHS : (n - col0));
