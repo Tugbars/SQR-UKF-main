@@ -4,6 +4,10 @@
 #include <math.h>
 #include <stdint.h>
 
+#include "gemm.h" 
+#include "qr.h" 
+#include "cholupdate.h" 
+
 /* ================================================================
  * FEATURE TOGGLES
  * ================================================================ */
