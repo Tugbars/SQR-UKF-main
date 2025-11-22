@@ -57,9 +57,9 @@
 #include <immintrin.h>
 
 #include "linalg_simd.h"
-#include "../gemm/gemm.h"
-#include "../gemm/gemm_utils.h"
-#include "lup_blas3.h"
+#include "gemm.h"
+#include "gemm_utils.h"
+#include "lup.h"
 
 //==============================================================================
 // CONFIGURATION PARAMETERS

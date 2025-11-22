@@ -31,6 +31,7 @@
 #include <string.h>
 #include <immintrin.h>
 #include "linalg_simd.h"
+#include "tran_pack.h"
 
 #ifndef TRAN_TILE
 #define TRAN_TILE 32
@@ -172,10 +173,7 @@ void tran_tiled(float *RESTRICT At, const float *RESTRICT A, uint16_t R, uint16_
         return;
 
     const size_t TS = TRAN_TILE;
-    const size_t Rb = R & ~(size_t)7;
-    const size_t Cb = C & ~(size_t)7;
-    const size_t C4 = Cb + ((C - Cb) & ~(size_t)3);
-
+  
     for (size_t i0 = 0; i0 < R; i0 += TS)
     {
         const size_t ib = (i0 + TS <= R) ? TS : (R - i0);
@@ -232,7 +230,7 @@ void tran_tiled(float *RESTRICT At, const float *RESTRICT A, uint16_t R, uint16_
  *
  * Layout result: Ap[r*K + t] = A[(k0+t), (i+r)]  for r=0..7, t=0..K-1
  */
-static inline void pack_T_8xK(const float *RESTRICT A, uint16_t M, uint16_t Ktot,
+inline void pack_T_8xK(const float *RESTRICT A, uint16_t M, uint16_t Ktot,
                               uint16_t i, uint16_t k0, uint16_t K, float *RESTRICT Ap)
 {
     (void)M;
@@ -259,7 +257,7 @@ static inline void pack_T_8xK(const float *RESTRICT A, uint16_t M, uint16_t Ktot
  *
  * Layout result: Bp[t*16 + c] = B[(k0+t), (j+c)]  for c=0..15
  */
-static inline void pack_T_Kx16(const float *RESTRICT B, uint16_t Ktot, uint16_t N,
+inline void pack_T_Kx16(const float *RESTRICT B, uint16_t Ktot, uint16_t N,
                                uint16_t k0, uint16_t j, uint16_t K, float *RESTRICT Bp)
 {
     for (uint16_t t = 0; t < K; ++t)

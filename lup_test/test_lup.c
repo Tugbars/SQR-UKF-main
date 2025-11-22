@@ -17,7 +17,7 @@
  * @date 2025
  */
 
-#include "lup_blas3.h"
+#include "lup.h"
 #include "test_common.h"
 #include <stdio.h>
 #include <stdlib.h>

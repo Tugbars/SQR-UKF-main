@@ -16,7 +16,7 @@
  * @date 2025
  */
 
-#include "inv_blas3_gemm.h"
+#include "inv.h"
 #include "test_common.h"
 #include <stdio.h>
 #include <stdlib.h>

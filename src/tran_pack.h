@@ -282,6 +282,13 @@ void transpose_upper_to_lower_blocked(const float *restrict U,
                                       uint16_t n);
 
 
+inline void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT dst,
+                                    size_t src_stride, size_t dst_stride);
+
+inline void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT dst,
+                                    size_t src_stride, size_t dst_stride);
+
+
 #ifdef __cplusplus
 }
 #endif

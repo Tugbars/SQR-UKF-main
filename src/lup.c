@@ -59,6 +59,8 @@ struct lup_workspace
     int owns_memory; // Whether to free buffer on destroy
 };
 
+typedef struct lup_workspace lup_workspace_t;
+
 /**
  * @brief Query workspace size needed for LUP factorization
  *
