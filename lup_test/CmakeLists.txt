@@ -1,0 +1,181 @@
+cmake_minimum_required(VERSION 3.16)
+project(lup_test_suite C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+message(STATUS "========================================")
+message(STATUS "Configuring LUP Factorization Test Suite")
+message(STATUS "========================================")
+
+# ============================================================================
+# COMPILER FLAGS
+# ============================================================================
+
+if(MSVC)
+    set(SIMD_FLAGS /arch:AVX2 /fp:fast)
+    set(WARNING_FLAGS /W4)
+else()
+    set(SIMD_FLAGS -mavx2 -mfma -msse4.2)
+    set(OPT_FLAGS -O3 -march=native)
+    set(WARNING_FLAGS -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
+
+# ============================================================================
+# GEMM LIBRARY (Reuse or Build)
+# ============================================================================
+
+set(GEMM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm_2)
+set(GEMM_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../includes)
+
+# Check if gemm_lib already exists (from other test subdirectories)
+if(TARGET gemm_lib)
+    message(STATUS "Reusing existing gemm_lib from previous build")
+else()
+    message(STATUS "Building GEMM library for LUP tests...")
+    
+    file(GLOB GEMM_SOURCES 
+        ${GEMM_DIR}/gemm.c
+        ${GEMM_DIR}/gemm_small.c
+        ${GEMM_DIR}/gemm_large.c
+        ${GEMM_DIR}/gemm_planning.c
+        ${GEMM_DIR}/gemm_kernels_avx2.c
+        ${GEMM_DIR}/gemm_utils.c
+    )
+    
+    add_library(gemm_lib STATIC ${GEMM_SOURCES})
+    
+    target_include_directories(gemm_lib PUBLIC 
+        ${GEMM_DIR}
+        ${GEMM_INCLUDES}
+    )
+    
+    if(MSVC)
+        target_compile_options(gemm_lib PRIVATE ${SIMD_FLAGS})
+    else()
+        target_compile_options(gemm_lib PRIVATE 
+            ${SIMD_FLAGS} 
+            ${OPT_FLAGS} 
+            ${WARNING_FLAGS}
+        )
+    endif()
+    
+    target_compile_definitions(gemm_lib PUBLIC LINALG_SIMD_ENABLE=1)
+    
+    message(STATUS "  GEMM sources: ${GEMM_SOURCES}")
+endif()
+
+# ============================================================================
+# LUP LIBRARY (LU Factorization with Partial Pivoting)
+# ============================================================================
+
+message(STATUS "Building LUP Factorization library...")
+
+set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+set(LUP_SOURCES 
+    ${SRC_DIR}/lup.c
+    ${SRC_DIR}/tran_pack.c
+)
+
+add_library(lup_lib STATIC ${LUP_SOURCES})
+
+target_include_directories(lup_lib PUBLIC 
+    ${SRC_DIR}
+    ${GEMM_DIR}
+    ${GEMM_INCLUDES}
+)
+
+if(MSVC)
+    target_compile_options(lup_lib PRIVATE ${SIMD_FLAGS})
+else()
+    target_compile_options(lup_lib PRIVATE 
+        ${SIMD_FLAGS} 
+        ${OPT_FLAGS} 
+        ${WARNING_FLAGS}
+    )
+endif()
+
+target_compile_definitions(lup_lib PUBLIC LINALG_SIMD_ENABLE=1)
+
+target_link_libraries(lup_lib PUBLIC gemm_lib)
+
+message(STATUS "  LUP sources: ${LUP_SOURCES}")
+
+# ============================================================================
+# TEST COMMON INFRASTRUCTURE
+# ============================================================================
+
+set(TEST_COMMON
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_common.h
+)
+
+# ============================================================================
+# TEST EXECUTABLE (STANDALONE MODE)
+# ============================================================================
+
+message(STATUS "Building LUP Factorization test executable...")
+
+add_executable(test_lup test_lup.c)
+
+target_include_directories(test_lup PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${SRC_DIR}
+    ${GEMM_DIR}
+    ${GEMM_INCLUDES}
+)
+
+target_link_libraries(test_lup PRIVATE lup_lib gemm_lib)
+
+if(MSVC)
+    target_compile_options(test_lup PRIVATE ${SIMD_FLAGS})
+else()
+    target_compile_options(test_lup PRIVATE ${SIMD_FLAGS} ${WARNING_FLAGS})
+endif()
+
+target_compile_definitions(test_lup PRIVATE STANDALONE=1)
+
+if(UNIX OR MINGW)
+    target_link_libraries(test_lup PRIVATE m)
+endif()
+
+# ============================================================================
+# CTEST INTEGRATION
+# ============================================================================
+
+enable_testing()
+
+# Register test suite
+add_test(NAME LUP_Suite COMMAND test_lup)
+set_tests_properties(LUP_Suite PROPERTIES 
+    TIMEOUT 600
+    LABELS "correctness;lu_factorization"
+)
+
+# ============================================================================
+# CUSTOM TARGETS FOR CONVENIENCE
+# ============================================================================
+
+# Run all tests via CTest
+add_custom_target(run_lup_tests
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS test_lup
+    COMMENT "Running all LUP Factorization tests via CTest..."
+)
+
+# Run LUP tests directly
+add_custom_target(run_lup
+    COMMAND test_lup
+    DEPENDS test_lup
+    COMMENT "Running LUP Factorization tests (accuracy, pivoting, special matrices, sizes)..."
+)
+
+# Quick validation
+add_custom_target(run_lup_quick
+    COMMAND test_lup
+    DEPENDS test_lup
+    COMMENT "Running quick LUP Factorization validation..."
+)
+
+# =======================================

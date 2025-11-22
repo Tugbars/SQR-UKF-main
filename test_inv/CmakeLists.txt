@@ -1,0 +1,232 @@
+cmake_minimum_required(VERSION 3.16)
+project(inv_test_suite C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+message(STATUS "========================================")
+message(STATUS "Configuring Matrix Inversion Test Suite")
+message(STATUS "========================================")
+
+# ============================================================================
+# COMPILER FLAGS
+# ============================================================================
+
+if(MSVC)
+    set(SIMD_FLAGS /arch:AVX2 /fp:fast)
+    set(WARNING_FLAGS /W4)
+else()
+    set(SIMD_FLAGS -mavx2 -mfma -msse4.2)
+    set(OPT_FLAGS -O3 -march=native)
+    set(WARNING_FLAGS -Wall -Wextra -Wpedantic -Wno-unused-parameter)
+endif()
+
+# ============================================================================
+# GEMM LIBRARY (Reuse or Build)
+# ============================================================================
+
+set(GEMM_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src/gemm_2)
+set(GEMM_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/../includes)
+
+# Check if gemm_lib already exists (from other test subdirectories)
+if(TARGET gemm_lib)
+    message(STATUS "Reusing existing gemm_lib from previous build")
+else()
+    message(STATUS "Building GEMM library for inversion tests...")
+    
+    file(GLOB GEMM_SOURCES 
+        ${GEMM_DIR}/gemm.c
+        ${GEMM_DIR}/gemm_small.c
+        ${GEMM_DIR}/gemm_large.c
+        ${GEMM_DIR}/gemm_planning.c
+        ${GEMM_DIR}/gemm_kernels_avx2.c
+        ${GEMM_DIR}/gemm_utils.c
+    )
+    
+    add_library(gemm_lib STATIC ${GEMM_SOURCES})
+    
+    target_include_directories(gemm_lib PUBLIC 
+        ${GEMM_DIR}
+        ${GEMM_INCLUDES}
+    )
+    
+    if(MSVC)
+        target_compile_options(gemm_lib PRIVATE ${SIMD_FLAGS})
+    else()
+        target_compile_options(gemm_lib PRIVATE 
+            ${SIMD_FLAGS} 
+            ${OPT_FLAGS} 
+            ${WARNING_FLAGS}
+        )
+    endif()
+    
+    target_compile_definitions(gemm_lib PUBLIC LINALG_SIMD_ENABLE=1)
+    
+    message(STATUS "  GEMM sources: ${GEMM_SOURCES}")
+endif()
+
+# ============================================================================
+# LUP LIBRARY (LU Factorization - Dependency for Inversion)
+# ============================================================================
+
+set(SRC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+
+if(TARGET lup_lib)
+    message(STATUS "Reusing existing lup_lib from previous build")
+else()
+    message(STATUS "Building LUP library (dependency for inversion)...")
+    
+    set(LUP_SOURCES 
+        ${SRC_DIR}/lup.c
+        ${SRC_DIR}/tran_pack.c
+    )
+    
+    add_library(lup_lib STATIC ${LUP_SOURCES})
+    
+    target_include_directories(lup_lib PUBLIC 
+        ${SRC_DIR}
+        ${GEMM_DIR}
+        ${GEMM_INCLUDES}
+    )
+    
+    if(MSVC)
+        target_compile_options(lup_lib PRIVATE ${SIMD_FLAGS})
+    else()
+        target_compile_options(lup_lib PRIVATE 
+            ${SIMD_FLAGS} 
+            ${OPT_FLAGS} 
+            ${WARNING_FLAGS}
+        )
+    endif()
+    
+    target_compile_definitions(lup_lib PUBLIC LINALG_SIMD_ENABLE=1)
+    target_link_libraries(lup_lib PUBLIC gemm_lib)
+    
+    message(STATUS "  LUP sources: ${LUP_SOURCES}")
+endif()
+
+# ============================================================================
+# INV LIBRARY (Matrix Inversion)
+# ============================================================================
+
+message(STATUS "Building Matrix Inversion library...")
+
+set(INV_SOURCES 
+    ${SRC_DIR}/inv.c
+)
+
+add_library(inv_lib STATIC ${INV_SOURCES})
+
+target_include_directories(inv_lib PUBLIC 
+    ${SRC_DIR}
+    ${GEMM_DIR}
+    ${GEMM_INCLUDES}
+)
+
+if(MSVC)
+    target_compile_options(inv_lib PRIVATE ${SIMD_FLAGS})
+else()
+    target_compile_options(inv_lib PRIVATE 
+        ${SIMD_FLAGS} 
+        ${OPT_FLAGS} 
+        ${WARNING_FLAGS}
+    )
+endif()
+
+target_compile_definitions(inv_lib PUBLIC LINALG_SIMD_ENABLE=1)
+
+# inv depends on lup which depends on gemm
+target_link_libraries(inv_lib PUBLIC lup_lib gemm_lib)
+
+message(STATUS "  Matrix Inversion sources: ${INV_SOURCES}")
+
+# ============================================================================
+# TEST COMMON INFRASTRUCTURE
+# ============================================================================
+
+set(TEST_COMMON
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_common.h
+)
+
+# ============================================================================
+# TEST EXECUTABLE (STANDALONE MODE)
+# ============================================================================
+
+message(STATUS "Building Matrix Inversion test executable...")
+
+add_executable(test_inv test_inv.c)
+
+target_include_directories(test_inv PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${SRC_DIR}
+    ${GEMM_DIR}
+    ${GEMM_INCLUDES}
+)
+
+target_link_libraries(test_inv PRIVATE inv_lib lup_lib gemm_lib)
+
+if(MSVC)
+    target_compile_options(test_inv PRIVATE ${SIMD_FLAGS})
+else()
+    target_compile_options(test_inv PRIVATE ${SIMD_FLAGS} ${WARNING_FLAGS})
+endif()
+
+target_compile_definitions(test_inv PRIVATE STANDALONE=1)
+
+if(UNIX OR MINGW)
+    target_link_libraries(test_inv PRIVATE m)
+endif()
+
+# ============================================================================
+# CTEST INTEGRATION
+# ============================================================================
+
+enable_testing()
+
+# Register test suite
+add_test(NAME INV_Suite COMMAND test_inv)
+set_tests_properties(INV_Suite PROPERTIES 
+    TIMEOUT 600
+    LABELS "correctness;inversion"
+)
+
+# ============================================================================
+# CUSTOM TARGETS FOR CONVENIENCE
+# ============================================================================
+
+# Run all tests via CTest
+add_custom_target(run_inv_tests
+    COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
+    DEPENDS test_inv
+    COMMENT "Running all Matrix Inversion tests via CTest..."
+)
+
+# Run inversion tests directly
+add_custom_target(run_inv
+    COMMAND test_inv
+    DEPENDS test_inv
+    COMMENT "Running Matrix Inversion tests (accuracy, sizes, special matrices, error handling)..."
+)
+
+# Quick validation
+add_custom_target(run_inv_quick
+    COMMAND test_inv
+    DEPENDS test_inv
+    COMMENT "Running quick Matrix Inversion validation..."
+)
+
+# ============================================================================
+# SUMMARY
+# ============================================================================
+
+message(STATUS "========================================")
+message(STATUS "Matrix Inversion Test Configuration Summary:")
+message(STATUS "  Compiler: ${CMAKE_C_COMPILER_ID}")
+message(STATUS "  Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "  SIMD flags: ${SIMD_FLAGS}")
+message(STATUS "  GEMM dir: ${GEMM_DIR}")
+message(STATUS "  Source dir: ${SRC_DIR}")
+message(STATUS "  Libraries: gemm_lib, lup_lib, inv_lib")
+message(STATUS "  Test executable: test_inv")
+message(STATUS "========================================")
