@@ -277,12 +277,14 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
                 return -ENOMEM;
         }
         
-        /* Update cholupdate workspace if dimensions changed */
+        /* ✅ FIXED: Update cholupdate workspace if dimensions changed (rank-1 only) */
         if (!ws->chol_ws || ws->chol_ws->n_max < n)
         {
             if (ws->chol_ws)
                 cholupdate_workspace_free(ws->chol_ws);
-            ws->chol_ws = cholupdate_workspace_alloc(n, n);
+            
+            /* k_max=1: only rank-1 downdates needed */
+            ws->chol_ws = cholupdate_workspace_alloc(n, 1);
             if (!ws->chol_ws)
                 return -ENOMEM;
         }
@@ -313,14 +315,14 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
     if (!ws->gemm_plan)
         return -ENOMEM;
     
-    /* Allocate cholupdate workspace for rank-1 downdates */
-    ws->chol_ws = cholupdate_workspace_alloc(n, n);
-    if (!ws->chol_ws)
-        return -ENOMEM;
-
     /* Allocate TRSM GEMM plan for blocked triangular solve updates */
     ws->trsm_gemm_plan = gemm_plan_create(n, n, n);
     if (!ws->trsm_gemm_plan)
+        return -ENOMEM;
+
+    /* ✅ FIXED: Allocate cholupdate workspace for rank-1 downdates */
+    ws->chol_ws = cholupdate_workspace_alloc(n, 1);
+    if (!ws->chol_ws)
         return -ENOMEM;
 
     return 0;
@@ -1809,60 +1811,40 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     const uint16_t n = (uint16_t)L8;
     const size_t nn = (size_t)n * (size_t)n;
 
-    /* Ensure workspace is adequate */
     if (ukf_upd_ws_ensure(ws, n) != 0)
         return -ENOMEM;
 
-    float *Z = ws->Z;         /* n×n workspace → becomes K */
-    float *U = ws->U;         /* n×n temporary for K·Sy */
-    float *Ut = ws->Ut;       /* n×n transposed U */
-    float *Ky = ws->Ky;       /* n-vector: K·(y−ŷ) */
-    float *yyhat = ws->yyhat; /* n-vector: y − ŷ */
+    float *Z = ws->Z;
+    float *U = ws->U;
+    float *Ut = ws->Ut;
+    float *Ky = ws->Ky;
+    float *yyhat = ws->yyhat;
 
-    /* Initialize Z with Pxy (will be overwritten by K after solves) */
+    /* Initialize Z with Pxy */
     memcpy(Z, Pxy, nn * sizeof(float));
 
     /* Prefetch control */
     const int do_pf = (n >= (uint16_t)UKF_UPD_PF_MIN_N);
 
-    /* ==================================================================
+    /* ================================================================
      * STEP 1: Forward solve using BLOCKED TRSM
-     *         Sy^T · Z = Pxy  →  Z = (Sy^T)^{-1} · Pxy
-     * 
-     * ✅ NEW: Blocked algorithm with GEMM updates
-     *         Performance: ~2-4× faster than unblocked version
-     *         - Small diagonal solves: ~1.4 GFLOPS (unblocked)
-     *         - Large off-diagonal updates: ~100-150 GFLOPS (GEMM)
-     * ================================================================== */
-    int rc = trsm_blocked_lower(
-        Sy,                  /* Sy is upper-triangular, but accessed as lower when transposed */
-        Z,                   /* RHS matrix [n×n], overwritten with solution */
-        n, n,                /* Dimensions: n rows, n cols */
-        n, n,                /* Strides (row-major, contiguous) */
-        ws->trsm_gemm_plan); /* GEMM plan for off-diagonal updates */
-    
+     * ================================================================ */
+    int rc = trsm_blocked_lower(Sy, Z, n, n, n, n, ws->trsm_gemm_plan);
     if (rc != 0)
         return rc;
 
-    /* ==================================================================
+    /* ================================================================
      * STEP 2: Backward solve using BLOCKED TRSM
-     *         Sy · K = Z  →  K = Sy^{-1} · Z
-     * ================================================================== */
-    rc = trsm_blocked_upper(
-        Sy,                  /* Upper triangular */
-        Z,                   /* RHS matrix [n×n], overwritten with K */
-        n, n,
-        n, n,
-        ws->trsm_gemm_plan);
-    
+     * ================================================================ */
+    rc = trsm_blocked_upper(Sy, Z, n, n, n, n, ws->trsm_gemm_plan);
     if (rc != 0)
         return rc;
 
-    /* Z now contains K (the Kalman gain) */
+    /* Z now contains K (Kalman gain) */
 
-    /* ==================================================================
+    /* ================================================================
      * STEP 3: Compute innovation  v = y − ŷ
-     * ================================================================== */
+     * ================================================================ */
 #if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
     {
@@ -1883,28 +1865,17 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
             yyhat[i] = y[i] - yhat[i];
     }
 
-    /* ==================================================================
-     * STEP 4: Compute Ky = K · (y − ŷ) using optimized GEMM
-     *         Matrix-vector multiply: [n×n] × [n×1] = [n×1]
-     * ================================================================== */
-    rc = gemm_execute_plan_strided(
-        ws->gemm_plan,
-        Ky,              /* C: output [n×1] */
-        Z,               /* A: Kalman gain [n×n] */
-        yyhat,           /* B: innovation [n×1] */
-        n, n, 1,         /* M=n, K=n, N=1 */
-        1,               /* ldc = 1 (vector stride) */
-        n,               /* lda = n (row-major K) */
-        1,               /* ldb = 1 (vector stride) */
-        1.0f,            /* alpha = 1.0 */
-        0.0f);           /* beta = 0.0 (overwrite Ky) */
-
+    /* ================================================================
+     * STEP 4: Compute Ky = K · (y − ŷ)
+     * ================================================================ */
+    rc = gemm_execute_plan_strided(ws->gemm_plan, Ky, Z, yyhat,
+                                    n, n, 1, 1, n, 1, 1.0f, 0.0f);
     if (rc != 0)
         return -EIO;
 
-    /* ==================================================================
+    /* ================================================================
      * STEP 5: State update  x̂ ← x̂ + Ky
-     * ================================================================== */
+     * ================================================================ */
 #if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
     {
@@ -1925,58 +1896,44 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
             xhat[i] += Ky[i];
     }
 
-    /* ==================================================================
-     * STEP 6: Compute U = K · Sy using optimized GEMM
-     *         Matrix-matrix multiply: [n×n] × [n×n] = [n×n]
-     * ================================================================== */
-    rc = gemm_execute_plan_strided(
-        ws->gemm_plan,
-        U,               /* C: output [n×n] */
-        Z,               /* A: Kalman gain [n×n] */
-        Sy,              /* B: measurement SR cov [n×n] */
-        n, n, n,         /* M=n, K=n, N=n */
-        n,               /* ldc = n (row-major) */
-        n,               /* lda = n (row-major) */
-        n,               /* ldb = n (row-major) */
-        1.0f,            /* alpha = 1.0 */
-        0.0f);           /* beta = 0.0 (overwrite U) */
-
+    /* ================================================================
+     * STEP 6: Compute U = K · Sy
+     * ================================================================ */
+    rc = gemm_execute_plan_strided(ws->gemm_plan, U, Z, Sy,
+                                    n, n, n, n, n, n, 1.0f, 0.0f);
     if (rc != 0)
         return -EIO;
 
-    /* ==================================================================
+    /* ================================================================
      * STEP 7: Transpose U using optimized tiled transpose
-     *         Input:  U [n×n] row-major
-     *         Output: Ut [n×n] row-major (= U^T)
-     * 
-     * Uses 32×32 macro-tiles + 8×8 micro-tiles + NT stores
-     * Performance: ~250 GB/s on modern CPUs
-     * ================================================================== */
+     * ================================================================ */
     tran_tiled(Ut, U, n, n);
 
     /* ==================================================================
      * STEP 8: Downdate S by each row of U^T
-     *         S' = chol(S*S^T - U^T*U)
-     * 
-     * Uses optimized rank-1 downdate:
-     *   - 16-wide AVX2 with register transpose (for lower-tri)
-     *   - Automatic cache blocking (for n ≥ 256)
-     *   - Zero malloc overhead (uses workspace)
      * ================================================================== */
     for (uint16_t j = 0; j < n; ++j)
     {
-        /* Prefetch next row to hide memory latency */
+        /* Prefetch next row */
         if (do_pf && j + 2 < n)
             _mm_prefetch((const char *)(Ut + (j + 2) * n), _MM_HINT_T0);
 
-        /* Row j of U^T is contiguous (was column j of U) */
+        /* Row j of U^T is now contiguous */
         const float *Utj = Ut + (size_t)j * n;
 
         /* Copy to cholupdate workspace buffer (downdate modifies in-place) */
         memcpy(ws->chol_ws->xbuf, Utj, (size_t)n * sizeof(float));
 
-        /* Apply optimized rank-1 downdate */
-        rc = cholupdate_rank1_downdate(S, ws->chol_ws->xbuf, n, /*is_upper=*/true);
+        /* ✅ NEW API: Apply optimized rank-1 downdate using auto-dispatch */
+        rc = cholupdatek_auto_ws(
+            ws->chol_ws,           /* Workspace (pre-allocated) */
+            S,                     /* Upper-triangular Cholesky factor */
+            ws->chol_ws->xbuf,     /* Update vector (n×1 matrix) */
+            n,                     /* Matrix dimension */
+            1,                     /* Rank-1 update */
+            /*is_upper=*/true,     /* Upper-triangular storage */
+            -1);                   /* Downdate (subtract X*X^T) */
+        
         if (rc != 0)
         {
             /* Filter divergence detected */
