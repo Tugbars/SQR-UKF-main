@@ -101,8 +101,7 @@ static inline void build_identity_tile_simd(float *restrict RHS,
                                             uint16_t n, uint16_t col0, uint16_t jb)
 {
 #if LINALG_SIMD_ENABLE
-    if (linalg_has_avx2())
-    {
+
         // Zero entire tile with streaming stores (bypasses cache)
         __m256 zero = _mm256_setzero_ps();
         size_t total = (size_t)n * jb;
@@ -136,8 +135,6 @@ static inline void build_identity_tile_simd(float *restrict RHS,
         {
             RHS[(size_t)(col0 + t) * jb + t] = 1.0f;
         }
-    }
-    else
 #endif
     {
         // Scalar fallback for non-AVX2 systems
@@ -814,8 +811,7 @@ int inv(float *restrict Ai_out, const float *restrict A, uint16_t n)
 
         // ✅ Phase 3: Micro-tiled TRSM (full register blocking)
 #if LINALG_SIMD_ENABLE
-        if (linalg_has_avx2())
-        {
+   
             forward_trsm_microtiled_L(LU, n, RHS, jb);
             
             int rc = backward_trsm_microtiled_U(LU, n, RHS, jb);
@@ -826,16 +822,14 @@ int inv(float *restrict Ai_out, const float *restrict A, uint16_t n)
                 gemm_aligned_free(P);
                 return rc;
             }
-        }
-        else
+      
 #endif
-        {
+     
             // Scalar fallback (not implemented - require AVX2 for production use)
             gemm_aligned_free(RHS);
             gemm_aligned_free(LU);
             gemm_aligned_free(P);
             return -ENOTSUP;
-        }
 
         // Scatter tile into output inverse matrix
         for (uint16_t r = 0; r < n; ++r)
