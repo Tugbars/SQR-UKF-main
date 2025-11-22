@@ -4,79 +4,64 @@
 #include <math.h>
 #include <stdint.h>
 
-/* define to 1 if you want the 8-way batching; keep 0 by default */
+/* ================================================================
+ * FEATURE TOGGLES
+ * ================================================================ */
+
+/**
+ * @brief Enable 8-way SIMD batching in compute_transition_function
+ * Set to 1 for lightweight F() functions where gather overhead matters
+ */
 #ifndef SQR_UKF_ENABLE_BATCH8
 #define SQR_UKF_ENABLE_BATCH8 0
 #endif
 
-#ifndef UKF_PREFETCH_ROWS_AHEAD
-#define UKF_PREFETCH_ROWS_AHEAD 1 /* 0..2 are sensible */
-#endif
-#ifndef UKF_PREFETCH_DIST_BYTES
-#define UKF_PREFETCH_DIST_BYTES 128 /* 64 or 128 */
-#endif
-#ifndef UKF_PREFETCH_MIN_L
-#define UKF_PREFETCH_MIN_L 128
-#endif
+/* ================================================================
+ * CROSS-COVARIANCE PREFETCHING
+ * ================================================================ */
 
-#ifndef UKF_TRANS_PF_MIN_L
-#define UKF_TRANS_PF_MIN_L 128 /* enable prefetch when L >= this */
-#endif
-#ifndef UKF_TRANS_PF_ROWS_AHEAD
-#define UKF_TRANS_PF_ROWS_AHEAD 1 /* 0..2 sensible; 1 is safe default */
-#endif
-
-#ifndef UKF_MEAN_PF_MIN_ROWS
-#define UKF_MEAN_PF_MIN_ROWS 128 /* enable row-ahead prefetch when L >= this */
-#endif
-#ifndef UKF_MEAN_PF_ROWS_AHEAD
-#define UKF_MEAN_PF_ROWS_AHEAD 1 /* 0..2 are reasonable */
-#endif
-
-#ifndef UKF_APRIME_PF_MIN_L
-#define UKF_APRIME_PF_MIN_L 128 /* enable prefetch when L >= this */
-#endif
-#ifndef UKF_APRIME_PF_ROWS_AHEAD
-#define UKF_APRIME_PF_ROWS_AHEAD 1 /* 0..2 are sensible */
-#endif
-#ifndef UKF_APRIME_PF_DIST_BYTES
-#define UKF_APRIME_PF_DIST_BYTES 128 /* cache-line distance (64 or 128) */
-#endif
-
-#ifndef UKF_PXY_PF_MIN_N
-#define UKF_PXY_PF_MIN_N 256 /* enable prefetch when N >= this */
-#endif
-#ifndef UKF_PXY_PF_ROWS_AHEAD
-#define UKF_PXY_PF_ROWS_AHEAD 1 /* prefetch this many future Y rows (0..2 sensible) */
-#endif
-#ifndef UKF_PXY_PF_DIST_BYTES
-#define UKF_PXY_PF_DIST_BYTES 128 /* stream prefetch distance within a row: 64 or 128 */
-#endif
-
-#ifndef UKF_UPD_COLBLOCK
-#define UKF_UPD_COLBLOCK 64 /* RHS column block for triangular solves */
-#endif
-#ifndef UKF_UPD_PF_MIN_N
-#define UKF_UPD_PF_MIN_N 128 /* enable prefetch in solves when n >= this */
-#endif
-#ifndef UKF_UPD_PF_DIST_BYTES
-#define UKF_UPD_PF_DIST_BYTES 128 /* prefetch distance along RHS rows */
-#endif
-
+/**
+ * @brief Enable prefetching in cross-covariance computation when L >= this
+ * Typical values: 16-32 (small overhead, good for L≥32)
+ */
 #ifndef UKF_PXY_PF_MIN_L
-#define UKF_PXY_PF_MIN_L 16 /* enable row-ahead prefetch when L >= this */
+#define UKF_PXY_PF_MIN_L 16
 #endif
-#ifndef UKF_PXY_PF_MIN_N
-#define UKF_PXY_PF_MIN_N 32 /* enable within-row prefetch when N >= this */
+
+/* ================================================================
+ * MEASUREMENT UPDATE PREFETCHING
+ * ================================================================ */
+
+/**
+ * @brief Enable prefetching in triangular solves when n >= this
+ * Typical values: 64-128 (prefetch is expensive for small matrices)
+ */
+#ifndef UKF_UPD_PF_MIN_N
+#define UKF_UPD_PF_MIN_N 128
 #endif
-#ifndef UKF_PXY_PF_ROWS_AHEAD
-#define UKF_PXY_PF_ROWS_AHEAD 1 /* 0..2 sensible */
-#endif
-#ifndef UKF_PXY_PF_DIST_BYTES
-#define UKF_PXY_PF_DIST_BYTES 128 /* 64 or 128 are typical */
+
+/* ================================================================
+ * BLOCKED TRSM TUNING
+ * ================================================================ */
+
+/**
+ * @brief Block size for blocked triangular solve (TRSM)
+ * Auto-selected in code based on n, but you can override:
+ * - NB=32: n ≤ 128 (small overhead)
+ * - NB=64: n ≤ 512 (good balance)
+ * - NB=96: n > 512 (amortize GEMM setup)
+ */
+#ifndef UKF_TRSM_BLOCK_SIZE_OVERRIDE
+#define UKF_TRSM_BLOCK_SIZE_OVERRIDE 0  /* 0 = auto-select */
 #endif
 
 /* =================== Reusable workspace for SR-UKF QR step =================== */
+/**
+ * @brief Workspace for QR-based covariance update
+ * 
+ * Used in create_state_estimation_error_covariance_matrix()
+ * to avoid repeated malloc/free overhead across UKF iterations.
+ */
 typedef struct
 {
     float *Aprime;
@@ -84,66 +69,82 @@ typedef struct
     float *b;
     size_t capL;
     
-    /* NEW: Cross-covariance workspace */
+    /* Cross-covariance workspace */
     ukf_pxy_ws_t pxy_ws;
+    
+    /* NEW: QR workspace for blocked decomposition */
+    qr_workspace *qr_ws;  /* Reusable QR workspace */
     
 } ukf_qr_ws_t;
 
+/**
+ * @brief Workspace for measurement update step
+ * 
+ * Used in update_state_covariance_matrix_and_state_estimation_vector()
+ * to avoid repeated malloc/free overhead across UKF iterations.
+ */
 typedef struct
 {
-    float *Z;
-    float *Ky;
-    float *U;
-    float *Ut;
-    float *Uk;
-    float *yyhat;
+    /* Temporary matrices and vectors */
+    float *Z;      /* [n×n] RHS workspace → becomes Kalman gain K */
+    float *Ky;     /* [n] K·(y−ŷ) (state correction) */
+    float *U;      /* [n×n] K·Sy (for covariance downdate) */
+    float *Ut;     /* [n×n] Transposed U (row-major for downdates) */
+    float *Uk;     /* [n] Scratch vector (currently unused?) */
+    float *yyhat;  /* [n] Innovation vector: y − ŷ */
     
-    /* GEMM and cholupdate workspaces */
-    gemm_plan_t *gemm_plan;
-    cholupdate_workspace *chol_ws;
+    /* Sub-workspaces (owned pointers, must be freed) */
+    gemm_plan_t *gemm_plan;       /* For matrix multiplies (K·Sy, K·v) */
+    cholupdate_workspace *chol_ws; /* For rank-1 Cholesky downdates */
+    gemm_plan_t *trsm_gemm_plan;  /* For blocked TRSM off-diagonal updates */
     
-    /* NEW: TRSM-specific GEMM plan */
-    gemm_plan_t *trsm_gemm_plan;  /* For triangular solve updates */
-    
-    size_t cap;
+    size_t cap;  /* Current capacity (n×n elements supported) */
 } ukf_upd_ws_t;
-
-
 
 /**
  * @brief Clean up QR workspace (free internal allocations)
+ * 
+ * Frees all dynamically allocated memory and resets to zero state.
+ * Safe to call multiple times or on uninitialized workspace.
+ * 
+ * @param ws Workspace to clean up (NULL-safe)
  */
 static inline void ukf_qr_ws_cleanup(ukf_qr_ws_t *ws)
 {
     if (!ws)
         return;
 
-    if (ws->Aprime)
+    gemm_aligned_free(ws->Aprime);
+    gemm_aligned_free(ws->R_);
+    gemm_aligned_free(ws->b);
+    
+    /* Clean up embedded workspaces */
+    ukf_pxy_ws_cleanup(&ws->pxy_ws);
+    
+    /* NEW: Free QR workspace */
+    if (ws->qr_ws)
     {
-        gemm_aligned_free(ws->Aprime);
-        ws->Aprime = NULL;
+        qr_workspace_free(ws->qr_ws);
+        ws->qr_ws = NULL;
     }
-    if (ws->R_)
-    {
-        gemm_aligned_free(ws->R_);
-        ws->R_ = NULL;
-    }
-    if (ws->b)
-    {
-        gemm_aligned_free(ws->b);
-        ws->b = NULL;
-    }
+    
     ws->capL = 0;
 }
 
 /**
  * @brief Cleanup function for update workspace
+ * 
+ * Frees all dynamically allocated memory including sub-workspaces.
+ * Safe to call multiple times or on uninitialized workspace.
+ * 
+ * @param ws Workspace to clean up (NULL-safe)
  */
 static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
 {
     if (!ws)
         return;
 
+    /* Free temporary buffers */
     gemm_aligned_free(ws->Z);
     gemm_aligned_free(ws->U);
     gemm_aligned_free(ws->Ut);
@@ -151,6 +152,7 @@ static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
     gemm_aligned_free(ws->yyhat);
     gemm_aligned_free(ws->Uk);
 
+    /* Free sub-workspaces (handle NULL internally) */
     if (ws->gemm_plan)
         gemm_plan_destroy(ws->gemm_plan);
     if (ws->trsm_gemm_plan)
@@ -158,6 +160,7 @@ static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
     if (ws->chol_ws)
         cholupdate_workspace_free(ws->chol_ws);
 
+    /* Reset all pointers to NULL (safety) */
     ws->Z = NULL;
     ws->U = NULL;
     ws->Ut = NULL;
@@ -170,6 +173,18 @@ static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
     ws->cap = 0;
 }
 
+/**
+ * @brief Ensure QR workspace capacity for given L
+ * 
+ * Allocates or reallocates workspace buffers if current capacity is insufficient.
+ * If workspace is already adequate, does nothing (fast path).
+ * 
+ * @param ws Workspace structure to ensure
+ * @param L  State dimension (must support matrices up to 3L × L)
+ * @return 0 on success, -ENOMEM on allocation failure
+ * 
+ * @note Calling with smaller L than current capacity is a no-op (doesn't shrink)
+ */
 static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
 {
     const size_t M = 3u * L;
@@ -178,28 +193,71 @@ static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
     const size_t need_b = L;
 
     if (ws->capL >= L && ws->Aprime && ws->R_ && ws->b)
+    {
+        /* Fast path: buffers OK, check QR workspace */
+        if (!ws->qr_ws || ws->qr_ws->m_max < M || ws->qr_ws->n_max < L)
+        {
+            /* Recreate QR workspace if dimensions changed */
+            if (ws->qr_ws)
+                qr_workspace_free(ws->qr_ws);
+            
+            /* Adaptive blocking: pass ib=0 for auto-selection */
+            ws->qr_ws = qr_workspace_alloc((uint16_t)M, (uint16_t)L, 0);
+            if (!ws->qr_ws)
+                return -ENOMEM;
+        }
         return 0;
+    }
 
-    /* Clean up old allocations */
+    /* Slow path: full reallocation */
     ukf_qr_ws_cleanup(ws);
 
-    /* Allocate new (larger) workspace */
     ws->Aprime = (float *)gemm_aligned_alloc(32, need_A * sizeof(float));
     ws->R_ = (float *)gemm_aligned_alloc(32, need_R * sizeof(float));
     ws->b = (float *)gemm_aligned_alloc(32, need_b * sizeof(float));
-    ws->capL = (ws->Aprime && ws->R_ && ws->b) ? L : 0;
-
-    return (ws->capL ? 0 : -ENOMEM);
+    
+    if (!ws->Aprime || !ws->R_ || !ws->b)
+    {
+        ukf_qr_ws_cleanup(ws);
+        return -ENOMEM;
+    }
+    
+    /* Allocate QR workspace with adaptive blocking */
+    ws->qr_ws = qr_workspace_alloc((uint16_t)M, (uint16_t)L, 0);
+    if (!ws->qr_ws)
+    {
+        ukf_qr_ws_cleanup(ws);
+        return -ENOMEM;
+    }
+    
+    ws->capL = L;
+    return 0;
 }
 
+/**
+ * @brief Ensure update workspace capacity for given n
+ * 
+ * Allocates or reallocates workspace buffers if current capacity is insufficient.
+ * Also ensures sub-workspaces (GEMM plans, cholupdate) are adequately sized.
+ * 
+ * @param ws Workspace structure to ensure
+ * @param n  State dimension (must support n×n matrices)
+ * @return 0 on success, -ENOMEM on allocation failure
+ * 
+ * @note If buffers exist but sub-workspaces need updating, only updates those
+ * @note Calling with smaller n than current capacity is a no-op for buffers
+ */
 static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
 {
     const size_t nn = (size_t)n * (size_t)n;
 
+    /* ================================================================
+     * FAST PATH: Buffers exist, maybe just update sub-workspaces
+     * ================================================================ */
     if (ws->cap >= nn && ws->Z && ws->U && ws->Ut && 
         ws->Ky && ws->yyhat && ws->Uk)
     {
-        /* Update GEMM plans if needed */
+        /* Update GEMM plan if dimensions changed */
         if (!ws->gemm_plan || ws->gemm_plan->max_M < n)
         {
             if (ws->gemm_plan)
@@ -209,16 +267,17 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
                 return -ENOMEM;
         }
         
+        /* Update TRSM GEMM plan if dimensions changed */
         if (!ws->trsm_gemm_plan || ws->trsm_gemm_plan->max_M < n)
         {
             if (ws->trsm_gemm_plan)
                 gemm_plan_destroy(ws->trsm_gemm_plan);
-            /* TRSM plan: worst case n × n × n */
             ws->trsm_gemm_plan = gemm_plan_create(n, n, n);
             if (!ws->trsm_gemm_plan)
                 return -ENOMEM;
         }
         
+        /* Update cholupdate workspace if dimensions changed */
         if (!ws->chol_ws || ws->chol_ws->n_max < n)
         {
             if (ws->chol_ws)
@@ -228,13 +287,15 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
                 return -ENOMEM;
         }
         
-        return 0;
+        return 0;  /* Buffers OK, sub-workspaces updated */
     }
 
-    /* Clean up old allocations */
+    /* ================================================================
+     * SLOW PATH: Need full reallocation
+     * ================================================================ */
     ukf_upd_ws_cleanup(ws);
 
-    /* Allocate new buffers */
+    /* Allocate temporary buffers */
     ws->Z = (float *)gemm_aligned_alloc(32, nn * sizeof(float));
     ws->U = (float *)gemm_aligned_alloc(32, nn * sizeof(float));
     ws->Ut = (float *)gemm_aligned_alloc(32, nn * sizeof(float));
@@ -242,25 +303,25 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
     ws->yyhat = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
     ws->Uk = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
     
+    /* Check all buffer allocations succeeded */
     ws->cap = (ws->Z && ws->U && ws->Ut && ws->Ky && ws->yyhat && ws->Uk) ? nn : 0;
-
     if (!ws->cap)
         return -ENOMEM;
     
-    /* Allocate GEMM plan */
+    /* Allocate GEMM plan for K·Sy and K·v operations */
     ws->gemm_plan = gemm_plan_create(n, n, n);
     if (!ws->gemm_plan)
         return -ENOMEM;
     
-    /* Allocate cholupdate workspace */
+    /* Allocate cholupdate workspace for rank-1 downdates */
     ws->chol_ws = cholupdate_workspace_alloc(n, n);
     if (!ws->chol_ws)
         return -ENOMEM;
 
-      ws->trsm_gemm_plan = gemm_plan_create(n, n, n);
+    /* Allocate TRSM GEMM plan for blocked triangular solve updates */
+    ws->trsm_gemm_plan = gemm_plan_create(n, n, n);
     if (!ws->trsm_gemm_plan)
         return -ENOMEM;
-    
 
     return 0;
 }
@@ -1315,7 +1376,8 @@ static int create_state_estimation_error_covariance_matrix(
     }
 
     /* QR decomposition (unchanged) */
-    if (qr(Aprime, NULL, R_, (uint16_t)M, (uint16_t)L, true) != 0)
+     if (qr_ws_blocked_inplace(ws->qr_ws, Aprime, NULL, R_, 
+                              (uint16_t)M, (uint16_t)L, true) != 0)
         return -EIO;
 
     memcpy(S, R_, L * L * sizeof(float));
