@@ -722,4 +722,18 @@ int qr_ws_blocked_inplace(qr_workspace *ws, float *A, float *Q, float *R,
 int qr_blocked(const float *A, float *Q, float *R,
                uint16_t m, uint16_t n, bool only_R);
 
+/**
+ * @brief Compatibility wrapper for legacy qr() calls
+ * 
+ * Maps old qr() signature to new qr_blocked() implementation.
+ * Uses adaptive blocking (auto-selects optimal IB).
+ */
+static inline int qr(float *A, float *Q, float *R,
+                     uint16_t m, uint16_t n, bool only_R)
+{
+    // New implementation requires const input for non-inplace version
+    // Since we're passing non-const A, use the workspace version with copy
+    return qr_blocked((const float *)A, Q, R, m, n, only_R);
+}
+
 #endif // QR_H

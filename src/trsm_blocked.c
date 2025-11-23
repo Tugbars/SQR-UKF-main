@@ -766,6 +766,205 @@ static int trsm_blocked_lower_optimized(
     return 0;
 }
 
+//==============================================================================
+// TRANSPOSE-AWARE TRSM (for Sy^T solves without explicit transpose)
+//==============================================================================
+
+/**
+ * @brief Solve U^T · X = B where U is upper triangular (NO EXPLICIT TRANSPOSE)
+ * 
+ * @details
+ * Mathematically, U^T is lower triangular, so we use forward substitution.
+ * However, we access U in TRANSPOSED fashion (U[j,i] instead of U[i,j])
+ * to avoid physically transposing the matrix.
+ * 
+ * **Algorithm (forward substitution with transposed access):**
+ *   for j = 0 to n-1:
+ *     X[j,:] = B[j,:] / U^T[j,j]  (= B[j,:] / U[j,j])
+ *     for i = j+1 to n-1:
+ *       B[i,:] -= U^T[i,j] * X[j,:]
+ *       where U^T[i,j] = U[j,i]  ← KEY: transpose access
+ * 
+ * **Memory Access Pattern:**
+ * - U is upper triangular, row-major: U[i,j] stored at [i*ldu + j]
+ * - We need U^T[i,j] = U[j,i] stored at [j*ldu + i]
+ * - This accesses U in COLUMN order (cache-unfriendly, but unavoidable)
+ * 
+ * **Performance:**
+ * - Slower than non-transposed TRSM (strided column access)
+ * - But faster than explicit transpose + solve (saves one O(n²) pass)
+ * - Uses RHS blocking + prefetch to mitigate cache misses
+ * 
+ * @param[in]     U         Upper triangular matrix [n×n] (row-major)
+ * @param[in,out] B         RHS matrix [n×ncols] (row-major), overwritten with X
+ * @param[in]     n         Matrix dimension
+ * @param[in]     ncols     Number of RHS columns
+ * @param[in]     ldu       Leading dimension of U
+ * @param[in]     ldb       Leading dimension of B
+ * @param[in]     gemm_plan GEMM plan for trailing updates
+ * @param[in]     ws        Workspace for packing
+ * 
+ * @return 0 on success, -EDOM if singular, -EIO on GEMM failure
+ * 
+ * @note This is equivalent to solving L·X=B where L=U^T (lower triangular)
+ * @note Uses forward substitution (like lower-TRSM) but reads U transposed
+ */
+static int trsm_blocked_upper_transpose(
+    const float *restrict U,
+    float *restrict B,
+    size_t n, size_t ncols,
+    size_t ldu, size_t ldb,
+    gemm_plan_t *gemm_plan,
+    trsm_workspace *ws)
+{
+    if (n == 0 || ncols == 0)
+        return 0;
+    
+    const size_t NB = trsm_choose_block_size(n);
+    const size_t RC = TRSM_RC_BLOCK_SIZE;
+    
+    /* ================================================================
+     * BLOCKED LOOP: Forward substitution (since U^T is lower triangular)
+     * ================================================================ */
+    for (size_t i = 0; i < n; i += NB)
+    {
+        const size_t ib = MIN(NB, n - i);
+        
+        /* Prefetch next panels */
+#ifdef __AVX2__
+        if (i + NB + TRSM_PREFETCH_NEAR * NB < n)
+        {
+            size_t pf_idx = i + NB + TRSM_PREFETCH_NEAR * NB;
+            for (size_t p = 0; p < MIN(NB, n - pf_idx); p += 8)
+            {
+                _mm_prefetch((const char*)&U[(pf_idx + p) * ldu + (pf_idx + p)], 
+                            _MM_HINT_T0);
+            }
+        }
+#endif
+        
+        /* Singularity check */
+        float diag_min = fabsf(U[i * ldu + i]);
+        for (size_t j = 1; j < ib; ++j)
+        {
+            float diag = fabsf(U[(i + j) * ldu + (i + j)]);
+            if (diag < diag_min)
+                diag_min = diag;
+        }
+        if (diag_min == 0.0f)
+            return -EDOM;
+        
+        /* ============================================================
+         * PACK U^T DIAGONAL BLOCK: Transpose while packing
+         * 
+         * Extract U^T[i:i+ib, i:i+ib] by reading columns of U
+         * Store as lower triangular in L_packed
+         * ============================================================ */
+        for (size_t ii = 0; ii < ib; ++ii)
+        {
+            // Pack row ii of U^T = column i+ii of U
+            for (size_t jj = 0; jj <= ii; ++jj)
+            {
+                // L_packed[ii,jj] = U^T[i+ii, i+jj] = U[i+jj, i+ii]
+                ws->L_packed[ii * ib + jj] = U[(i + jj) * ldu + (i + ii)];
+            }
+            // Zero out upper triangle (safety)
+            for (size_t jj = ii + 1; jj < ib; ++jj)
+            {
+                ws->L_packed[ii * ib + jj] = 0.0f;
+            }
+        }
+        
+        /* ============================================================
+         * RHS COLUMN BLOCKING: Process RC columns at a time
+         * ============================================================ */
+        for (size_t jj = 0; jj < ncols; jj += RC)
+        {
+            const size_t jb = MIN(RC, ncols - jj);
+            
+            /* ========================================================
+             * SOLVE DIAGONAL PANEL: Use packed lower-triangular block
+             * ======================================================== */
+            trsm_panel_lower_packed(
+                ws->L_packed,
+                B + i * ldb + jj,
+                ib, jb);
+            
+            /* ========================================================
+             * UPDATE TRAILING ROWS: GEMM with U^T off-diagonal
+             * ======================================================== */
+            if (i + ib < n)
+            {
+                const size_t m_update = n - (i + ib);
+                
+                /* Pack solved panel X */
+                pack_panel_contiguous(
+                    ws->X_packed,
+                    B + i * ldb + jj,
+                    ib, jb,
+                    ldb);
+                
+                /* ====================================================
+                 * PACK U^T OFF-DIAGONAL BLOCK
+                 * 
+                 * Need: U^T[i+ib:n, i:i+ib] (m_update × ib)
+                 *     = U[i:i+ib, i+ib:n]^T  (transpose of ib × m_update)
+                 * 
+                 * Read columns of U, store as rows
+                 * ==================================================== */
+                float *UT_packed = (float *)_mm_malloc(m_update * ib * sizeof(float), 32);
+                
+                for (size_t kk = 0; kk < ib; ++kk)
+                {
+                    // Row kk of UT_packed = column i+kk of U, rows i+ib:n
+                    const float *U_col = U + (i + kk) * ldu + (i + ib);
+                    float *UT_row = UT_packed + kk * m_update;
+                    
+                    // Copy column (strided) to row (contiguous)
+                    for (size_t ii = 0; ii < m_update; ++ii)
+                    {
+                        UT_row[ii] = U_col[ii];
+                    }
+                }
+                
+                /* Prefetch for GEMM */
+#ifdef __AVX2__
+                for (size_t p = 0; p < MIN(128, m_update * ib); p += 64)
+                {
+                    _mm_prefetch((const char*)(UT_packed + p), _MM_HINT_T0);
+                }
+#endif
+                
+                /* ====================================================
+                 * GEMM: B[i+ib:n, jj:jj+jb] -= U^T[i+ib:n, i:i+ib] × X
+                 * 
+                 * Now UT_packed is contiguous → fast GEMM!
+                 * ==================================================== */
+                int rc = gemm_execute_plan_strided(
+                    gemm_plan,
+                    B + (i + ib) * ldb + jj,  /* C: trailing rows */
+                    UT_packed,                /* A: PACKED U^T (contiguous!) */
+                    ws->X_packed,             /* B: PACKED X */
+                    (uint16_t)m_update,       /* M */
+                    (uint16_t)ib,             /* K */
+                    (uint16_t)jb,             /* N */
+                    (uint16_t)ldb,            /* ldc */
+                    (uint16_t)m_update,       /* lda: UT_packed row stride */
+                    (uint16_t)jb,             /* ldb: X_packed row stride */
+                    -1.0f,                    /* alpha: subtract */
+                    1.0f);                    /* beta: accumulate */
+                
+                _mm_free(UT_packed);
+                
+                if (rc != 0)
+                    return -EIO;
+            }
+        }
+    }
+    
+    return 0;
+}
+
 /**
  * @brief Blocked upper triangular solve: U · X = B (FULLY OPTIMIZED)
  */
@@ -927,6 +1126,28 @@ int trsm_blocked_upper(
 
     int rc = trsm_blocked_upper_optimized(U, B, n, ncols, ldu, ldb, gemm_plan, ws);
 
+    trsm_workspace_free(ws);
+    return rc;
+}
+
+/**
+ * @brief Public API: Solve U^T · X = B (upper triangular, transposed)
+ * 
+ * @note Auto-allocates workspace (can be optimized by reusing)
+ */
+int trsm_blocked_upper_transpose_auto(
+    const float *restrict U,
+    float *restrict B,
+    size_t n, size_t ncols,
+    size_t ldu, size_t ldb,
+    gemm_plan_t *gemm_plan)
+{
+    trsm_workspace *ws = trsm_workspace_alloc(n);
+    if (!ws)
+        return -ENOMEM;
+    
+    int rc = trsm_blocked_upper_transpose(U, B, n, ncols, ldu, ldb, gemm_plan, ws);
+    
     trsm_workspace_free(ws);
     return rc;
 }
