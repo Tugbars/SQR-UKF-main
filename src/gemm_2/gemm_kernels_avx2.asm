@@ -71,7 +71,7 @@
 #
 # AUTHORS & LICENSE
 # =================
-# Part of VectorFFT linear algebra library.
+# Part of SQR UKF library.
 # See LICENSE for terms.
 #
 #===============================================================================

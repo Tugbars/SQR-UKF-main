@@ -4,9 +4,9 @@
 #include <math.h>
 #include <stdint.h>
 
-#include "gemm.h" 
-#include "qr.h" 
-#include "cholupdate.h" 
+#include "gemm.h"
+#include "qr.h"
+#include "cholupdate.h"
 
 /* ================================================================
  * FEATURE TOGGLES
@@ -56,13 +56,13 @@
  * - NB=96: n > 512 (amortize GEMM setup)
  */
 #ifndef UKF_TRSM_BLOCK_SIZE_OVERRIDE
-#define UKF_TRSM_BLOCK_SIZE_OVERRIDE 0  /* 0 = auto-select */
+#define UKF_TRSM_BLOCK_SIZE_OVERRIDE 0 /* 0 = auto-select */
 #endif
 
 /* =================== Reusable workspace for SR-UKF QR step =================== */
 /**
  * @brief Workspace for QR-based covariance update
- * 
+ *
  * Used in create_state_estimation_error_covariance_matrix()
  * to avoid repeated malloc/free overhead across UKF iterations.
  */
@@ -72,46 +72,46 @@ typedef struct
     float *R_;
     float *b;
     size_t capL;
-    
+
     /* Cross-covariance workspace */
     ukf_pxy_ws_t pxy_ws;
-    
+
     /* NEW: QR workspace for blocked decomposition */
-    qr_workspace *qr_ws;  /* Reusable QR workspace */
-    
+    qr_workspace *qr_ws; /* Reusable QR workspace */
+
 } ukf_qr_ws_t;
 
 /**
  * @brief Workspace for measurement update step
- * 
+ *
  * Used in update_state_covariance_matrix_and_state_estimation_vector()
  * to avoid repeated malloc/free overhead across UKF iterations.
  */
 typedef struct
 {
     /* Temporary matrices and vectors */
-    float *Z;      /* [n×n] RHS workspace → becomes Kalman gain K */
-    float *Ky;     /* [n] K·(y−ŷ) (state correction) */
-    float *U;      /* [n×n] K·Sy (for covariance downdate) */
-    float *Ut;     /* [n×n] Transposed U (row-major for downdates) */
-    float *Uk;     /* [n] Scratch vector (currently unused?) */
-    float *yyhat;  /* [n] Innovation vector: y − ŷ */
-    
+    float *Z;     /* [n×n] RHS workspace → becomes Kalman gain K */
+    float *Ky;    /* [n] K·(y−ŷ) (state correction) */
+    float *U;     /* [n×n] K·Sy (for covariance downdate) */
+    float *Ut;    /* [n×n] Transposed U (row-major for downdates) */
+    float *Uk;    /* [n] Scratch vector (currently unused?) */
+    float *yyhat; /* [n] Innovation vector: y − ŷ */
+
     /* Sub-workspaces (owned pointers, must be freed) */
-    gemm_plan_t *gemm_plan;       /* For matrix multiplies (K·Sy, K·v) */
+    gemm_plan_t *gemm_plan;        /* For matrix multiplies (K·Sy, K·v) */
     cholupdate_workspace *chol_ws; /* For rank-1 Cholesky downdates */
-    gemm_plan_t *trsm_gemm_plan;  /* For blocked TRSM off-diagonal updates */
-    trsm_workspace *trsm_ws;          /* For panel packing in TRSM */
-    
-    size_t cap;  /* Current capacity (n×n elements supported) */
+    gemm_plan_t *trsm_gemm_plan;   /* For blocked TRSM off-diagonal updates */
+    trsm_workspace *trsm_ws;       /* For panel packing in TRSM */
+
+    size_t cap; /* Current capacity (n×n elements supported) */
 } ukf_upd_ws_t;
 
 /**
  * @brief Clean up QR workspace (free internal allocations)
- * 
+ *
  * Frees all dynamically allocated memory and resets to zero state.
  * Safe to call multiple times or on uninitialized workspace.
- * 
+ *
  * @param ws Workspace to clean up (NULL-safe)
  */
 static inline void ukf_qr_ws_cleanup(ukf_qr_ws_t *ws)
@@ -122,26 +122,26 @@ static inline void ukf_qr_ws_cleanup(ukf_qr_ws_t *ws)
     gemm_aligned_free(ws->Aprime);
     gemm_aligned_free(ws->R_);
     gemm_aligned_free(ws->b);
-    
+
     /* Clean up embedded workspaces */
     ukf_pxy_ws_cleanup(&ws->pxy_ws);
-    
+
     /* NEW: Free QR workspace */
     if (ws->qr_ws)
     {
         qr_workspace_free(ws->qr_ws);
         ws->qr_ws = NULL;
     }
-    
+
     ws->capL = 0;
 }
 
 /**
  * @brief Cleanup function for update workspace
- * 
+ *
  * Frees all dynamically allocated memory including sub-workspaces.
  * Safe to call multiple times or on uninitialized workspace.
- * 
+ *
  * @param ws Workspace to clean up (NULL-safe)
  */
 static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
@@ -164,7 +164,7 @@ static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
         gemm_plan_destroy(ws->trsm_gemm_plan);
     if (ws->chol_ws)
         cholupdate_workspace_free(ws->chol_ws);
-     if (ws->trsm_ws)
+    if (ws->trsm_ws)
         trsm_workspace_free(ws->trsm_ws);
 
     /* Reset all pointers to NULL (safety) */
@@ -182,14 +182,14 @@ static inline void ukf_upd_ws_cleanup(ukf_upd_ws_t *ws)
 
 /**
  * @brief Ensure QR workspace capacity for given L
- * 
+ *
  * Allocates or reallocates workspace buffers if current capacity is insufficient.
  * If workspace is already adequate, does nothing (fast path).
- * 
+ *
  * @param ws Workspace structure to ensure
  * @param L  State dimension (must support matrices up to 3L × L)
  * @return 0 on success, -ENOMEM on allocation failure
- * 
+ *
  * @note Calling with smaller L than current capacity is a no-op (doesn't shrink)
  */
 static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
@@ -207,7 +207,7 @@ static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
             /* Recreate QR workspace if dimensions changed */
             if (ws->qr_ws)
                 qr_workspace_free(ws->qr_ws);
-            
+
             /* Adaptive blocking: pass ib=0 for auto-selection */
             ws->qr_ws = qr_workspace_alloc((uint16_t)M, (uint16_t)L, 0);
             if (!ws->qr_ws)
@@ -222,13 +222,13 @@ static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
     ws->Aprime = (float *)gemm_aligned_alloc(32, need_A * sizeof(float));
     ws->R_ = (float *)gemm_aligned_alloc(32, need_R * sizeof(float));
     ws->b = (float *)gemm_aligned_alloc(32, need_b * sizeof(float));
-    
+
     if (!ws->Aprime || !ws->R_ || !ws->b)
     {
         ukf_qr_ws_cleanup(ws);
         return -ENOMEM;
     }
-    
+
     /* Allocate QR workspace with adaptive blocking */
     ws->qr_ws = qr_workspace_alloc((uint16_t)M, (uint16_t)L, 0);
     if (!ws->qr_ws)
@@ -236,21 +236,21 @@ static inline int ukf_qr_ws_ensure(ukf_qr_ws_t *ws, size_t L)
         ukf_qr_ws_cleanup(ws);
         return -ENOMEM;
     }
-    
+
     ws->capL = L;
     return 0;
 }
 
 /**
  * @brief Ensure update workspace capacity for given n
- * 
+ *
  * Allocates or reallocates workspace buffers if current capacity is insufficient.
  * Also ensures sub-workspaces (GEMM plans, cholupdate) are adequately sized.
- * 
+ *
  * @param ws Workspace structure to ensure
  * @param n  State dimension (must support n×n matrices)
  * @return 0 on success, -ENOMEM on allocation failure
- * 
+ *
  * @note If buffers exist but sub-workspaces need updating, only updates those
  * @note Calling with smaller n than current capacity is a no-op for buffers
  */
@@ -261,7 +261,7 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
     /* ================================================================
      * FAST PATH: Buffers exist, maybe just update sub-workspaces
      * ================================================================ */
-    if (ws->cap >= nn && ws->Z && ws->U && ws->Ut && 
+    if (ws->cap >= nn && ws->Z && ws->U && ws->Ut &&
         ws->Ky && ws->yyhat && ws->Uk)
     {
         /* Update GEMM plan if dimensions changed */
@@ -273,7 +273,7 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
             if (!ws->gemm_plan)
                 return -ENOMEM;
         }
-        
+
         /* Update TRSM GEMM plan if dimensions changed */
         if (!ws->trsm_gemm_plan || ws->trsm_gemm_plan->max_M < n)
         {
@@ -283,13 +283,13 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
             if (!ws->trsm_gemm_plan)
                 return -ENOMEM;
         }
-        
+
         /* ✅ FIXED: Update cholupdate workspace if dimensions changed (rank-1 only) */
         if (!ws->chol_ws || ws->chol_ws->n_max < n)
         {
             if (ws->chol_ws)
                 cholupdate_workspace_free(ws->chol_ws);
-            
+
             /* k_max=1: only rank-1 downdates needed */
             ws->chol_ws = cholupdate_workspace_alloc(n, 1);
             if (!ws->chol_ws)
@@ -304,8 +304,8 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
             if (!ws->trsm_ws)
                 return -ENOMEM;
         }
-        
-        return 0;  /* Buffers OK, sub-workspaces updated */
+
+        return 0; /* Buffers OK, sub-workspaces updated */
     }
 
     /* ================================================================
@@ -320,17 +320,17 @@ static inline int ukf_upd_ws_ensure(ukf_upd_ws_t *ws, uint16_t n)
     ws->Ky = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
     ws->yyhat = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
     ws->Uk = (float *)gemm_aligned_alloc(32, (size_t)n * sizeof(float));
-    
+
     /* Check all buffer allocations succeeded */
     ws->cap = (ws->Z && ws->U && ws->Ut && ws->Ky && ws->yyhat && ws->Uk) ? nn : 0;
     if (!ws->cap)
         return -ENOMEM;
-    
+
     /* Allocate GEMM plan for K·Sy and K·v operations */
     ws->gemm_plan = gemm_plan_create(n, n, n);
     if (!ws->gemm_plan)
         return -ENOMEM;
-    
+
     /* Allocate TRSM GEMM plan for blocked triangular solve updates */
     ws->trsm_gemm_plan = gemm_plan_create(n, n, n);
     if (!ws->trsm_gemm_plan)
@@ -362,10 +362,9 @@ static inline float avx2_sum_ps(__m256 v)
 }
 #endif
 
-
 /**
  * @brief Workspace for cross-covariance computation
- * 
+ *
  * Pre-allocated buffers to avoid malloc overhead in repeated UKF calls.
  * Typical usage:
  * 1. Allocate once: ws = ukf_pxy_ws_alloc(L_max, N_max)
@@ -377,16 +376,16 @@ typedef struct
     float *Xc;         /* L × N8 weighted centered X */
     float *Y_centered; /* L × N8 centered Y (row-major) */
     float *YTc;        /* N8 × L transposed centered Y */
-    
+
     gemm_plan_t *gemm_plan; /* GEMM plan for L×N8 × N8×L multiply */
-    
-    size_t capL;   /* Capacity in L dimension */
-    size_t capN8;  /* Capacity in N8 dimension (rounded up) */
+
+    size_t capL;  /* Capacity in L dimension */
+    size_t capN8; /* Capacity in N8 dimension (rounded up) */
 } ukf_pxy_ws_t;
 
 /**
  * @brief Ensure workspace capacity for given dimensions
- * 
+ *
  * @param ws   Workspace structure
  * @param L    State dimension
  * @param N8   Rounded-up sigma point count (must be multiple of 8)
@@ -395,11 +394,11 @@ typedef struct
 static inline int ukf_pxy_ws_ensure(ukf_pxy_ws_t *ws, size_t L, size_t N8)
 {
     /* Check if existing workspace is adequate */
-    if (ws->capL >= L && ws->capN8 >= N8 && 
+    if (ws->capL >= L && ws->capN8 >= N8 &&
         ws->Xc && ws->Y_centered && ws->YTc && ws->gemm_plan)
     {
         /* Update GEMM plan if dimensions changed */
-        if (ws->gemm_plan->max_M < L || ws->gemm_plan->max_K < N8 || 
+        if (ws->gemm_plan->max_M < L || ws->gemm_plan->max_K < N8 ||
             ws->gemm_plan->max_N < L)
         {
             gemm_plan_destroy(ws->gemm_plan);
@@ -436,7 +435,7 @@ static inline int ukf_pxy_ws_ensure(ukf_pxy_ws_t *ws, size_t L, size_t N8)
     ws->Xc = (float *)gemm_aligned_alloc(32, L * N8 * sizeof(float));
     ws->Y_centered = (float *)gemm_aligned_alloc(32, L * N8 * sizeof(float));
     ws->YTc = (float *)gemm_aligned_alloc(32, N8 * L * sizeof(float));
-    
+
     if (!ws->Xc || !ws->Y_centered || !ws->YTc)
     {
         gemm_aligned_free(ws->Xc);
@@ -466,7 +465,7 @@ static inline int ukf_pxy_ws_ensure(ukf_pxy_ws_t *ws, size_t L, size_t N8)
 
 /**
  * @brief Clean up cross-covariance workspace
- * 
+ *
  * @param ws Workspace to clean up (NULL-safe)
  */
 static inline void ukf_pxy_ws_cleanup(ukf_pxy_ws_t *ws)
@@ -477,7 +476,7 @@ static inline void ukf_pxy_ws_cleanup(ukf_pxy_ws_t *ws)
     gemm_aligned_free(ws->Xc);
     gemm_aligned_free(ws->Y_centered);
     gemm_aligned_free(ws->YTc);
-    
+
     if (ws->gemm_plan)
         gemm_plan_destroy(ws->gemm_plan);
 
@@ -491,21 +490,21 @@ static inline void ukf_pxy_ws_cleanup(ukf_pxy_ws_t *ws)
 
 /**
  * @brief Build YTc directly from Y (fused centering + transpose)
- * 
+ *
  * @details
  * Instead of:
  *   1. Y → Y_centered (write L×N8 buffer)
  *   2. Y_centered → YTc (transpose, write N8×L buffer)
- * 
+ *
  * Do:
  *   1. Y → YTc directly (read Y once, write YTc once)
- * 
+ *
  * Saves: 33% memory traffic (eliminates Y_centered write + read)
- * 
+ *
  * **Access pattern:**
  * Y is L×N row-major, need to produce YTc as N8×L row-major
  * YTc[j][i] = Y[i][j] - y[i]
- * 
+ *
  * Challenge: Y is accessed in strided manner (column-wise)
  * Solution: Process in 8×8 blocks with register transpose
  */
@@ -522,15 +521,15 @@ static void build_YTc_fused(
         for (size_t i0 = 0; i0 < L; i0 += 8)
         {
             const size_t ib = MIN(8, L - i0);
-            
+
             for (size_t j0 = 0; j0 < N; j0 += 8)
             {
                 const size_t jb = MIN(8, N - j0);
-                
+
                 if (ib == 8 && jb == 8)
                 {
                     /* ✅ FAST PATH: Full 8×8 tile with register transpose */
-                    
+
                     /* Load 8 rows from Y (with centering) */
                     __m256 r0 = _mm256_loadu_ps(Y + (i0 + 0) * N + j0);
                     __m256 r1 = _mm256_loadu_ps(Y + (i0 + 1) * N + j0);
@@ -540,7 +539,7 @@ static void build_YTc_fused(
                     __m256 r5 = _mm256_loadu_ps(Y + (i0 + 5) * N + j0);
                     __m256 r6 = _mm256_loadu_ps(Y + (i0 + 6) * N + j0);
                     __m256 r7 = _mm256_loadu_ps(Y + (i0 + 7) * N + j0);
-                    
+
                     /* Apply centering (subtract y) */
                     r0 = _mm256_sub_ps(r0, _mm256_set1_ps(y[i0 + 0]));
                     r1 = _mm256_sub_ps(r1, _mm256_set1_ps(y[i0 + 1]));
@@ -550,10 +549,10 @@ static void build_YTc_fused(
                     r5 = _mm256_sub_ps(r5, _mm256_set1_ps(y[i0 + 5]));
                     r6 = _mm256_sub_ps(r6, _mm256_set1_ps(y[i0 + 6]));
                     r7 = _mm256_sub_ps(r7, _mm256_set1_ps(y[i0 + 7]));
-                    
+
                     /* Transpose 8×8 in registers */
                     transpose8x8_ps(&r0, &r1, &r2, &r3, &r4, &r5, &r6, &r7);
-                    
+
                     /* Store transposed rows to YTc */
                     _mm256_storeu_ps(YTc + (j0 + 0) * L + i0, r0);
                     _mm256_storeu_ps(YTc + (j0 + 1) * L + i0, r1);
@@ -571,14 +570,14 @@ static void build_YTc_fused(
                     {
                         for (size_t i = 0; i < ib; ++i)
                         {
-                            YTc[(j0 + j) * L + (i0 + i)] = 
+                            YTc[(j0 + j) * L + (i0 + i)] =
                                 Y[(i0 + i) * N + (j0 + j)] - y[i0 + i];
                         }
                     }
                 }
             }
         }
-        
+
         /* Zero-pad to N8 */
         for (size_t j = N; j < N8; ++j)
         {
@@ -596,7 +595,7 @@ static void build_YTc_fused(
                 YTc[j * L + i] = Y[i * N + j] - y[i];
             }
         }
-        
+
         /* Zero-pad to N8 */
         for (size_t j = N; j < N8; ++j)
         {
@@ -607,20 +606,20 @@ static void build_YTc_fused(
 
 /**
  * @brief Build Aprime directly in column-major layout (fused construction + transpose)
- * 
+ *
  * @details
  * Aprime layout (column-major M×L, stored as L columns of M elements):
- * 
+ *
  * Column i layout:
  *   [0..K-1]:     Deviations w1s * (X[i, 1..2L] - x[i])
  *   [K..K+L-1]:   SR noise Rsr[i, 0..L-1]
  *   [K+L..M-1]:   (unused, should not exist as K+L = 2L+L = 3L = M)
- * 
+ *
  * This is a column-major construction, which is unnatural for row-major inputs,
  * but eliminates the transpose step entirely.
  */
 static void build_Aprime_column_major(
-    float *restrict Aprime,  /* Column-major M×L */
+    float *restrict Aprime, /* Column-major M×L */
     const float *restrict X,
     const float *restrict x,
     const float *restrict Rsr,
@@ -630,45 +629,45 @@ static void build_Aprime_column_major(
     /* Build each column i of Aprime separately */
     for (size_t i = 0; i < L; ++i)
     {
-        float *Aprime_col = Aprime + i * M;  /* Column i (M elements) */
+        float *Aprime_col = Aprime + i * M; /* Column i (M elements) */
         const float *Xi = X + i * N;
         const float xi = x[i];
-        
+
         /* ✅ SECTION 1: Deviations [0..K-1] */
         /* Aprime_col[r] = w1s * (Xi[r+1] - xi) for r = 0..K-1 */
-        
+
         size_t r = 0;
-        
+
 #if LINALG_SIMD_ENABLE
         if (ukf_has_avx2())
         {
             const __m256 w1v = _mm256_set1_ps(w1s);
             const __m256 xiv = _mm256_set1_ps(xi);
-            
+
             /* Vectorized: 8 elements at a time */
             for (; r + 7 < K; r += 8)
             {
-                __m256 xv = _mm256_loadu_ps(Xi + r + 1);  /* Xi[r+1..r+8] */
+                __m256 xv = _mm256_loadu_ps(Xi + r + 1); /* Xi[r+1..r+8] */
                 __m256 diff = _mm256_sub_ps(xv, xiv);
                 __m256 res = _mm256_mul_ps(w1v, diff);
                 _mm256_storeu_ps(Aprime_col + r, res);
             }
         }
 #endif
-        
+
         /* Scalar tail */
         for (; r < K; ++r)
         {
             Aprime_col[r] = w1s * (Xi[r + 1] - xi);
         }
-        
+
         /* ✅ SECTION 2: SR noise [K..K+L-1] = [K..M-1] */
         /* Aprime_col[K + t] = Rsr[i, t] for t = 0..L-1 */
-        
+
         const float *Rsri = Rsr + i * L;
-        
+
         size_t t = 0;
-        
+
 #if LINALG_SIMD_ENABLE
         if (ukf_has_avx2())
         {
@@ -680,7 +679,7 @@ static void build_Aprime_column_major(
             }
         }
 #endif
-        
+
         /* Scalar tail */
         for (; t < L; ++t)
         {
@@ -1398,7 +1397,7 @@ static int create_state_estimation_error_covariance_matrix(
     }
 
     /* QR decomposition (unchanged) */
-     if (qr_ws_blocked_inplace(ws->qr_ws, Aprime, NULL, R_, 
+    if (qr_ws_blocked_inplace(ws->qr_ws, Aprime, NULL, R_,
                               (uint16_t)M, (uint16_t)L, true) != 0)
         return -EIO;
 
@@ -1476,7 +1475,7 @@ static inline void ukf_transpose8x8_ps(__m256 in[8], __m256 out[8])
  *
  * @details
  *  Computes: P[i,j] = Σ_k W[k] · (X[i,k] - x[i]) · (Y[j,k] - y[j])
- *  
+ *
  *  **Algorithm (Optimized):**
  *   1. Build Xc = (X - x) ⊙ W (weighted centered X, 2-row vectorized)
  *   2. Build YTc directly from Y (fused centering + 8×8 transpose)
@@ -1651,7 +1650,7 @@ static int create_state_cross_covariance_matrix(
     /* ----------------------------------------------------------------
      * STEP 3: Matrix multiply P = Xc · YTc using production GEMM
      *         C[L×L] = alpha * A[L×N8] × B[N8×L] + beta * C
-     * 
+     *
      * GEMM features:
      *  - Packing: A and B packed into contiguous buffers
      *  - Blocking: MC=128, KC=256, NC=256 (L2-optimized)
@@ -1659,18 +1658,18 @@ static int create_state_cross_covariance_matrix(
      *  - Performance: ~169 GFLOPS (single-core, i9-14900K)
      * ---------------------------------------------------------------- */
     int rc = gemm_execute_plan_strided(
-        ws->gemm_plan,   /* Pre-allocated GEMM plan (reused) */
-        P,               /* C: output [L×L] row-major */
-        Xc,              /* A: weighted centered X [L×N8] row-major */
-        YTc,             /* B: transposed centered Y [N8×L] row-major */
-        (uint16_t)L,     /* M: rows of A and C */
-        (uint16_t)N8,    /* K: columns of A, rows of B */
-        (uint16_t)L,     /* N: columns of B and C */
-        (uint16_t)L,     /* ldc: leading dimension of C (stride) */
-        (uint16_t)N8,    /* lda: leading dimension of A (stride) */
-        (uint16_t)L,     /* ldb: leading dimension of B (stride) */
-        1.0f,            /* alpha: A*B is not scaled */
-        0.0f);           /* beta: overwrite P (don't accumulate) */
+        ws->gemm_plan, /* Pre-allocated GEMM plan (reused) */
+        P,             /* C: output [L×L] row-major */
+        Xc,            /* A: weighted centered X [L×N8] row-major */
+        YTc,           /* B: transposed centered Y [N8×L] row-major */
+        (uint16_t)L,   /* M: rows of A and C */
+        (uint16_t)N8,  /* K: columns of A, rows of B */
+        (uint16_t)L,   /* N: columns of B and C */
+        (uint16_t)L,   /* ldc: leading dimension of C (stride) */
+        (uint16_t)N8,  /* lda: leading dimension of A (stride) */
+        (uint16_t)L,   /* ldb: leading dimension of B (stride) */
+        1.0f,          /* alpha: A*B is not scaled */
+        0.0f);         /* beta: overwrite P (don't accumulate) */
 
     if (rc != 0)
         return -EIO;
@@ -1789,10 +1788,10 @@ static void transpose_square_inplace(float *A, uint16_t n)
 
 /**
  * @brief Measurement update: compute Kalman gain, update state, downdate covariance
- * 
+ *
  * @details
  * ✅ FIXED: Uses transpose-aware TRSM for correct Sy^T solve
- * 
+ *
  * Algorithm:
  *   1. Forward solve:  Sy^T · Z = Pxy  (transpose-aware TRSM) ✅ CORRECTED
  *   2. Backward solve: Sy · K = Z      (standard upper TRSM)
@@ -1801,12 +1800,12 @@ static void transpose_square_inplace(float *A, uint16_t n)
  *   5. Compute U = K·Sy (optimized GEMM)
  *   6. Transpose U → Ut (tiled transpose)
  *   7. Downdate S via n rank-1 Cholesky downdates
- * 
+ *
  * Mathematical correctness:
  *   K = Pxy · (Sy·Sy^T)^(-1)
  *     = Pxy · Sy^(-T) · Sy^(-1)   (factor inverse)
  *     = Sy^(-1) · (Sy^(-T) · Pxy)  (associativity)
- *   
+ *
  *   Step 1: Z = Sy^(-T) · Pxy  (solve Sy^T · Z = Pxy)
  *   Step 2: K = Sy^(-1) · Z    (solve Sy · K = Z)
  */
@@ -1841,7 +1840,7 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     /* ==================================================================
      * STEP 1: Forward solve using TRANSPOSE-AWARE TRSM ✅ CORRECTED
      *         Sy^T · Z = Pxy  →  Z = Sy^(-T) · Pxy
-     * 
+     *
      * Mathematical note:
      * - Sy is UPPER triangular (row-major storage)
      * - Sy^T is LOWER triangular (mathematical property)
@@ -1849,33 +1848,33 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
      * - This reads Sy in column-wise fashion (Sy[j,i] instead of Sy[i,j])
      * ================================================================== */
     int rc = trsm_blocked_upper_transpose(
-        Sy,                        /* Upper triangular Sy (read transposed) */
-        Z,                         /* RHS matrix [n×n], overwritten with solution */
-        n, n,                      /* Dimensions */
-        n, n,                      /* Strides */
-        ws->trsm_gemm_plan,        /* GEMM plan for off-diagonal updates */
-        ws->trsm_ws);              /* ✅ NEW: Workspace for packing */
-    
+        Sy,                 /* Upper triangular Sy (read transposed) */
+        Z,                  /* RHS matrix [n×n], overwritten with solution */
+        n, n,               /* Dimensions */
+        n, n,               /* Strides */
+        ws->trsm_gemm_plan, /* GEMM plan for off-diagonal updates */
+        ws->trsm_ws);       /* ✅ NEW: Workspace for packing */
+
     if (rc != 0)
         return rc;
 
     /* ==================================================================
      * STEP 2: Backward solve using STANDARD UPPER TRSM
      *         Sy · K = Z  →  K = Sy^(-1) · Z
-     * 
+     *
      * Mathematical note:
      * - Sy is UPPER triangular (row-major storage)
      * - Standard upper-TRSM (backward substitution)
      * - No transpose needed here
      * ================================================================== */
     rc = trsm_blocked_upper_optimized(
-        Sy,                        /* Upper triangular Sy */
-        Z,                         /* RHS matrix [n×n], overwritten with K */
+        Sy, /* Upper triangular Sy */
+        Z,  /* RHS matrix [n×n], overwritten with K */
         n, n,
         n, n,
         ws->trsm_gemm_plan,
-        ws->trsm_ws);              /* ✅ NEW: Reuse workspace */
-    
+        ws->trsm_ws); /* ✅ NEW: Reuse workspace */
+
     if (rc != 0)
         return rc;
 
@@ -1908,7 +1907,7 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
      * STEP 4: Compute Ky = K · (y − ŷ)
      * ================================================================== */
     rc = gemm_execute_plan_strided(ws->gemm_plan, Ky, Z, yyhat,
-                                    n, n, 1, 1, n, 1, 1.0f, 0.0f);
+                                   n, n, 1, 1, n, 1, 1.0f, 0.0f);
     if (rc != 0)
         return -EIO;
 
@@ -1939,7 +1938,7 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
      * STEP 6: Compute U = K · Sy
      * ================================================================== */
     rc = gemm_execute_plan_strided(ws->gemm_plan, U, Z, Sy,
-                                    n, n, n, n, n, n, 1.0f, 0.0f);
+                                   n, n, n, n, n, n, 1.0f, 0.0f);
     if (rc != 0)
         return -EIO;
 
@@ -1965,14 +1964,14 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
 
         /* Apply rank-1 downdate */
         rc = cholupdatek_auto_ws(
-            ws->chol_ws,           /* Workspace */
-            S,                     /* Upper-triangular Cholesky factor */
-            ws->chol_ws->xbuf,     /* Update vector */
-            n,                     /* Matrix dimension */
-            1,                     /* Rank-1 */
-            /*is_upper=*/true,     /* Upper-triangular storage */
-            -1);                   /* Downdate (subtract X*X^T) */
-        
+            ws->chol_ws,       /* Workspace */
+            S,                 /* Upper-triangular Cholesky factor */
+            ws->chol_ws->xbuf, /* Update vector */
+            n,                 /* Matrix dimension */
+            1,                 /* Rank-1 */
+            /*is_upper=*/true, /* Upper-triangular storage */
+            -1);               /* Downdate (subtract X*X^T) */
+
         if (rc != 0)
         {
             /* Filter divergence detected */

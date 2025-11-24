@@ -15,6 +15,27 @@
         "typeinfo": "c",
         "gemm_planning.h": "c",
         "assert.h": "c",
-        "gemm_utils.h": "c"
+        "gemm_utils.h": "c",
+        "*.S": "asm"
+    },
+    "editor.tokenColorCustomizations": {
+        "textMateRules": [
+            {
+                "scope": "keyword.mnemonic",
+                "settings": { "foreground": "#569CD6" }
+            },
+            {
+                "scope": "entity.name.function.asm",
+                "settings": { "foreground": "#DCDCAA" }
+            },
+            {
+                "scope": "variable.parameter.register",
+                "settings": { "foreground": "#9CDCFE" }
+            },
+            {
+                "scope": "constant.numeric",
+                "settings": { "foreground": "#B5CEA8" }
+            }
+        ]
     }
 }
