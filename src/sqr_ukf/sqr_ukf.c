@@ -8,6 +8,7 @@
 #include "qr.h"
 #include "cholupdate.h"
 #include "trsm_blocked.h"
+#include "trsm_right.h"
 
 /* ================================================================
  * FEATURE TOGGLES
@@ -1787,36 +1788,29 @@ static void transpose_square_inplace(float *A, uint16_t n)
     }
 }
 
+
 /**
  * @brief Measurement update: compute Kalman gain, update state, downdate covariance
  *
- * @details
- * ✅ FIXED: Uses transpose-aware TRSM for correct Sy^T solve
- *
- * Algorithm:
- *   1. Forward solve:  Sy^T · Z = Pxy  (transpose-aware TRSM) ✅ CORRECTED
- *   2. Backward solve: Sy · K = Z      (standard upper TRSM)
- *   3. Compute innovation: v = y − ŷ
- *   4. State update: x̂ ← x̂ + K·v
- *   5. Compute U = K·Sy (optimized GEMM)
- *   6. Transpose U → Ut (tiled transpose)
- *   7. Downdate S via n rank-1 Cholesky downdates
- *
  * Mathematical correctness:
- *   K = Pxy · (Sy·Sy^T)^(-1)
- *     = Pxy · Sy^(-T) · Sy^(-1)   (factor inverse)
- *     = Sy^(-1) · (Sy^(-T) · Pxy)  (associativity)
+ *   K = Pxy · Pyy^(-1)
+ *     = Pxy · (Sy·Sy^T)^(-1)
+ *     = Pxy · Sy^(-T) · Sy^(-1)
+ *
+ *   Step 1: Z · Sy^T = Pxy  →  Z = Pxy · Sy^(-T)   (RIGHT-solve)
+ *   Step 2: K · Sy   = Z    →  K = Z · Sy^(-1)     (RIGHT-solve)
+ *
  *
  *   Step 1: Z = Sy^(-T) · Pxy  (solve Sy^T · Z = Pxy)
  *   Step 2: K = Sy^(-1) · Z    (solve Sy · K = Z)
  */
 static int update_state_covariance_matrix_and_state_estimation_vector(
-    float *RESTRICT S,
-    float *RESTRICT xhat,
-    const float *RESTRICT yhat,
-    const float *RESTRICT y,
-    const float *RESTRICT Sy,
-    const float *RESTRICT Pxy,
+    float *restrict S,
+    float *restrict xhat,
+    const float *restrict yhat,
+    const float *restrict y,
+    const float *restrict Sy,
+    const float *restrict Pxy,
     ukf_upd_ws_t *ws,
     uint8_t L8)
 {
@@ -1826,63 +1820,36 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     if (ukf_upd_ws_ensure(ws, n) != 0)
         return -ENOMEM;
 
-    float *Z = ws->Z;
-    float *U = ws->U;
-    float *Ut = ws->Ut;
-    float *Ky = ws->Ky;
-    float *yyhat = ws->yyhat;
-
-    /* Initialize Z with Pxy */
-    memcpy(Z, Pxy, nn * sizeof(float));
-
-    /* Prefetch control */
-    const int do_pf = (n >= (uint16_t)UKF_UPD_PF_MIN_N);
+    float *K = ws->Z;      /* Kalman gain (reuse Z buffer) */
+    float *U = ws->U;      /* K·Sy for covariance downdate */
+    float *Ut = ws->Ut;    /* Transposed U */
+    float *Ky = ws->Ky;    /* K·v state correction */
+    float *yyhat = ws->yyhat; /* Innovation v = y - ŷ */
 
     /* ==================================================================
-     * STEP 1: Forward solve using TRANSPOSE-AWARE TRSM ✅ CORRECTED
-     *         Sy^T · Z = Pxy  →  Z = Sy^(-T) · Pxy
+     * STEP 1-2: Compute Kalman gain K using RIGHT-TRSM ✅ FIXED!
      *
-     * Mathematical note:
-     * - Sy is UPPER triangular (row-major storage)
-     * - Sy^T is LOWER triangular (mathematical property)
-     * - We use transpose-aware TRSM to avoid explicit transpose
-     * - This reads Sy in column-wise fashion (Sy[j,i] instead of Sy[i,j])
-     * ================================================================== */
-    int rc = trsm_blocked_upper_transpose(
-        Sy,                 /* Upper triangular Sy (read transposed) */
-        Z,                  /* RHS matrix [n×n], overwritten with solution */
-        n, n,               /* Dimensions */
-        n, n,               /* Strides */
-        ws->trsm_gemm_plan, /* GEMM plan for off-diagonal updates */
-        ws->trsm_ws);       /* ✅ NEW: Workspace for packing */
-
-    if (rc != 0)
-        return rc;
-
-    /* ==================================================================
-     * STEP 2: Backward solve using STANDARD UPPER TRSM
-     *         Sy · K = Z  →  K = Sy^(-1) · Z
+     * K = Pxy · Sy^(-T) · Sy^(-1)
      *
-     * Mathematical note:
-     * - Sy is UPPER triangular (row-major storage)
-     * - Standard upper-TRSM (backward substitution)
-     * - No transpose needed here
+     *   Step 1: Z · Sy^T = Pxy  →  Z = Pxy · Sy^(-T)
+     *   Step 2: K · Sy   = Z    →  K = Z · Sy^(-1)
      * ================================================================== */
-    rc = trsm_blocked_upper_optimized(
-        Sy, /* Upper triangular Sy */
-        Z,  /* RHS matrix [n×n], overwritten with K */
-        n, n,
-        n, n,
-        ws->trsm_gemm_plan,
-        ws->trsm_ws); /* ✅ NEW: Reuse workspace */
 
+    /* Copy Pxy to K */
+    memcpy(K, Pxy, nn * sizeof(float));
+
+    /* Step 1: K · Sy^T = Pxy  →  K = Pxy · Sy^(-T) */
+    int rc = trsm_right_upper_transpose(K, Sy, n, n, n, n);
     if (rc != 0)
-        return rc;
+        return -EDOM;
 
-    /* Z now contains K (the Kalman gain) */
+    /* Step 2: K · Sy = K  →  K = K · Sy^(-1) */
+    rc = trsm_right_upper(K, Sy, n, n, n, n);
+    if (rc != 0)
+        return -EDOM;
 
     /* ==================================================================
-     * STEP 3: Compute innovation  v = y − ŷ
+     * STEP 3: Compute innovation v = y − ŷ
      * ================================================================== */
 #if LINALG_SIMD_ENABLE
     if (ukf_has_avx2() && n >= 8)
@@ -1905,18 +1872,18 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     }
 
     /* ==================================================================
-     * STEP 4: Compute Ky = K · (y − ŷ)
+     * STEP 4: Compute Ky = K · v
      * ================================================================== */
-    rc = gemm_execute_plan_strided(ws->gemm_plan, Ky, Z, yyhat,
+    rc = gemm_execute_plan_strided(ws->gemm_plan, Ky, K, yyhat,
                                    n, n, 1, 1, n, 1, 1.0f, 0.0f);
     if (rc != 0)
         return -EIO;
 
     /* ==================================================================
-     * STEP 5: State update  x̂ ← x̂ + Ky
+     * STEP 5: State update x̂ ← x̂ + Ky
      * ================================================================== */
 #if LINALG_SIMD_ENABLE
-    if (ukf_has_avx2() && n >= 8)
+    if (n >= 8)
     {
         uint16_t i = 0;
         for (; i + 7 < n; i += 8)
@@ -1938,13 +1905,13 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
     /* ==================================================================
      * STEP 6: Compute U = K · Sy
      * ================================================================== */
-    rc = gemm_execute_plan_strided(ws->gemm_plan, U, Z, Sy,
+    rc = gemm_execute_plan_strided(ws->gemm_plan, U, K, Sy,
                                    n, n, n, n, n, n, 1.0f, 0.0f);
     if (rc != 0)
         return -EIO;
 
     /* ==================================================================
-     * STEP 7: Transpose U using optimized tiled transpose
+     * STEP 7: Transpose U → Ut using optimized tiled transpose
      * ================================================================== */
     tran_tiled(Ut, U, n, n);
 
@@ -1953,10 +1920,6 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
      * ================================================================== */
     for (uint16_t j = 0; j < n; ++j)
     {
-        /* Prefetch next row */
-        if (do_pf && j + 2 < n)
-            _mm_prefetch((const char *)(Ut + (j + 2) * n), _MM_HINT_T0);
-
         /* Row j of U^T is contiguous */
         const float *Utj = Ut + (size_t)j * n;
 
@@ -1965,19 +1928,16 @@ static int update_state_covariance_matrix_and_state_estimation_vector(
 
         /* Apply rank-1 downdate */
         rc = cholupdatek_auto_ws(
-            ws->chol_ws,       /* Workspace */
-            S,                 /* Upper-triangular Cholesky factor */
-            ws->chol_ws->xbuf, /* Update vector */
-            n,                 /* Matrix dimension */
-            1,                 /* Rank-1 */
-            /*is_upper=*/true, /* Upper-triangular storage */
-            -1);               /* Downdate (subtract X*X^T) */
+            ws->chol_ws,
+            S,
+            ws->chol_ws->xbuf,
+            n,
+            1,
+            /*is_upper=*/true,
+            -1); /* Downdate */
 
         if (rc != 0)
-        {
-            /* Filter divergence detected */
             return rc;
-        }
     }
 
     return 0;

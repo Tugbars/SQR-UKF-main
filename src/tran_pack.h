@@ -288,6 +288,9 @@ void transpose8x4_sse(const float *RESTRICT src, float *RESTRICT dst,
 void transpose8x8_avx(const float *RESTRICT src, float *RESTRICT dst,
                                     size_t src_stride, size_t dst_stride);
 
+void transpose8x8_ps(__m256 *r0, __m256 *r1, __m256 *r2, __m256 *r3,
+                                   __m256 *r4, __m256 *r5, __m256 *r6, __m256 *r7);
+
 
 #ifdef __cplusplus
 }

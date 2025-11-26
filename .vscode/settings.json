@@ -16,7 +16,8 @@
         "gemm_planning.h": "c",
         "assert.h": "c",
         "gemm_utils.h": "c",
-        "*.S": "asm"
+        "*.S": "asm",
+        "trsm_blocked.h": "c"
     },
     "editor.tokenColorCustomizations": {
         "textMateRules": [
