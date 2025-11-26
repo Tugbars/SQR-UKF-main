@@ -1334,15 +1334,14 @@ static int cholupdatek_tiled_ws(cholupdate_workspace *ws,
         for (; i + 7 < n; i += 8)
         {
             // Build stride pattern: [0*k, 1*k, 2*k, ..., 7*k]
-            __m256i idx = _mm256_setr_epi32(
-                0 * (int)k, 1 * (int)k, 2 * (int)k, 3 * (int)k,
-                4 * (int)k, 5 * (int)k, 6 * (int)k, 7 * (int)k
-            );
-            const float *src_base = src + (size_t)i * k;
-            __m256 vals = _mm256_i32gather_ps(src_base, idx, sizeof(float));
-            _mm256_storeu_ps(dst + i, vals);  // Store contiguously
+            __m256 vals = _mm256_setr_ps(
+                src[(i + 0) * k], src[(i + 1) * k],
+                src[(i + 2) * k], src[(i + 3) * k],
+                src[(i + 4) * k], src[(i + 5) * k],
+                src[(i + 6) * k], src[(i + 7) * k]);
+            _mm256_storeu_ps(dst + i, vals); // Store contiguously
         }
-        
+
         // Scalar tail
         for (; i < n; ++i)
             dst[i] = src[(size_t)i * k];
