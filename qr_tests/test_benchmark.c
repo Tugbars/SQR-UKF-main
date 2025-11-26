@@ -13,6 +13,7 @@
  */
 
 #include "qr.h"
+#include "gemm_utils.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,15 +177,15 @@ static benchmark_result_t benchmark_single(uint16_t m, uint16_t n, uint16_t ib,
     result.ib = ib;
     
     // Allocate matrices
-    float *A = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
-    float *A_work = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
-    float *Q = (float *)aligned_alloc(32, (size_t)m * m * sizeof(float));
-    float *R = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *A = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *A_work = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *Q = (float *)gemm_aligned_alloc(32, (size_t)m * m * sizeof(float));
+    float *R = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
     
     if (!A || !A_work || !Q || !R)
     {
         printf("    ERROR: Allocation failed for %dx%d\n", m, n);
-        free(A); free(A_work); free(Q); free(R);
+        gemm_aligned_free(A); gemm_aligned_free(A_work); gemm_aligned_free(Q); gemm_aligned_free(R);
         return result;
     }
     
@@ -196,7 +197,7 @@ static benchmark_result_t benchmark_single(uint16_t m, uint16_t n, uint16_t ib,
     if (!ws)
     {
         printf("    ERROR: Workspace allocation failed\n");
-        free(A); free(A_work); free(Q); free(R);
+        gemm_aligned_free(A); gemm_aligned_free(A_work); gemm_aligned_free(Q); gemm_aligned_free(R);
         return result;
     }
     
@@ -233,10 +234,10 @@ static benchmark_result_t benchmark_single(uint16_t m, uint16_t n, uint16_t ib,
     
     // Cleanup
     qr_workspace_free(ws);
-    free(A);
-    free(A_work);
-    free(Q);
-    free(R);
+    gemm_aligned_free(A);
+    gemm_aligned_free(A_work);
+    gemm_aligned_free(Q);
+    gemm_aligned_free(R);
     
     return result;
 }
@@ -407,15 +408,15 @@ static int test_r_only_benchmark(void)
     
     const uint16_t m = 512, n = 128;
     
-    float *A = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
-    float *A_work = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
-    float *Q = (float *)aligned_alloc(32, (size_t)m * m * sizeof(float));
-    float *R = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *A = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *A_work = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *Q = (float *)gemm_aligned_alloc(32, (size_t)m * m * sizeof(float));
+    float *R = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
     
     if (!A || !A_work || !Q || !R)
     {
         printf("  ERROR: Allocation failed\n");
-        free(A); free(A_work); free(Q); free(R);
+        gemm_aligned_free(A); gemm_aligned_free(A_work); gemm_aligned_free(Q); gemm_aligned_free(R);
         return 0;
     }
     
@@ -462,7 +463,7 @@ static int test_r_only_benchmark(void)
     printf("  Speedup (R-only):    %.2fx\n", speedup);
     
     qr_workspace_free(ws);
-    free(A); free(A_work); free(Q); free(R);
+    gemm_aligned_free(A); gemm_aligned_free(A_work); gemm_aligned_free(Q); gemm_aligned_free(R);
     
     return 1;
 }
@@ -479,15 +480,15 @@ static int test_throughput_benchmark(void)
     const uint16_t m = 128, n = 128;
     const int num_runs = 100;
     
-    float *A = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
-    float *A_work = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
-    float *Q = (float *)aligned_alloc(32, (size_t)m * m * sizeof(float));
-    float *R = (float *)aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *A = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *A_work = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
+    float *Q = (float *)gemm_aligned_alloc(32, (size_t)m * m * sizeof(float));
+    float *R = (float *)gemm_aligned_alloc(32, (size_t)m * n * sizeof(float));
     
     if (!A || !A_work || !Q || !R)
     {
         printf("  ERROR: Allocation failed\n");
-        free(A); free(A_work); free(Q); free(R);
+        gemm_aligned_free(A); gemm_aligned_free(A_work); gemm_aligned_free(Q); gemm_aligned_free(R);
         return 0;
     }
     
@@ -545,7 +546,7 @@ static int test_throughput_benchmark(void)
     printf("  Peak GFLOPS:   %.2f\n", flops / min_time / 1e9);
     
     qr_workspace_free(ws);
-    free(A); free(A_work); free(Q); free(R);
+    gemm_aligned_free(A); gemm_aligned_free(A_work); gemm_aligned_free(Q); gemm_aligned_free(R);
     
     return 1;
 }
