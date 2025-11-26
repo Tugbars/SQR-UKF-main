@@ -1130,19 +1130,19 @@ static void panel_factor_recursive(
             YT[i * m + j] = Y_left[j * ib1 + i];
 
     // Step 3b: Z = Y_left^T * A_right  [IB1 × M] × [M × IB2] → [IB1 × IB2]
-    naive_gemm_strided(Z, YT, right_cols,
+    gemm_strided(Z, YT, right_cols,
                        ib1, m, ib2,
                        ib2, m, lda,
                        1.0f, 0.0f);
 
     // Step 3c: Z_temp = T_left * Z  [IB1 × IB1] × [IB1 × IB2] → [IB1 × IB2]
-    naive_gemm_strided(Z_temp, T_left, Z,
+    gemm_strided(Z_temp, T_left, Z,
                        ib1, ib1, ib2,
                        ib2, ib1, ib2,
                        1.0f, 0.0f);
 
     // Step 3d: A_right = A_right - Y_left * Z_temp  [M × IB1] × [IB1 × IB2] → [M × IB2]
-    naive_gemm_strided(right_cols, Y_left, Z_temp,
+    gemm_strided(right_cols, Y_left, Z_temp,
                        m, ib1, ib2,
                        lda, ib1, ib2,
                        -1.0f, 1.0f);
@@ -1685,7 +1685,7 @@ static int apply_block_reflector_strided(
     //==========================================================================
     // YT is contiguous [IB × M], C has stride ldc
 
-    naive_gemm_strided(Z, YT, C,
+    gemm_strided(Z, YT, C,
                        ib, m, n,
                        n, m, ldc,
                        1.0f, 0.0f);
@@ -1704,7 +1704,7 @@ static int apply_block_reflector_strided(
     //==========================================================================
     // Y has stride ldy, C has stride ldc, Z_temp is contiguous
 
-    naive_gemm_strided(C, Y, Z_temp,
+    gemm_strided(C, Y, Z_temp,
                        m, ib, n,
                        ldc, ldy, n,
                        -1.0f, 1.0f);
