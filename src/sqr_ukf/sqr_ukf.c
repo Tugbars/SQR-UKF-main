@@ -7,6 +7,7 @@
 #include "gemm.h"
 #include "qr.h"
 #include "cholupdate.h"
+#include "trsm_blocked.h"
 
 /* ================================================================
  * FEATURE TOGGLES
