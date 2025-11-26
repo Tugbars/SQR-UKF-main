@@ -701,25 +701,24 @@ gemm_plan_t *gemm_plan_create_with_mode(
     precompute_panels(plan);
 
     // Setup Workspace
+#if GEMM_ENABLE_STATIC_POOL
     if (mode == GEMM_MEM_STATIC)
     {
         gemm_static_init();
-
-        // Calculate proper B workspace size (matching dynamic mode)
-        size_t max_n_panels = (plan->NC + plan->NR - 1) / plan->NR;
-        size_t a_offset = 0;
-        size_t b_offset = plan->MR * plan->KC; // A only uses MR × KC, not MC × KC
-
-        // Align b_offset to 64 bytes
-        b_offset = (b_offset + 15) & ~(size_t)15;
-
+        
+        // Calculate proper offsets matching dynamic mode sizing
+        size_t a_size = plan->MR * plan->KC;
+        a_size = (a_size + 15) & ~(size_t)15;
+        
         plan->workspace_a = gemm_static_pool.workspace;
-        plan->workspace_b = gemm_static_pool.workspace + b_offset;
+        plan->workspace_b = gemm_static_pool.workspace + a_size;
         plan->workspace_temp = gemm_static_pool.workspace;
         plan->workspace_size = 0;
         plan->workspace_aligned = 1;
     }
-    else // GEMM_MEM_DYNAMIC
+    else
+#endif
+    // GEMM_MEM_DYNAMIC
     {
         // FIX: Allocate workspace_a based on MR, not MC!
         //

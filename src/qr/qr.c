@@ -48,62 +48,6 @@ static void build_T_matrix(const float *Y, const float *tau, float *T,
 #endif
 
 //==============================================================================
-// NAIVE STRIDED GEMM (for debugging)
-//==============================================================================
-
-/**
- * @brief Naive strided GEMM: C = alpha*A*B + beta*C
- * 
- * @param C Output matrix [m × n], stride ldc
- * @param A Input matrix [m × k], stride lda
- * @param B Input matrix [k × n], stride ldb
- * @param m Number of rows in A and C
- * @param k Number of columns in A, rows in B
- * @param n Number of columns in B and C
- * @param ldc Stride of C (elements between rows)
- * @param lda Stride of A
- * @param ldb Stride of B
- * @param alpha Scalar for A*B
- * @param beta Scalar for C
- */
-static void naive_gemm_strided(
-    float *restrict C,
-    const float *restrict A,
-    const float *restrict B,
-    uint16_t m, uint16_t k, uint16_t n,
-    uint16_t ldc, uint16_t lda, uint16_t ldb,
-    float alpha, float beta)
-{
-    // C = beta * C
-    if (beta == 0.0f)
-    {
-        for (uint16_t i = 0; i < m; ++i)
-            for (uint16_t j = 0; j < n; ++j)
-                C[i * ldc + j] = 0.0f;
-    }
-    else if (beta != 1.0f)
-    {
-        for (uint16_t i = 0; i < m; ++i)
-            for (uint16_t j = 0; j < n; ++j)
-                C[i * ldc + j] *= beta;
-    }
-
-    // C += alpha * A * B
-    for (uint16_t i = 0; i < m; ++i)
-    {
-        for (uint16_t j = 0; j < n; ++j)
-        {
-            double sum = 0.0;
-            for (uint16_t p = 0; p < k; ++p)
-            {
-                sum += (double)A[i * lda + p] * (double)B[p * ldb + j];
-            }
-            C[i * ldc + j] += alpha * (float)sum;
-        }
-    }
-}
-
-//==============================================================================
 // GEMM PLAN MANAGEMENT
 //==============================================================================
 
@@ -2229,11 +2173,11 @@ static int apply_block_reflector_clean(
  * 
  * **Difference from _clean version:**
  * - _clean: C is contiguous (stride = N), can use GEMM directly
- * - _strided: C has stride ldc ≠ N, need strided GEMM or naive fallback
+ * - _strided: C has stride ldc ≠ N, need strided GEMM
  * 
  * **Implementation:**
- * Uses naive_gemm_strided() which handles arbitrary strides
- * Slower than optimized GEMM but necessary for correctness
+ * Uses optimized gemm_strided() which handles arbitrary strides
+ * with full AVX2 vectorization and cache blocking.
  * 
  * **When This Is Needed:**
  * - Trailing matrix updates where C is submatrix of larger matrix
