@@ -30,9 +30,9 @@
 #include <errno.h>
 #include <immintrin.h>
 #include "linalg_simd.h"        // For LINALG_DEFAULT_ALIGNMENT
-#include "gemm.h"       // For gemm_strided()
-#include "gemm_utils.h" // ✅ For gemm_aligned_alloc/free
-#include "tran_pack.h"          // ✅ For transpose8x8_avx(), transpose8x4_sse()
+#include "gemm.h"               // For gemm_strided()
+#include "gemm_utils.h"         //  For gemm_aligned_alloc/free
+#include "tran_pack.h"          //  For transpose8x8_avx(), transpose8x4_sse()
 
 #ifndef LUP_NB
 #define LUP_NB 128 // panel/block size (try 96–160)
