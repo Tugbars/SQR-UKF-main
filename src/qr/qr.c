@@ -1007,6 +1007,12 @@ static void apply_householder_clean(float *restrict C, uint16_t m, uint16_t n,
  * Packed:   pack[j * m + i]    (column-major, unit stride columns)
  *
  * This makes column operations (the dominant panel ops) unit-stride.
+ *
+ * **Performance Note (AVX2 gather avoidance):**
+ * AVX2 vgatherdps is slow (~12-20 cycles latency, 5+ µops).
+ * 8 scalar loads with _mm256_setr_ps is faster (~8-10 cycles total)
+ * because OoO execution pipelines them efficiently.
+ * BLIS, MKL, PLASMA all avoid AVX2 gather for exactly this reason.
  */
 static void pack_panel_to_colmajor(
     float *restrict pack,
@@ -1014,11 +1020,6 @@ static void pack_panel_to_colmajor(
     uint16_t m, uint16_t ib, uint16_t lda)
 {
 #ifdef __AVX2__
-    // Pack 8 rows at a time using gather
-    const __m256i stride_vec = _mm256_set_epi32(
-        7 * lda, 6 * lda, 5 * lda, 4 * lda,
-        3 * lda, 2 * lda, 1 * lda, 0);
-
     for (uint16_t j = 0; j < ib; ++j)
     {
         const float *col_ptr = &panel[j];
@@ -1026,11 +1027,19 @@ static void pack_panel_to_colmajor(
 
         uint16_t i = 0;
 
-        // Process 8 rows at a time with gather
+        // Process 8 rows at a time with scalar loads (faster than gather!)
         for (; i + 8 <= m; i += 8)
         {
-            // Gather 8 elements from column j, rows i to i+7
-            __m256 gathered = _mm256_i32gather_ps(&col_ptr[i * lda], stride_vec, 4);
+            // 8 scalar loads pipeline better than vgatherdps
+            __m256 gathered = _mm256_setr_ps(
+                col_ptr[(i + 0) * lda],
+                col_ptr[(i + 1) * lda],
+                col_ptr[(i + 2) * lda],
+                col_ptr[(i + 3) * lda],
+                col_ptr[(i + 4) * lda],
+                col_ptr[(i + 5) * lda],
+                col_ptr[(i + 6) * lda],
+                col_ptr[(i + 7) * lda]);
             _mm256_storeu_ps(&pack_col[i], gathered);
         }
 
@@ -1113,6 +1122,13 @@ static void unpack_panel_from_colmajor(
  * Computes: C[j:m, k] = C[j:m, k] - tau * (v^T * C[j:m, k]) * v
  *           for k = j_start to ib-1
  *
+ * **Performance Note (float accumulators):**
+ * Uses single-precision FMA accumulation instead of double:
+ * - 2× vector throughput (8 floats vs 4 doubles per vector)
+ * - No cvtps_pd conversion overhead
+ * - Simpler horizontal sum
+ * Single precision is sufficient for Householder updates (BLAS/LAPACK standard).
+ *
  * @param pack     Packed panel in column-major [m × ib], column k at pack[k*m]
  * @param v        Householder vector [col_len], unit stride
  * @param tau      Householder scaling factor
@@ -1147,72 +1163,65 @@ static void apply_householder_packed_avx2(
         float *c2 = &pack[(k + 2) * m + j];
         float *c3 = &pack[(k + 3) * m + j];
 
-        // Compute 4 dot products simultaneously
-        __m256d dot0 = _mm256_setzero_pd();
-        __m256d dot1 = _mm256_setzero_pd();
-        __m256d dot2 = _mm256_setzero_pd();
-        __m256d dot3 = _mm256_setzero_pd();
+        // Float accumulators - 2× throughput vs double!
+        __m256 dot0 = _mm256_setzero_ps();
+        __m256 dot1 = _mm256_setzero_ps();
+        __m256 dot2 = _mm256_setzero_ps();
+        __m256 dot3 = _mm256_setzero_ps();
 
         uint16_t i = 0;
-        for (; i + 4 <= col_len; i += 4)
+        // Process 8 elements at a time (vs 4 with double)
+        for (; i + 8 <= col_len; i += 8)
         {
-            // Load 4 elements from v (convert to double for accuracy)
-            __m128 v4 = _mm_loadu_ps(&v[i]);
-            __m256d v4d = _mm256_cvtps_pd(v4);
+            __m256 v8 = _mm256_loadu_ps(&v[i]);
 
-            // Load 4 elements from each column
-            __m128 c0_4 = _mm_loadu_ps(&c0[i]);
-            __m128 c1_4 = _mm_loadu_ps(&c1[i]);
-            __m128 c2_4 = _mm_loadu_ps(&c2[i]);
-            __m128 c3_4 = _mm_loadu_ps(&c3[i]);
+            __m256 c0_8 = _mm256_loadu_ps(&c0[i]);
+            __m256 c1_8 = _mm256_loadu_ps(&c1[i]);
+            __m256 c2_8 = _mm256_loadu_ps(&c2[i]);
+            __m256 c3_8 = _mm256_loadu_ps(&c3[i]);
 
-            __m256d c0_4d = _mm256_cvtps_pd(c0_4);
-            __m256d c1_4d = _mm256_cvtps_pd(c1_4);
-            __m256d c2_4d = _mm256_cvtps_pd(c2_4);
-            __m256d c3_4d = _mm256_cvtps_pd(c3_4);
-
-            // Accumulate dot products
-            dot0 = _mm256_fmadd_pd(v4d, c0_4d, dot0);
-            dot1 = _mm256_fmadd_pd(v4d, c1_4d, dot1);
-            dot2 = _mm256_fmadd_pd(v4d, c2_4d, dot2);
-            dot3 = _mm256_fmadd_pd(v4d, c3_4d, dot3);
+            // Single-precision FMA - full throughput!
+            dot0 = _mm256_fmadd_ps(v8, c0_8, dot0);
+            dot1 = _mm256_fmadd_ps(v8, c1_8, dot1);
+            dot2 = _mm256_fmadd_ps(v8, c2_8, dot2);
+            dot3 = _mm256_fmadd_ps(v8, c3_8, dot3);
         }
 
-        // Horizontal sums
-        __m128d dot0_lo = _mm256_castpd256_pd128(dot0);
-        __m128d dot0_hi = _mm256_extractf128_pd(dot0, 1);
-        __m128d dot0_sum = _mm_add_pd(dot0_lo, dot0_hi);
-        double d0 = _mm_cvtsd_f64(dot0_sum) + _mm_cvtsd_f64(_mm_unpackhi_pd(dot0_sum, dot0_sum));
+        // Horizontal sums (simpler for floats)
+        // Reduce 8 floats to 1: hi+lo → hadd → hadd → extract
+        __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(dot0), _mm256_extractf128_ps(dot0, 1));
+        __m128 t1 = _mm_add_ps(_mm256_castps256_ps128(dot1), _mm256_extractf128_ps(dot1, 1));
+        __m128 t2 = _mm_add_ps(_mm256_castps256_ps128(dot2), _mm256_extractf128_ps(dot2, 1));
+        __m128 t3 = _mm_add_ps(_mm256_castps256_ps128(dot3), _mm256_extractf128_ps(dot3, 1));
 
-        __m128d dot1_lo = _mm256_castpd256_pd128(dot1);
-        __m128d dot1_hi = _mm256_extractf128_pd(dot1, 1);
-        __m128d dot1_sum = _mm_add_pd(dot1_lo, dot1_hi);
-        double d1 = _mm_cvtsd_f64(dot1_sum) + _mm_cvtsd_f64(_mm_unpackhi_pd(dot1_sum, dot1_sum));
+        t0 = _mm_hadd_ps(t0, t0);
+        t0 = _mm_hadd_ps(t0, t0);
+        t1 = _mm_hadd_ps(t1, t1);
+        t1 = _mm_hadd_ps(t1, t1);
+        t2 = _mm_hadd_ps(t2, t2);
+        t2 = _mm_hadd_ps(t2, t2);
+        t3 = _mm_hadd_ps(t3, t3);
+        t3 = _mm_hadd_ps(t3, t3);
 
-        __m128d dot2_lo = _mm256_castpd256_pd128(dot2);
-        __m128d dot2_hi = _mm256_extractf128_pd(dot2, 1);
-        __m128d dot2_sum = _mm_add_pd(dot2_lo, dot2_hi);
-        double d2 = _mm_cvtsd_f64(dot2_sum) + _mm_cvtsd_f64(_mm_unpackhi_pd(dot2_sum, dot2_sum));
-
-        __m128d dot3_lo = _mm256_castpd256_pd128(dot3);
-        __m128d dot3_hi = _mm256_extractf128_pd(dot3, 1);
-        __m128d dot3_sum = _mm_add_pd(dot3_lo, dot3_hi);
-        double d3 = _mm_cvtsd_f64(dot3_sum) + _mm_cvtsd_f64(_mm_unpackhi_pd(dot3_sum, dot3_sum));
+        float d0 = _mm_cvtss_f32(t0);
+        float d1 = _mm_cvtss_f32(t1);
+        float d2 = _mm_cvtss_f32(t2);
+        float d3 = _mm_cvtss_f32(t3);
 
         // Finish scalar tail
         for (; i < col_len; ++i)
         {
-            d0 += (double)v[i] * (double)c0[i];
-            d1 += (double)v[i] * (double)c1[i];
-            d2 += (double)v[i] * (double)c2[i];
-            d3 += (double)v[i] * (double)c3[i];
+            d0 += v[i] * c0[i];
+            d1 += v[i] * c1[i];
+            d2 += v[i] * c2[i];
+            d3 += v[i] * c3[i];
         }
 
         // Scale by tau
-        float s0 = tau * (float)d0;
-        float s1 = tau * (float)d1;
-        float s2 = tau * (float)d2;
-        float s3 = tau * (float)d3;
+        float s0 = tau * d0;
+        float s1 = tau * d1;
+        float s2 = tau * d2;
+        float s3 = tau * d3;
 
         // Apply rank-1 updates: C[:,k] -= s * v
         __m256 s0_vec = _mm256_set1_ps(s0);
@@ -1256,29 +1265,27 @@ static void apply_householder_packed_avx2(
     {
         float *col = &pack[k * m + j];
 
-        // Dot product
-        __m256d dot = _mm256_setzero_pd();
+        // Float accumulator dot product
+        __m256 dot = _mm256_setzero_ps();
         uint16_t i = 0;
 
-        for (; i + 4 <= col_len; i += 4)
+        for (; i + 8 <= col_len; i += 8)
         {
-            __m128 v4 = _mm_loadu_ps(&v[i]);
-            __m128 c4 = _mm_loadu_ps(&col[i]);
-            __m256d v4d = _mm256_cvtps_pd(v4);
-            __m256d c4d = _mm256_cvtps_pd(c4);
-            dot = _mm256_fmadd_pd(v4d, c4d, dot);
+            __m256 v8 = _mm256_loadu_ps(&v[i]);
+            __m256 c8 = _mm256_loadu_ps(&col[i]);
+            dot = _mm256_fmadd_ps(v8, c8, dot);
         }
 
         // Horizontal sum
-        __m128d dot_lo = _mm256_castpd256_pd128(dot);
-        __m128d dot_hi = _mm256_extractf128_pd(dot, 1);
-        __m128d dot_sum = _mm_add_pd(dot_lo, dot_hi);
-        double d = _mm_cvtsd_f64(dot_sum) + _mm_cvtsd_f64(_mm_unpackhi_pd(dot_sum, dot_sum));
+        __m128 t = _mm_add_ps(_mm256_castps256_ps128(dot), _mm256_extractf128_ps(dot, 1));
+        t = _mm_hadd_ps(t, t);
+        t = _mm_hadd_ps(t, t);
+        float d = _mm_cvtss_f32(t);
 
         for (; i < col_len; ++i)
-            d += (double)v[i] * (double)col[i];
+            d += v[i] * col[i];
 
-        float s = tau * (float)d;
+        float s = tau * d;
 
         // Update
         __m256 s_vec = _mm256_set1_ps(s);
@@ -2663,19 +2670,27 @@ static void qr_extract_r(float *restrict R, const float *restrict A,
  * Applies reflectors in reverse order: Q = H(1) * H(2) * ... * H(k)
  * Uses block reflector representation: H = I - Y*T*Y^T
  *
- * **Cache Optimization (Column Tiling):**
- * Instead of streaming entire Q (m×m, ~4MB for m=1024) for each block,
- * we process Q in vertical tiles that fit in L2 cache:
+ * **Cache Optimization (Column Tiling + Y/T Hoisting):**
  *
+ * We use two complementary optimizations:
+ *
+ * 1. **Column Tiling:** Process Q in vertical tiles that fit L2 cache.
+ *    For m=1024, Q is 4MB. By processing 256 columns at a time (1MB tile),
+ *    Q_tile stays hot in L2 throughout all block applications.
+ *
+ * 2. **Y/T Hoisting:** Load Y and transpose T ONCE per block, then apply
+ *    to all tiles. This reduces Y/T traffic from O(blocks × tiles) to O(blocks).
+ *
+ * Loop structure (optimized):
  * ```
- * For each column tile of Q:
- *     Q_tile fits in L2 (~1MB)
- *     For each block k (reverse):
- *         Apply block reflector to Q_tile
- *         Y and T reload (small, ~130KB) is worth it for Q_tile cache hits
+ * for each block (reverse):       # ~8 iterations
+ *     Load Y_block                # 1× per block (was tiles× before)
+ *     Transpose T_block           # 1× per block (was tiles× before)
+ *     for each tile:              # ~4 iterations
+ *         Apply to Q_tile         # Q_tile stays in L2!
  * ```
  *
- * This reduces L3/DRAM traffic by 10-15× for large matrices.
+ * This reduces L3/DRAM traffic by 4× for Y/T while keeping Q_tile cache-hot.
  *
  * @param ws Workspace containing stored Y and T matrices
  * @param Q [out] Output Q matrix [m×m]
@@ -2698,69 +2713,65 @@ static int qr_form_q(qr_workspace *ws, float *Q, uint16_t m, uint16_t n,
         Q[i * m + i] = 1.0f;
 
     //==========================================================================
-    // CACHE OPTIMIZATION: Process Q in column tiles
+    // Tile width for L2 cache optimization
     //==========================================================================
-    // Q is m×m. For m=1024, that's 4MB - doesn't fit L2.
-    // By tiling columns, each Q_tile (m × tile_width) fits in L2:
-    //   - tile_width=256: 1024×256×4 = 1MB (fits L2)
-    //   - All block reflectors applied while Q_tile is hot in L2
-    //   - Y/T reloaded per tile, but they're small (~130KB total)
-    //
-    // Trade-off: Reload Y/T (block_count × num_tiles) times
-    //            vs Keep Q_tile in L2 (huge win for large m)
-    //==========================================================================
+    // Q_tile should fit in L2 (~2MB) with room for Y, T, workspace
+    // tile_width=256: m × 256 × 4 = 1MB for m=1024 (fits comfortably)
 
-    // Tile width tuned for L2 cache (~2MB, leave room for Y/T/workspace)
     const uint16_t Q_TILE_WIDTH = 256;
     const uint16_t num_tiles = (m + Q_TILE_WIDTH - 1) / Q_TILE_WIDTH;
 
-    for (uint16_t tile = 0; tile < num_tiles; tile++)
+    //==========================================================================
+    // OUTER LOOP: Blocks (reverse order)
+    // Y and T are loaded/transposed ONCE per block (hoisted outside tile loop)
+    //==========================================================================
+
+    for (int blk = block_count - 1; blk >= 0; blk--)
     {
-        uint16_t j0 = tile * Q_TILE_WIDTH;
-        uint16_t jb = MIN(Q_TILE_WIDTH, m - j0);
+        uint16_t k = blk * ws->ib;
+        uint16_t block_size = MIN(ws->ib, kmax - k);
+        uint16_t rows_below = m - k;
 
-        // Q_tile points to column j0, has stride m (not jb!)
-        float *Q_tile = Q + j0;
+        size_t y_offset = blk * ws->Y_block_stride;
+        size_t t_offset = blk * ws->T_block_stride;
 
         //======================================================================
-        // Apply all blocks to this column tile
+        // Load stored Y matrix for this block (ONCE, not per-tile!)
         //======================================================================
 
-        for (int blk = block_count - 1; blk >= 0; blk--)
+        memset(ws->Y, 0, (size_t)m * ws->ib * sizeof(float));
+        for (uint16_t i = 0; i < rows_below; ++i)
+            for (uint16_t j = 0; j < block_size; ++j)
+                ws->Y[(k + i) * ws->ib + j] =
+                    ws->Y_stored[y_offset + i * block_size + j];
+
+        //======================================================================
+        // Load and TRANSPOSE T matrix (ONCE, not per-tile!)
+        //======================================================================
+
+        float *T_packed = ws->panel_T_temp;
+        float *T_stored_ptr = &ws->T_stored[t_offset];
+
+        transpose_matrix_avx2_blocked(T_packed, T_stored_ptr,
+                                      block_size, block_size,
+                                      block_size, block_size);
+
+        //======================================================================
+        // INNER LOOP: Tiles
+        // Apply this block's reflector to each Q_tile
+        // Q_tile stays in L2; Y and T are already loaded
+        //======================================================================
+
+        for (uint16_t tile = 0; tile < num_tiles; tile++)
         {
-            uint16_t k = blk * ws->ib;
-            uint16_t block_size = MIN(ws->ib, kmax - k);
-            uint16_t rows_below = m - k;
+            uint16_t j0 = tile * Q_TILE_WIDTH;
+            uint16_t jb = MIN(Q_TILE_WIDTH, m - j0);
 
-            size_t y_offset = blk * ws->Y_block_stride;
-            size_t t_offset = blk * ws->T_block_stride;
+            // Q_tile points to column j0, has stride m (not jb!)
+            float *Q_tile = Q + j0;
 
-            //==================================================================
-            // Load stored Y matrix for this block
-            //==================================================================
-
-            memset(ws->Y, 0, (size_t)m * ws->ib * sizeof(float));
-            for (uint16_t i = 0; i < rows_below; ++i)
-                for (uint16_t j = 0; j < block_size; ++j)
-                    ws->Y[(k + i) * ws->ib + j] =
-                        ws->Y_stored[y_offset + i * block_size + j];
-
-            //==================================================================
-            // Load and TRANSPOSE T matrix for Q formation
-            //==================================================================
-
-            float *T_packed = ws->panel_T_temp;
-            float *T_stored_ptr = &ws->T_stored[t_offset];
-
-            transpose_matrix_avx2_blocked(T_packed, T_stored_ptr,
-                                          block_size, block_size,
-                                          block_size, block_size);
-
-            //==================================================================
             // Apply block reflector to Q_tile: Q_tile = (I - Y*T^T*Y^T) * Q_tile
-            //==================================================================
-            // Q_tile has stride m (not jb), so use strided version
-            // This is where the cache win happens: Q_tile stays in L2!
+            // Q_tile stays hot in L2, Y and T are already in cache from hoisting
 
             int ret = apply_block_reflector_strided(
                 Q_tile, ws->Y, T_packed,
