@@ -150,6 +150,8 @@ endfunction()
 # Correctness tests (ACTIVE)
 add_qr_standalone_test(test_qr_correctness test_correctness.c)
 
+add_qr_standalone_test(test_qr_benchmark test_benchmark.c)
+
 # ============================================================================
 # DISABLED TESTS (Not Yet Implemented)
 # ============================================================================
@@ -215,6 +217,13 @@ add_custom_target(run_qr_quick
     DEPENDS test_qr_correctness
     COMMENT "Running quick QR validation..."
 )
+
+add_custom_target(run_qr_benchmark
+    COMMAND test_qr_benchmark
+    DEPENDS test_qr_benchmark
+    COMMENT "Running QR performance benchmark..."
+)
+
 
 # ============================================================================
 # DISABLED CUSTOM TARGETS
