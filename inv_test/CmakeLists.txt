@@ -155,27 +155,27 @@ set(TEST_COMMON
 
 message(STATUS "Building Matrix Inversion test executable...")
 
-add_executable(test_inv test_inv.c)
+add_executable(inv_test test_inv.c)
 
-target_include_directories(test_inv PRIVATE
+target_include_directories(inv_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${SRC_DIR}
     ${GEMM_DIR}
     ${GEMM_INCLUDES}
 )
 
-target_link_libraries(test_inv PRIVATE inv_lib lup_lib gemm_lib)
+target_link_libraries(inv_test PRIVATE inv_lib lup_lib gemm_lib)
 
 if(MSVC)
-    target_compile_options(test_inv PRIVATE ${SIMD_FLAGS})
+    target_compile_options(inv_test PRIVATE ${SIMD_FLAGS})
 else()
-    target_compile_options(test_inv PRIVATE ${SIMD_FLAGS} ${WARNING_FLAGS})
+    target_compile_options(inv_test PRIVATE ${SIMD_FLAGS} ${WARNING_FLAGS})
 endif()
 
-target_compile_definitions(test_inv PRIVATE STANDALONE=1)
+target_compile_definitions(inv_test PRIVATE STANDALONE=1)
 
 if(UNIX OR MINGW)
-    target_link_libraries(test_inv PRIVATE m)
+    target_link_libraries(inv_test PRIVATE m)
 endif()
 
 # ============================================================================
@@ -185,7 +185,7 @@ endif()
 enable_testing()
 
 # Register test suite
-add_test(NAME INV_Suite COMMAND test_inv)
+add_test(NAME INV_Suite COMMAND inv_test)
 set_tests_properties(INV_Suite PROPERTIES 
     TIMEOUT 600
     LABELS "correctness;inversion"
@@ -198,21 +198,21 @@ set_tests_properties(INV_Suite PROPERTIES
 # Run all tests via CTest
 add_custom_target(run_inv_tests
     COMMAND ${CMAKE_CTEST_COMMAND} --output-on-failure
-    DEPENDS test_inv
+    DEPENDS inv_test
     COMMENT "Running all Matrix Inversion tests via CTest..."
 )
 
 # Run inversion tests directly
 add_custom_target(run_inv
-    COMMAND test_inv
-    DEPENDS test_inv
+    COMMAND inv_test
+    DEPENDS inv_test
     COMMENT "Running Matrix Inversion tests (accuracy, sizes, special matrices, error handling)..."
 )
 
 # Quick validation
 add_custom_target(run_inv_quick
-    COMMAND test_inv
-    DEPENDS test_inv
+    COMMAND inv_test
+    DEPENDS inv_test
     COMMENT "Running quick Matrix Inversion validation..."
 )
 
@@ -228,5 +228,5 @@ message(STATUS "  SIMD flags: ${SIMD_FLAGS}")
 message(STATUS "  GEMM dir: ${GEMM_DIR}")
 message(STATUS "  Source dir: ${SRC_DIR}")
 message(STATUS "  Libraries: gemm_lib, lup_lib, inv_lib")
-message(STATUS "  Test executable: test_inv")
+message(STATUS "  Test executable: inv_test")
 message(STATUS "========================================")

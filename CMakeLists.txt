@@ -51,7 +51,7 @@ endif()
 
 if(BUILD_INV_TESTS)
     message(STATUS ">>> Adding Matrix Inversion tests subdirectory")
-    add_subdirectory(test_inv)          # ← Keep test_inv (already exists)
+    add_subdirectory(inv_test)          # ← Keep test_inv (already exists)
 else()
     message(STATUS ">>> Matrix Inversion tests DISABLED")
 endif()
